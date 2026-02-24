@@ -1,0 +1,19 @@
+{
+    "method": "stream_distill",
+    "description": "Diffusion Forcing based stream distillation. Per-frame independent noise levels with monotonic schedule. Supports infinite-length generation.",
+    "window_size": 16,
+    "overlap_frames": 4,
+    "noise_schedule": "monotonic_linear",
+    "denoising_steps_per_frame": 4,
+    "causal_attention": true,
+    "fps_conditioning": true,
+    "loss": "mse",
+    "optimizer": "adamw",
+    "learning_rate": 5e-6,
+    "weight_decay": 0.01,
+    "gradient_clip": 1.0,
+    "warmup_steps": 1000,
+    "mixed_precision": "bf16",
+    "gradient_checkpointing": true,
+    "notes": "Reference: SkyReels-V2 Diffusion Forcing framework"
+}

@@ -1,0 +1,39 @@
+# Core
+torch>=2.5.1
+torchvision>=0.20.1
+torchaudio>=2.5.1
+
+# Attention
+flash-attn>=2.5.0
+
+# Diffusion / Transformers
+diffusers>=0.31.0
+transformers>=4.49.0
+tokenizers>=0.20.3
+accelerate>=1.1.1
+safetensors
+peft==0.17.0
+
+# Video / Image
+opencv-python>=4.9.0.80
+imageio[ffmpeg]
+imageio-ffmpeg
+av
+Pillow
+
+# Utilities
+einops
+scipy
+loguru
+tqdm
+numpy
+easydict
+ftfy
+huggingface_hub
+gguf
+prometheus_client
+sgl-kernel
+
+# Training / Distributed
+deepspeed>=0.14.0
+# colossalai>=0.4.0  # Optional: Open-Sora style booster

@@ -1,0 +1,17 @@
+{
+    "method": "consistency_distill",
+    "description": "Trajectory Consistency Distillation (TCD). Semi-linear consistency function mapping any point on the ODE trajectory to the origin.",
+    "num_inference_steps": 2,
+    "consistency_type": "tcd",
+    "ema_decay": 0.9999,
+    "huber_loss_c": 0.001,
+    "loss": "huber",
+    "optimizer": "adamw",
+    "learning_rate": 1e-5,
+    "weight_decay": 0.0,
+    "gradient_clip": 1.0,
+    "warmup_steps": 500,
+    "mixed_precision": "bf16",
+    "gradient_checkpointing": true,
+    "notes": "Reference: Trajectory Consistency Distillation (TCD), Latent Consistency Distillation (LCD)"
+}

@@ -1,0 +1,31 @@
+{
+    "method": "context_forcing",
+    "description": "Memory-aware context forcing distillation. Aligns teacher/student memory context to prevent error drift in autoregressive world models.",
+    "num_inference_steps": 4,
+    "chunk_size": 4,
+    "memory_frames": 20,
+    "temporal_context_size": 12,
+    "window_out_ratio": 0.8,
+    "use_fov_retrieval": true,
+    "curriculum_training": true,
+    "curriculum_schedule": {
+        "0": 32,
+        "500": 64,
+        "1000": 96,
+        "2000": 128,
+        "3000": 160
+    },
+    "action_conditioning": true,
+    "prope_camera": true,
+    "loss": "mse",
+    "loss_mask": "last_chunk_only_for_window_out",
+    "optimizer": "muon",
+    "learning_rate": 1e-5,
+    "weight_decay": 0.0,
+    "gradient_clip": 10.0,
+    "warmup_steps": 500,
+    "mixed_precision": "bf16",
+    "gradient_checkpointing": true,
+    "generator_update_interval": 5,
+    "notes": "Reference: HY-WorldPlay Context Forcing distillation"
+}

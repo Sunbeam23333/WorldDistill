@@ -1,0 +1,182 @@
+# ============================================================================
+# WorldDistill Model Zoo
+# Registry of all supported video generation and world models
+# ============================================================================
+
+# Status: supported | partial | stub (interface only, implementation pending)
+
+models:
+  # ======================== Video Generation Models ========================
+  wan2.1:
+    hf_repo: "Wan-AI/Wan2.1-T2V-14B"
+    architecture: wan
+    tasks: [t2v, i2v]
+    runner_cls: "wan2.1"
+    distill_methods: [step_distill, lora_distill, mean_flow_distill]
+    status: supported
+
+  wan2.1_distill:
+    hf_repo: "Wan-AI/Wan2.1-T2V-14B"
+    architecture: wan
+    tasks: [t2v, i2v]
+    runner_cls: "wan2.1_distill"
+    distill_methods: [step_distill]
+    default_steps: 4
+    status: supported
+
+  wan2.2_moe:
+    hf_repo: "Wan-AI/Wan2.2-T2V-A14B"
+    architecture: wan_moe
+    tasks: [t2v, i2v]
+    runner_cls: "wan2.2_moe"
+    distill_methods: [step_distill, lora_distill, full_model_distill, fp8_distill]
+    status: supported
+
+  wan2.2_moe_distill:
+    hf_repo: "lightx2v/Wan2.2-Distill-Models"
+    architecture: wan_moe
+    tasks: [t2v, i2v]
+    runner_cls: "wan2.2_moe_distill"
+    distill_methods: [step_distill]
+    default_steps: 4
+    dual_model: true  # high_noise + low_noise, boundary at step 2
+    status: supported
+
+  hunyuan_video_1.5:
+    hf_repo: "tencent/HunyuanVideo"
+    architecture: hunyuan_video
+    tasks: [t2v, i2v]
+    runner_cls: "hunyuan_video_1.5"
+    distill_methods: [step_distill]
+    status: supported
+
+  hunyuan_video_1.5_distill:
+    hf_repo: "tencent/HunyuanVideo"
+    architecture: hunyuan_video
+    tasks: [t2v, i2v]
+    runner_cls: "hunyuan_video_1.5_distill"
+    distill_methods: [step_distill]
+    default_steps: 4
+    status: supported
+
+  skyreels_v2:
+    hf_repo: "Skywork/SkyReels-V2-T2V-14B"
+    architecture: wan  # Based on Wan2.1 with 3D Causal VAE
+    tasks: [t2v, i2v]
+    runner_cls: "skyreels_v2"
+    distill_methods: [stream_distill, step_distill]
+    notes: "Diffusion Forcing framework, infinite-length generation"
+    status: stub
+
+  # ======================== World Models ========================
+  worldplay_distill:
+    hf_repo: "tencent/HY-WorldPlay"
+    architecture: hunyuan_video
+    tasks: [t2v, i2v, game]
+    runner_cls: "worldplay_distill"
+    distill_methods: [step_distill, context_forcing]
+    features: [action_conditioning, prope_camera, context_memory]
+    default_steps: 4
+    status: supported
+
+  lingbot_cam_moe:
+    hf_repo: ""  # Set your HF repo here
+    architecture: wan_moe
+    tasks: [i2v]
+    runner_cls: "lingbot_cam_moe"
+    features: [plucker_camera_control]
+    status: supported
+
+  matrix_game_2:
+    hf_repo: ""
+    architecture: wan
+    tasks: [game]
+    runner_cls: "wan2.1_sf_mtxg2"
+    distill_methods: [step_distill]
+    features: [self_forcing, autoregressive]
+    status: supported
+
+  gamefactory:
+    hf_repo: "KwaiVGI/GameFactory"
+    architecture: custom
+    tasks: [game]
+    runner_cls: "gamefactory"
+    paper: "https://arxiv.org/abs/2501.08325"
+    notes: "ICCV 2025. Creates new games from pre-trained video generation models."
+    status: stub
+
+  gamecraft:
+    hf_repo: "tencent/GameCraft-2"
+    architecture: hunyuan_video
+    tasks: [game]
+    runner_cls: "gamecraft"
+    distill_methods: [step_distill, context_forcing]
+    features: [action_conditioning, prope_camera]
+    paper: "https://arxiv.org/abs/2506.xxxxx"
+    status: stub
+
+  infinite_world:
+    hf_repo: ""
+    architecture: custom
+    tasks: [game, open_world]
+    runner_cls: "infinite_world"
+    features: [infinite_generation, spatial_memory]
+    paper: "https://arxiv.org/abs/2504.xxxxx"
+    status: stub
+
+  genie:
+    hf_repo: ""
+    architecture: custom_autoregressive
+    tasks: [game]
+    runner_cls: "genie"
+    distill_methods: [progressive_distill]
+    features: [autoregressive, latent_action]
+    paper: "https://arxiv.org/abs/2402.15391"
+    notes: "Google DeepMind. Foundation world model with latent action interface."
+    status: stub
+
+  gamegen_x:
+    hf_repo: ""
+    architecture: custom
+    tasks: [game]
+    runner_cls: "gamegen_x"
+    features: [open_world_game_generation]
+    paper: "https://arxiv.org/abs/2411.00769"
+    status: stub
+
+  vmem:
+    hf_repo: ""
+    architecture: memory_augmented
+    tasks: [long_video, game]
+    runner_cls: "vmem"
+    distill_methods: [context_forcing]
+    features: [visual_memory, long_range_context]
+    status: stub
+
+  spmem:
+    hf_repo: ""
+    architecture: memory_augmented
+    tasks: [long_video, game]
+    runner_cls: "spmem"
+    distill_methods: [context_forcing]
+    features: [spatial_memory, persistent_state]
+    status: stub
+
+  cam:
+    hf_repo: ""
+    architecture: memory_augmented
+    tasks: [long_video]
+    runner_cls: "cam"
+    distill_methods: [context_forcing]
+    features: [context_as_memory, fov_retrieval]
+    notes: "Context as Memory approach for long video generation."
+    status: stub
+
+  mirage:
+    hf_repo: ""
+    architecture: custom
+    tasks: [game]
+    runner_cls: "mirage"
+    distill_methods: [step_distill]
+    notes: "Decart's real-time game world model."
+    status: stub
