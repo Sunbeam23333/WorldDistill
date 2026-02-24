@@ -469,8 +469,8 @@ If you find WorldDistill useful, please consider citing:
 ```bibtex
 @misc{worlddistill2025,
   title={WorldDistill: A Unified Toolkit for Video Generation Model Distillation},
-  year={2025},
-  url={https://github.com/your-org/WorldDistill}
+  year={2026},
+  url={https://github.com/Sunbeam23333/WorldDistill}
 }
 ```
 
