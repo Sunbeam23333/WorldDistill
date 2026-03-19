@@ -4,6 +4,12 @@
 # ============================================================================
 
 # Status: supported | partial | stub (interface only, implementation pending)
+# Optional fields:
+#   - aliases: additional user-facing aliases
+#   - default_configs: task -> default inference config path under `inference/configs/`
+#   - teacher_model_cls: canonical teacher model used by distilled/student variant
+#   - distill_stage: base | teacher | student
+#   - input_modalities / output_modalities / modalities: multimodal IO hints
 
 models:
   # ======================== Video Generation Models ========================
@@ -21,7 +27,35 @@ models:
     tasks: [t2v, i2v]
     runner_cls: "wan2.1_distill"
     distill_methods: [step_distill]
+    teacher_model_cls: "wan2.1"
+    distill_stage: student
     default_steps: 4
+    status: supported
+
+  wan2.1_mean_flow_distill:
+    hf_repo: "Wan-AI/Wan2.1-T2V-14B"
+    architecture: wan
+    tasks: [t2v]
+    runner_cls: "wan2.1_mean_flow_distill"
+    distill_methods: [mean_flow_distill]
+    teacher_model_cls: "wan2.1"
+    distill_stage: student
+    status: supported
+
+  wan2.1_vace:
+    hf_repo: "Wan-AI/Wan2.1-I2V-14B-720P"
+    architecture: wan
+    tasks: [vace]
+    runner_cls: "wan2.1_vace"
+    features: [video_editing]
+    status: supported
+
+  wan2.1_sf:
+    hf_repo: "Wan-AI/Wan2.1-T2V-14B"
+    architecture: wan
+    tasks: [t2v]
+    runner_cls: "wan2.1_sf"
+    features: [self_forcing, streaming_generation]
     status: supported
 
   wan2.2_moe:
@@ -38,8 +72,42 @@ models:
     tasks: [t2v, i2v]
     runner_cls: "wan2.2_moe_distill"
     distill_methods: [step_distill]
+    teacher_model_cls: "wan2.2_moe"
+    distill_stage: student
     default_steps: 4
     dual_model: true  # high_noise + low_noise, boundary at step 2
+    status: supported
+
+  wan2.2_moe_vace:
+    hf_repo: "lightx2v/Wan2.2-VACE"
+    architecture: wan_moe
+    tasks: [vace]
+    runner_cls: "wan2.2_moe_vace"
+    features: [video_editing]
+    status: supported
+
+  wan2.2_audio:
+    hf_repo: "lightx2v/Wan2.2-Audio"
+    architecture: wan_dense
+    tasks: [s2v, rs2v]
+    runner_cls: "wan2.2_audio"
+    features: [audio_conditioning, streaming_generation]
+    status: supported
+
+  wan2.2_animate:
+    hf_repo: "lightx2v/Wan2.2-Animate"
+    architecture: wan_moe
+    tasks: [animate]
+    runner_cls: "wan2.2_animate"
+    features: [motion_guidance, pose_conditioning]
+    status: supported
+
+  seko_talk:
+    hf_repo: "lightx2v/SekoTalk"
+    architecture: wan
+    tasks: [s2v, rs2v]
+    runner_cls: "seko_talk"
+    features: [audio_conditioning, reference_speech]
     status: supported
 
   hunyuan_video_1.5:
@@ -56,6 +124,8 @@ models:
     tasks: [t2v, i2v]
     runner_cls: "hunyuan_video_1.5_distill"
     distill_methods: [step_distill]
+    teacher_model_cls: "hunyuan_video_1.5"
+    distill_stage: student
     default_steps: 4
     status: supported
 
@@ -68,6 +138,49 @@ models:
     notes: "Diffusion Forcing framework, infinite-length generation"
     status: stub
 
+  qwen_image:
+    hf_repo: "Qwen/Qwen-Image-Edit-2511"
+    architecture: dit
+    tasks: [t2i, i2i]
+    runner_cls: "qwen_image"
+    aliases: [qwen-image, qwen-image-edit, qwen-image-edit-2511]
+    checkpoint_formats: [directory, diffusers, quantized, state_dict]
+    status: supported
+
+  longcat_image:
+    hf_repo: "megvii-research/LongCat-Flash-Image"
+    architecture: dit
+    tasks: [t2i, i2i]
+    runner_cls: "longcat_image"
+    aliases: [longcat-image]
+    checkpoint_formats: [directory, diffusers, state_dict]
+    status: supported
+
+  z_image:
+    hf_repo: "Tongyi-MAI/Z-Image-Turbo"
+    architecture: dit
+    tasks: [t2i, i2i]
+    runner_cls: "z_image"
+    aliases: [z-image]
+    checkpoint_formats: [directory, diffusers, quantized, state_dict]
+    status: supported
+
+  ltx2:
+    hf_repo: "Lightricks/LTX-Video"
+    architecture: dit
+    tasks: [t2v, i2v, t2av, i2av]
+    runner_cls: "ltx2"
+    checkpoint_formats: [directory, diffusers, state_dict]
+    status: supported
+
+  bagel:
+    hf_repo: "ByteDance/Bagel"
+    architecture: dit
+    tasks: [t2i, i2i]
+    runner_cls: "bagel"
+    checkpoint_formats: [directory, diffusers, state_dict]
+    status: supported
+
   # ======================== World Models ========================
   worldplay_distill:
     hf_repo: "tencent/HY-WorldPlay"
@@ -75,6 +188,7 @@ models:
     tasks: [t2v, i2v, game]
     runner_cls: "worldplay_distill"
     distill_methods: [step_distill, context_forcing]
+    distill_stage: student
     features: [action_conditioning, prope_camera, context_memory]
     default_steps: 4
     status: supported

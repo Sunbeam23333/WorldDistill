@@ -67,10 +67,11 @@ class ProgressiveDistillTrainer(BaseDistillTrainer):
         sigma_start = t_start / self.num_train_timesteps
         t_start_tensor = torch.full((bs,), t_start, device=self.device)
         teacher_input_1 = self.prepare_teacher_input(batch, noisy_latents, t_start_tensor)
-        with torch.no_grad():
-            v_pred_1 = self.teacher_model(**teacher_input_1)
-            if isinstance(v_pred_1, (tuple, list)):
-                v_pred_1 = v_pred_1[0]
+        v_pred_1 = self.run_teacher(
+            teacher_input_1,
+            batch,
+            cache_extra={"t_start": t_start, "t_mid": t_mid, "teacher_stage": 1},
+        )
 
         # Euler step: x_{t_mid} = x_{t_start} - (sigma_start - sigma_mid) * v_pred
         sigma_mid = t_mid / self.num_train_timesteps
@@ -80,10 +81,11 @@ class ProgressiveDistillTrainer(BaseDistillTrainer):
         # Step 2: t_mid -> t_end
         t_mid_tensor = torch.full((bs,), t_mid, device=self.device)
         teacher_input_2 = self.prepare_teacher_input(batch, x_mid.to(noisy_latents.dtype), t_mid_tensor)
-        with torch.no_grad():
-            v_pred_2 = self.teacher_model(**teacher_input_2)
-            if isinstance(v_pred_2, (tuple, list)):
-                v_pred_2 = v_pred_2[0]
+        v_pred_2 = self.run_teacher(
+            teacher_input_2,
+            batch,
+            cache_extra={"t_mid": t_mid, "t_end": t_end, "teacher_stage": 2},
+        )
 
         sigma_end = t_end / self.num_train_timesteps
         dt_2 = sigma_mid - sigma_end
@@ -130,9 +132,7 @@ class ProgressiveDistillTrainer(BaseDistillTrainer):
         student_input = self.prepare_student_input(
             batch, noisy_latents, torch.full((bs,), t_start, device=self.device)
         )
-        student_v = self.student_model(**student_input)
-        if isinstance(student_v, (tuple, list)):
-            student_v = student_v[0]
+        student_v = self.run_student(student_input, batch)
 
         # Compute loss based on configured loss space
         if self.loss_space == "v":
@@ -167,11 +167,7 @@ class ProgressiveDistillTrainer(BaseDistillTrainer):
             "hidden_states": noisy_latents,
             "timestep": timesteps,
         }
-        if "encoder_hidden_states" in batch:
-            input_kwargs["encoder_hidden_states"] = batch["encoder_hidden_states"]
-        if "image_cond" in batch:
-            input_kwargs["image_cond"] = batch["image_cond"]
-        return input_kwargs
+        return self._augment_model_input(input_kwargs, batch)
 
     def on_train_step_end(self, metrics):
         """Check if we should advance to the next progressive stage."""

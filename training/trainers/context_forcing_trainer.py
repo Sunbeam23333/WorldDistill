@@ -69,14 +69,12 @@ class ContextForcingTrainer(BaseDistillTrainer):
         Returns:
             Memory context tensor (B, C, T_mem, H, W) or None for first chunk.
         """
-        start_frame = current_chunk_idx * chunk_size
-        mem_start = max(0, start_frame - self.memory_frames)
-        mem_end = start_frame
-
-        if mem_end <= mem_start:
-            return None
-
-        return all_frames[:, :, mem_start:mem_end]
+        return self.select_runtime_memory_frames(
+            all_frames=all_frames,
+            current_chunk_idx=current_chunk_idx,
+            chunk_size=chunk_size,
+            memory_frames=self.memory_frames,
+        )
 
     def _generate_teacher_context(
         self,
@@ -111,17 +109,28 @@ class ContextForcingTrainer(BaseDistillTrainer):
         noise = torch.randn_like(context_latents)
         noisy_context = (1 - noise_level) * context_latents + noise_level * noise
 
-        # Teacher denoises the context
-        t_ctx = torch.full((bs,), noise_level * self.num_train_timesteps, device=self.device)
-        teacher_input = self.prepare_teacher_input(batch, noisy_context, t_ctx)
-        with torch.no_grad():
-            teacher_v = self.teacher_model(**teacher_input)
-            if isinstance(teacher_v, (tuple, list)):
-                teacher_v = teacher_v[0]
+        def _produce_teacher_context() -> torch.Tensor:
+            t_ctx = torch.full((bs,), noise_level * self.num_train_timesteps, device=self.device)
+            teacher_input = self.prepare_teacher_input(batch, noisy_context, t_ctx)
+            teacher_v = self.run_teacher(
+                teacher_input,
+                batch,
+                cache_namespace="teacher_context_forward",
+                cache_extra={"chunk_start": chunk_start, "chunk_end": chunk_end, "timesteps": t_ctx},
+                allow_cache=False,
+            )
+            teacher_context = noisy_context.float() - noise_level * teacher_v.float()
+            return teacher_context.to(context_latents.dtype)
 
-        # Recover x_0 from velocity: x_0 = x_t - sigma * v
-        teacher_context = noisy_context.float() - noise_level * teacher_v.float()
-        return teacher_context.to(context_latents.dtype)
+        if self.runtime is not None and hasattr(self.runtime, "get_or_create_teacher_context"):
+            return self.runtime.get_or_create_teacher_context(
+                batch=batch,
+                global_step=self.global_step,
+                chunk_start=chunk_start,
+                chunk_end=chunk_end,
+                producer=_produce_teacher_context,
+            )
+        return _produce_teacher_context()
 
     def _build_context_input(
         self,
@@ -226,22 +235,20 @@ class ContextForcingTrainer(BaseDistillTrainer):
             loss_mask = self._build_context_mask(num_memory, num_target, bs)
             frame_timesteps = self._build_context_timesteps(num_memory, timesteps, bs, num_target)
 
-            # Teacher forward
             teacher_input = self.prepare_teacher_input(batch, model_input, frame_timesteps)
-            with torch.no_grad():
-                teacher_output = self.teacher_model(**teacher_input)
-                if isinstance(teacher_output, (tuple, list)):
-                    teacher_output = teacher_output[0]
-
-            # Student forward (with its own input preparation)
             student_input = self.prepare_student_input(batch, model_input, frame_timesteps)
-            student_output = self.student_model(**student_input)
-            if isinstance(student_output, (tuple, list)):
-                student_output = student_output[0]
+            teacher_output, student_output = self._run_teacher_student_pair(
+                teacher_input=teacher_input,
+                student_input=student_input,
+                batch=batch,
+                cache_extra={"mode": "context_chunk", "chunk_idx": chunk_idx, "timesteps": frame_timesteps},
+            )
 
-            # Masked loss (only on target frames)
-            diff = (student_output.float() - teacher_output.float().detach()) ** 2
-            chunk_loss = (diff * loss_mask).sum() / loss_mask.sum().clamp(min=1)
+            chunk_loss = self.compute_supervision_loss(
+                prediction=student_output,
+                target=teacher_output.detach(),
+                mask=loss_mask,
+            )
             total_loss = total_loss + chunk_loss
             num_loss_chunks += 1
 
@@ -267,15 +274,7 @@ class ContextForcingTrainer(BaseDistillTrainer):
             "hidden_states": noisy_latents,
             "timestep": timesteps,
         }
-        if "encoder_hidden_states" in batch:
-            input_kwargs["encoder_hidden_states"] = batch["encoder_hidden_states"]
-        if "image_cond" in batch:
-            input_kwargs["image_cond"] = batch["image_cond"]
-        if "camera_poses" in batch:
-            input_kwargs["camera_poses"] = batch["camera_poses"]
-        if "actions" in batch:
-            input_kwargs["actions"] = batch["actions"]
-        return input_kwargs
+        return self._augment_model_input(input_kwargs, batch)
 
     def on_train_step_end(self, metrics):
         """Advance curriculum if needed."""

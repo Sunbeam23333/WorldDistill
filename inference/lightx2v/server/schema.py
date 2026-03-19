@@ -45,6 +45,17 @@ class VideoTaskRequest(BaseTaskRequest):
     talk_objects: Optional[list[TalkObject]] = Field(None, description="Talk objects (Wan-Audio)")
     target_fps: Optional[int] = Field(16, description="Target FPS for video frame interpolation (overrides config)")
     resize_mode: Optional[str] = Field("adaptive", description="Resize mode (adaptive, keep_ratio_fixed_area, fixed_min_area, fixed_max_area, fixed_shape, fixed_min_side)")
+    image_strength: Optional[float] = Field(None, description="Image conditioning strength (i2av / image-guided tasks)")
+    last_frame_path: str = Field("", description="Last frame path for flf2v tasks")
+    src_ref_images: str = Field("", description="Reference image path(s) for VACE / Animate tasks")
+    src_video: str = Field("", description="Source video path for VACE tasks")
+    src_mask: str = Field("", description="Source mask path for VACE tasks")
+    src_pose_path: str = Field("", description="Source pose video path for animate tasks")
+    src_face_path: str = Field("", description="Source face video path for animate tasks")
+    src_bg_path: str = Field("", description="Source background video path for animate replace tasks")
+    src_mask_path: str = Field("", description="Source mask video path for animate replace tasks")
+    pose: str = Field("", description="Pose string or pose file path for WorldPlay tasks")
+    action_path: str = Field("", description="Camera pose / action control file path for LingBot or world models")
 
 
 class ImageTaskRequest(BaseTaskRequest):
@@ -59,6 +70,17 @@ class TaskRequest(BaseTaskRequest):
     talk_objects: Optional[list[TalkObject]] = Field(None, description="Talk objects (Wan-Audio)")
     aspect_ratio: str = Field("16:9", description="Output aspect ratio (T2I only)")
     target_fps: Optional[int] = Field(16, description="Target FPS for video frame interpolation (overrides config)")
+    image_strength: Optional[float] = Field(None, description="Image conditioning strength (i2av / image-guided tasks)")
+    last_frame_path: str = Field("", description="Last frame path for flf2v tasks")
+    src_ref_images: str = Field("", description="Reference image path(s) for VACE / Animate tasks")
+    src_video: str = Field("", description="Source video path for VACE tasks")
+    src_mask: str = Field("", description="Source mask path for VACE tasks")
+    src_pose_path: str = Field("", description="Source pose video path for animate tasks")
+    src_face_path: str = Field("", description="Source face video path for animate tasks")
+    src_bg_path: str = Field("", description="Source background video path for animate replace tasks")
+    src_mask_path: str = Field("", description="Source mask video path for animate replace tasks")
+    pose: str = Field("", description="Pose string or pose file path for WorldPlay tasks")
+    action_path: str = Field("", description="Camera pose / action control file path for LingBot or world models")
 
 
 class TaskStatusMessage(BaseModel):

@@ -7,12 +7,15 @@ torchaudio>=2.5.1
 flash-attn>=2.5.0
 
 # Diffusion / Transformers
-diffusers>=0.31.0
-transformers>=4.49.0
-tokenizers>=0.20.3
-accelerate>=1.1.1
-safetensors
-peft==0.17.0
+diffusers>=0.33.0,<1
+transformers==4.57.1
+tokenizers>=0.22.0,<0.23
+accelerate>=0.34.2,<2
+safetensors>=0.4.5,<1
+peft>=0.17.0,<1
+huggingface_hub>=0.25.0,<1
+PyYAML>=6.0,<7
+packaging>=24.2,<26
 
 # Video / Image
 opencv-python>=4.9.0.80
@@ -33,6 +36,10 @@ huggingface_hub
 gguf
 prometheus_client
 sgl-kernel
+
+# Experiment Tracking
+tensorboard>=2.16.2
+wandb>=0.19.0
 
 # Training / Distributed
 deepspeed>=0.14.0

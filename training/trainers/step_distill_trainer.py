@@ -148,60 +148,65 @@ class StepDistillTrainer(BaseDistillTrainer):
         sigmas_expanded = sigmas.view(bs, *([1] * (latents.dim() - 1)))
         noisy_latents = (1 - sigmas_expanded) * latents + sigmas_expanded * noise
 
-        # Teacher forward (no grad)
         teacher_input = self.prepare_teacher_input(batch, noisy_latents, timesteps)
-        with torch.no_grad():
-            teacher_output = self.teacher_model(**teacher_input)
-            if isinstance(teacher_output, (tuple, list)):
-                teacher_output = teacher_output[0]
 
         if not self.use_dual_model:
-            # Single model path
             student_input = self.prepare_student_input(batch, noisy_latents, timesteps)
-            student_output = self.student_model(**student_input)
-            if isinstance(student_output, (tuple, list)):
-                student_output = student_output[0]
-            loss = self.compute_distill_loss(teacher_output, student_output, batch, timesteps)
-            return loss
+            teacher_output, student_output = self._run_teacher_student_pair(
+                teacher_input=teacher_input,
+                student_input=student_input,
+                batch=batch,
+                cache_extra={"timesteps": timesteps, "mode": "step_distill"},
+            )
+            return self.compute_distill_loss(teacher_output, student_output, batch, timesteps)
 
-        # --- Dual-model: per-sample routing ---
+        pending_teacher = self.launch_teacher(
+            teacher_input,
+            batch,
+            cache_extra={"timesteps": timesteps, "mode": "step_distill"},
+        )
+
         boundary_sigma = self.distill_sigmas[self.boundary_step_index].item()
         boundary_t = boundary_sigma * self.num_train_timesteps
-
-        # Mask: True for high-noise samples, False for low-noise
-        high_mask = timesteps >= boundary_t  # (B,)
+        high_mask = timesteps >= boundary_t
         low_mask = ~high_mask
+
+        teacher_output = self.wait_teacher(pending_teacher)
+        if teacher_output is None:
+            teacher_output = self.run_teacher(
+                teacher_input,
+                batch,
+                cache_extra={"timesteps": timesteps, "mode": "step_distill"},
+            )
 
         total_loss = torch.tensor(0.0, device=self.device, requires_grad=True)
         count = 0
 
-        # High-noise samples through student_high
         if high_mask.any():
             h_idx = high_mask.nonzero(as_tuple=True)[0]
+            h_batch = self._subset_batch(batch, h_idx)
             h_input = self.prepare_student_input(
-                self._subset_batch(batch, h_idx),
+                h_batch,
                 noisy_latents[h_idx],
                 timesteps[h_idx],
             )
-            h_output = self.student_high(**h_input)
-            if isinstance(h_output, (tuple, list)):
-                h_output = h_output[0]
-            h_loss = F.mse_loss(h_output.float(), teacher_output[h_idx].float())
+            h_output = self.run_student(h_input, h_batch, model=self.student_high, tag="student_high")
+            h_mask = h_batch.get("loss_mask") if isinstance(h_batch, dict) else None
+            h_loss = self.compute_supervision_loss(h_output, teacher_output[h_idx].detach(), mask=h_mask)
             total_loss = total_loss + h_loss * h_idx.shape[0]
             count += h_idx.shape[0]
 
-        # Low-noise samples through student_low
         if low_mask.any():
             l_idx = low_mask.nonzero(as_tuple=True)[0]
+            l_batch = self._subset_batch(batch, l_idx)
             l_input = self.prepare_student_input(
-                self._subset_batch(batch, l_idx),
+                l_batch,
                 noisy_latents[l_idx],
                 timesteps[l_idx],
             )
-            l_output = self.student_low(**l_input)
-            if isinstance(l_output, (tuple, list)):
-                l_output = l_output[0]
-            l_loss = F.mse_loss(l_output.float(), teacher_output[l_idx].float())
+            l_output = self.run_student(l_input, l_batch, model=self.student_low, tag="student_low")
+            l_mask = l_batch.get("loss_mask") if isinstance(l_batch, dict) else None
+            l_loss = self.compute_supervision_loss(l_output, teacher_output[l_idx].detach(), mask=l_mask)
             total_loss = total_loss + l_loss * l_idx.shape[0]
             count += l_idx.shape[0]
 
@@ -228,17 +233,11 @@ class StepDistillTrainer(BaseDistillTrainer):
         timesteps: torch.Tensor,
     ) -> torch.Tensor:
         """MSE loss between teacher and student flow predictions."""
-        loss = F.mse_loss(student_output.float(), teacher_output.float(), reduction="none")
-
-        # Apply mask if available (e.g., i2v condition frames)
-        if "loss_mask" in batch:
-            mask = batch["loss_mask"]
-            loss = loss * mask
-            loss = loss.sum() / mask.sum().clamp(min=1)
-        else:
-            loss = loss.mean()
-
-        return loss
+        return self.compute_supervision_loss(
+            prediction=student_output,
+            target=teacher_output.detach(),
+            mask=batch.get("loss_mask"),
+        )
 
     def prepare_teacher_input(
         self,
@@ -251,11 +250,7 @@ class StepDistillTrainer(BaseDistillTrainer):
             "hidden_states": noisy_latents,
             "timestep": timesteps,
         }
-        if "encoder_hidden_states" in batch:
-            input_kwargs["encoder_hidden_states"] = batch["encoder_hidden_states"]
-        if "image_cond" in batch:
-            input_kwargs["image_cond"] = batch["image_cond"]
-        return input_kwargs
+        return self._augment_model_input(input_kwargs, batch)
 
     def save_checkpoint(self, step: int, output_dir: str):
         """Save checkpoint including dual model if used."""

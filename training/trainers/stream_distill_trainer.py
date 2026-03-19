@@ -131,16 +131,12 @@ class StreamDistillTrainer(BaseDistillTrainer):
             teacher_input["temporal_mask"] = causal_mask
             student_input["temporal_mask"] = causal_mask
 
-        # Teacher forward with per-frame timesteps
-        with torch.no_grad():
-            teacher_output = self.teacher_model(**teacher_input)
-            if isinstance(teacher_output, (tuple, list)):
-                teacher_output = teacher_output[0]
-
-        # Student forward
-        student_output = self.student_model(**student_input)
-        if isinstance(student_output, (tuple, list)):
-            student_output = student_output[0]
+        teacher_output, student_output = self._run_teacher_student_pair(
+            teacher_input=teacher_input,
+            student_input=student_input,
+            batch=batch,
+            cache_extra={"timesteps": per_frame_timesteps, "mode": "stream_window", "window_frames": num_frames},
+        )
 
         loss = self.compute_distill_loss(
             teacher_output, student_output, batch, per_frame_timesteps
@@ -221,10 +217,4 @@ class StreamDistillTrainer(BaseDistillTrainer):
             "hidden_states": noisy_latents,
             "timestep": timesteps,  # (B, T) per-frame timesteps
         }
-
-        if "encoder_hidden_states" in batch:
-            input_kwargs["encoder_hidden_states"] = batch["encoder_hidden_states"]
-        if "image_cond" in batch:
-            input_kwargs["image_cond"] = batch["image_cond"]
-
-        return input_kwargs
+        return self._augment_model_input(input_kwargs, batch)

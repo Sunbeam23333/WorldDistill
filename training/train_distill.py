@@ -48,21 +48,49 @@ Model loading strategies (in priority order):
 """
 
 import copy
+import json
 import os
 import random
 import sys
+from importlib import import_module
+from pathlib import Path
 
 import numpy as np
 import torch
 from loguru import logger
 
-from training.trainer_args import parse_training_args
-from training.trainers import build_trainer
-from training.utils.optimizers import build_optimizer
-from training.utils.schedulers import build_lr_scheduler
-from training.utils.distributed import setup_distributed, cleanup_distributed, is_main_process
-from training.data.video_dataset import CachedLatentDataset
-from training.data.bucket_sampler import BucketSampler
+if __package__ in {None, ""}:  # pragma: no cover - script entry fallback
+    _PROJECT_ROOT = Path(__file__).resolve().parents[1]
+    if str(_PROJECT_ROOT) not in sys.path:
+        sys.path.insert(0, str(_PROJECT_ROOT))
+    validate_runtime_dependency_versions = import_module("training.env_compat").validate_runtime_dependency_versions
+    parse_training_args = import_module("training.trainer_args").parse_training_args
+    build_trainer = import_module("training.trainers").build_trainer
+    runtime_module = import_module("training.runtime")
+    build_distill_cache = runtime_module.build_distill_cache
+    build_runtime = runtime_module.build_runtime
+    DiffusersRawBatchEncoder = import_module("training.utils.batch_encoder").DiffusersRawBatchEncoder
+    build_optimizer = import_module("training.utils.optimizers").build_optimizer
+    build_lr_scheduler = import_module("training.utils.schedulers").build_lr_scheduler
+    distributed_module = import_module("training.utils.distributed")
+    setup_distributed = distributed_module.setup_distributed
+    cleanup_distributed = distributed_module.cleanup_distributed
+    is_main_process = distributed_module.is_main_process
+    video_dataset_module = import_module("training.data.video_dataset")
+    CachedLatentDataset = video_dataset_module.CachedLatentDataset
+    VideoDataset = video_dataset_module.VideoDataset
+    BucketSampler = import_module("training.data.bucket_sampler").BucketSampler
+else:
+    from .env_compat import validate_runtime_dependency_versions
+    from .trainer_args import parse_training_args
+    from .trainers import build_trainer
+    from .runtime import build_distill_cache, build_runtime
+    from .utils.batch_encoder import DiffusersRawBatchEncoder
+    from .utils.optimizers import build_optimizer
+    from .utils.schedulers import build_lr_scheduler
+    from .utils.distributed import setup_distributed, cleanup_distributed, is_main_process
+    from .data.video_dataset import CachedLatentDataset, VideoDataset
+    from .data.bucket_sampler import BucketSampler
 
 
 def set_seed(seed: int):
@@ -76,8 +104,51 @@ def set_seed(seed: int):
     # torch.backends.cudnn.benchmark = False
 
 
+def _resolve_data_mode(data_json: str, requested_mode: str) -> str:
+    if requested_mode != "auto":
+        return requested_mode
+
+    with open(data_json, "r") as f:
+        manifest = json.load(f)
+
+    if not manifest:
+        raise ValueError(f"Dataset manifest is empty: {data_json}")
+
+    sample = manifest[0]
+    if "latent_path" in sample:
+        return "cached"
+    if "path" in sample or "video_path" in sample:
+        return "raw"
+
+    raise ValueError(
+        f"Unable to infer data mode from manifest {data_json}. "
+        "Please set --data_mode explicitly to `cached` or `raw`."
+    )
+
+
+def _build_dataset(
+    data_json: str,
+    data_mode: str,
+    cache_dir: str,
+    video_dir: str,
+    resolution: str,
+    num_frames: int,
+):
+    if data_mode == "cached":
+        return CachedLatentDataset(data_json=data_json, cache_dir=cache_dir)
+    if data_mode == "raw":
+        return VideoDataset(
+            data_json=data_json,
+            video_dir=video_dir,
+            resolution=resolution,
+            num_frames=num_frames,
+        )
+    raise ValueError(f"Unsupported data_mode: {data_mode}")
+
+
 def main():
     args = parse_training_args()
+    validate_runtime_dependency_versions(strict=getattr(args, "strict_env_check", True))
     rank, world_size = setup_distributed()
     device = torch.device(f"cuda:{rank % torch.cuda.device_count()}" if torch.cuda.is_available() else "cpu")
 
@@ -86,8 +157,15 @@ def main():
 
     if is_main_process():
         logger.info(f"WorldDistill Training | Method: {args.distill_method} | Model: {args.model_cls}")
+        logger.info(
+            f"Model metadata | architecture={args.model_architecture or 'unknown'} | "
+            f"family={args.model_family or 'unknown'} | "
+            f"checkpoint_format={args.checkpoint_format or 'unknown'} | "
+            f"runner={args.resolved_runner_cls or args.model_cls}"
+        )
         logger.info(f"Distributed: world_size={world_size}, device={device}")
         logger.info(f"Parallel mode: {args.parallel_mode} | SP size: {args.sp_size}")
+        logger.info(f"Requested data mode: {args.data_mode}")
         if args.parallel_mode == "deepspeed":
             logger.info(f"DeepSpeed ZeRO stage: {args.deepspeed_stage}")
         elif args.parallel_mode == "fsdp":
@@ -95,7 +173,15 @@ def main():
         os.makedirs(args.output_dir, exist_ok=True)
 
     # --- Build Dataset & DataLoader ---
-    dataset = CachedLatentDataset(data_json=args.data_json, cache_dir=args.cache_dir)
+    train_data_mode = _resolve_data_mode(args.data_json, args.data_mode)
+    dataset = _build_dataset(
+        data_json=args.data_json,
+        data_mode=train_data_mode,
+        cache_dir=args.cache_dir,
+        video_dir=args.video_dir,
+        resolution=args.resolution,
+        num_frames=args.num_frames,
+    )
 
     if args.use_bucket_sampler:
         sampler = BucketSampler(
@@ -114,10 +200,16 @@ def main():
 
     # --- Build Validation DataLoader (optional) ---
     val_dataloader = None
+    val_data_mode = None
     if args.val_data_json:
-        val_dataset = CachedLatentDataset(
+        val_data_mode = _resolve_data_mode(args.val_data_json, args.data_mode)
+        val_dataset = _build_dataset(
             data_json=args.val_data_json,
+            data_mode=val_data_mode,
             cache_dir=args.val_cache_dir if args.val_cache_dir else args.cache_dir,
+            video_dir=args.video_dir,
+            resolution=args.resolution,
+            num_frames=args.num_frames,
         )
         val_sampler = (
             torch.utils.data.distributed.DistributedSampler(val_dataset, shuffle=False)
@@ -131,6 +223,19 @@ def main():
             num_workers=args.num_workers,
             pin_memory=True,
             drop_last=False,
+        )
+
+    batch_encoder = None
+    if train_data_mode == "raw" or val_data_mode == "raw":
+        encoder_dtype = torch.float32
+        if args.mixed_precision == "bf16":
+            encoder_dtype = torch.bfloat16
+        elif args.mixed_precision == "fp16":
+            encoder_dtype = torch.float16
+        batch_encoder = DiffusersRawBatchEncoder(
+            model_path=args.teacher_model_path,
+            device=device,
+            dtype=encoder_dtype,
         )
 
     # --- Build Models ---
@@ -166,6 +271,15 @@ def main():
         min_lr_ratio=args.lr_min_ratio,
     )
 
+    distill_cache = build_distill_cache(args)
+    runtime = build_runtime(
+        args=args,
+        teacher_model=teacher_model,
+        student_model=student_model,
+        device=device,
+        distill_cache=distill_cache,
+    )
+
     # --- Build Trainer ---
     trainer = build_trainer(
         method=args.distill_method,
@@ -177,11 +291,101 @@ def main():
         train_dataloader=dataloader,
         val_dataloader=val_dataloader,
         device=device,
+        batch_encoder=batch_encoder,
+        runtime=runtime,
+        distill_cache=distill_cache,
     )
 
     # --- Train ---
     trainer.train()
     cleanup_distributed()
+
+
+def _candidate_model_dirs(model_path: str, model_cls: str, config_json: str = "") -> list[str]:
+    if not model_path:
+        return []
+    if os.path.isfile(model_path):
+        return [os.path.dirname(model_path)]
+
+    preferred_subdirs = [
+        "",
+        "transformer",
+        "original",
+        "distill_models",
+        os.path.join("distill_models", "transformer"),
+        "low_noise_model",
+        "high_noise_model",
+        os.path.join("distill_models", "low_noise_model"),
+        os.path.join("distill_models", "high_noise_model"),
+    ]
+    if model_cls in {"hunyuan_video_1.5", "hunyuan_video_1.5_distill", "worldplay_distill", "worldplay_ar", "worldplay_bi"}:
+        preferred_subdirs = ["transformer", "", *preferred_subdirs[2:]]
+
+    config_overrides: dict[str, str] = {}
+    if config_json and os.path.exists(config_json):
+        try:
+            with open(config_json, "r") as f:
+                raw_config = json.load(f)
+            if isinstance(raw_config, dict):
+                config_overrides = {str(k): str(v) for k, v in raw_config.items() if isinstance(v, (str, os.PathLike))}
+        except Exception as exc:
+            logger.warning(f"Failed to read config_json {config_json}: {exc}")
+
+    candidates: list[str] = []
+
+    def _append_candidate(candidate: str) -> None:
+        normalized = os.path.normpath(candidate)
+        if os.path.isdir(normalized) and normalized not in candidates:
+            candidates.append(normalized)
+
+    for relative_dir in preferred_subdirs:
+        candidate = os.path.join(model_path, relative_dir) if relative_dir else model_path
+        _append_candidate(candidate)
+
+    transformer_model_name = config_overrides.get("transformer_model_name", "")
+    if transformer_model_name:
+        _append_candidate(os.path.join(model_path, "transformer", transformer_model_name))
+        _append_candidate(os.path.join(model_path, "distill_models", transformer_model_name))
+
+    transformer_model_path = config_overrides.get("transformer_model_path", "")
+    if transformer_model_path:
+        if not os.path.isabs(transformer_model_path):
+            transformer_model_path = os.path.join(model_path, transformer_model_path)
+        _append_candidate(transformer_model_path)
+
+    for checkpoint_key in ("dit_original_ckpt", "high_noise_original_ckpt", "low_noise_original_ckpt"):
+        checkpoint_path = config_overrides.get(checkpoint_key, "")
+        if not checkpoint_path:
+            continue
+        if not os.path.isabs(checkpoint_path):
+            checkpoint_path = os.path.join(model_path, checkpoint_path)
+        _append_candidate(os.path.dirname(checkpoint_path))
+
+    for nested_parent in ("transformer", "distill_models"):
+        parent_dir = os.path.join(model_path, nested_parent)
+        if not os.path.isdir(parent_dir):
+            continue
+        for child_name in sorted(os.listdir(parent_dir)):
+            _append_candidate(os.path.join(parent_dir, child_name))
+
+    return candidates
+
+
+def _find_weight_files(model_dir: str) -> list[str]:
+    import glob
+
+    patterns = ("*.safetensors", "*.bin", "*.pt", "*.pth", "*.ckpt")
+    weight_files: list[str] = []
+    for pattern in patterns:
+        weight_files.extend(sorted(glob.glob(os.path.join(model_dir, pattern))))
+        weight_files.extend(sorted(glob.glob(os.path.join(model_dir, "**", pattern), recursive=True)))
+
+    deduped: list[str] = []
+    for weight_file in weight_files:
+        normalized = os.path.normpath(weight_file)
+        if normalized not in deduped:
+            deduped.append(normalized)
+    return deduped
 
 
 def _load_models(
@@ -215,50 +419,43 @@ def _load_models(
             "Please provide a valid --teacher_model_path."
         )
 
+    candidate_dirs = _candidate_model_dirs(teacher_path, model_cls, config_json)
+
     # --- Strategy 1: diffusers pipeline ---
-    if os.path.isdir(teacher_path):
-        # Check for model_index.json (diffusers format)
-        has_diffusers = (
-            os.path.exists(os.path.join(teacher_path, "model_index.json"))
-            or os.path.exists(os.path.join(teacher_path, "config.json"))
-        )
-        if has_diffusers:
-            try:
-                from diffusers import DiffusionPipeline
-                pipe = DiffusionPipeline.from_pretrained(
-                    teacher_path, torch_dtype=torch.bfloat16
-                )
-                # Extract the core denoising model (transformer for DiT, unet for UNet)
-                if hasattr(pipe, "transformer") and pipe.transformer is not None:
-                    teacher_model = pipe.transformer.to(device)
-                elif hasattr(pipe, "unet") and pipe.unet is not None:
-                    teacher_model = pipe.unet.to(device)
-                else:
-                    logger.warning("diffusers pipeline loaded but no transformer/unet found.")
-                if teacher_model is not None:
-                    logger.info(f"Loaded teacher via diffusers: {type(teacher_model).__name__}")
-                del pipe
-                torch.cuda.empty_cache()
-            except Exception as e:
-                logger.warning(f"diffusers loading failed: {e}")
+    for candidate_dir in candidate_dirs:
+        has_diffusers = os.path.exists(os.path.join(candidate_dir, "model_index.json"))
+        if not has_diffusers:
+            continue
+        try:
+            from diffusers import DiffusionPipeline
+            pipe = DiffusionPipeline.from_pretrained(candidate_dir, torch_dtype=torch.bfloat16)
+            if hasattr(pipe, "transformer") and pipe.transformer is not None:
+                teacher_model = pipe.transformer.to(device)
+            elif hasattr(pipe, "unet") and pipe.unet is not None:
+                teacher_model = pipe.unet.to(device)
+            else:
+                logger.warning("diffusers pipeline loaded but no transformer/unet found.")
+            if teacher_model is not None:
+                logger.info(f"Loaded teacher via diffusers from {candidate_dir}: {type(teacher_model).__name__}")
+            del pipe
+            torch.cuda.empty_cache()
+            if teacher_model is not None:
+                break
+        except Exception as e:
+            logger.warning(f"diffusers loading failed from {candidate_dir}: {e}")
 
     # --- Strategy 2: Direct state_dict loading ---
     if teacher_model is None:
-        import glob
         if os.path.isdir(teacher_path):
-            # Look for weight files
-            weight_files = sorted(glob.glob(os.path.join(teacher_path, "*.safetensors")))
-            if not weight_files:
-                weight_files = sorted(glob.glob(os.path.join(teacher_path, "*.bin")))
-            if not weight_files:
-                weight_files = sorted(glob.glob(os.path.join(teacher_path, "*.pt")))
-
-            if weight_files:
-                logger.info(f"Found {len(weight_files)} weight files in {teacher_path}")
-                # Try to load a transformer config and construct model
-                teacher_model = _construct_model_from_weights(teacher_path, weight_files, model_cls, device)
+            for candidate_dir in candidate_dirs:
+                weight_files = _find_weight_files(candidate_dir)
+                if not weight_files:
+                    continue
+                logger.info(f"Found {len(weight_files)} weight files in {candidate_dir}")
+                teacher_model = _construct_model_from_weights(candidate_dir, weight_files, model_cls, device)
+                if teacher_model is not None:
+                    break
         else:
-            # Single file
             logger.info(f"Loading single weight file: {teacher_path}")
             teacher_model = _construct_model_from_weights(
                 os.path.dirname(teacher_path), [teacher_path], model_cls, device
@@ -318,7 +515,7 @@ def _load_models(
 
 
 def _construct_model_from_weights(
-    model_dir: str, weight_files: list, model_cls: str, device: torch.device
+    model_dir: str, weight_files: list[str], model_cls: str, device: torch.device
 ):
     """Construct a model from weight files.
 

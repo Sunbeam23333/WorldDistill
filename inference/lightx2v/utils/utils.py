@@ -640,12 +640,23 @@ def validate_task_arguments(args: "argparse.Namespace") -> None:
     Raises:
         AssertionError: If required arguments are missing or invalid for the task
     """
+    from lightx2v.utils.model_catalog import normalize_model_cls, resolve_model_metadata
+
     # Check model_path exists
     model_path = getattr(args, "model_path", None)
     if model_path:
         check_path_exists(model_path)
 
+    if hasattr(args, "model_cls"):
+        args.model_cls = normalize_model_cls(args.model_cls)
+
     task = args.task
+    metadata = resolve_model_metadata(getattr(args, "model_cls", ""), model_path=model_path, task=task)
+    if not metadata.get("supports_task", True):
+        raise ValueError(
+            f"Model '{metadata['canonical_model_cls']}' does not advertise task '{task}'. "
+            f"Supported tasks: {metadata.get('tasks', [])}"
+        )
 
     # Define required file paths for each task
     task_requirements = {
@@ -659,6 +670,7 @@ def validate_task_arguments(args: "argparse.Namespace") -> None:
         "t2v": {"required_paths": [], "description": "Text-to-Video task"},
         "t2i": {"required_paths": [], "description": "Text-to-Image task"},
         "i2av": {"required_paths": ["image_path"], "description": "Image-to-Audio-Video task requires --image_path"},
+        "game": {"required_paths": [], "description": "Game/world-model task"},
     }
 
     if task not in task_requirements:
@@ -704,6 +716,11 @@ def validate_config_paths(config: dict) -> None:
     if "dit_original_ckpt" in config and config["dit_original_ckpt"] is not None:
         check_path_exists(config["dit_original_ckpt"])
         logger.debug(f"✓ Verified dit_original_ckpt: {config['dit_original_ckpt']}")
+
+    for optional_path_key in ("transformer_model_path", "action_ckpt", "action_path"):
+        if optional_path_key in config and config[optional_path_key]:
+            check_path_exists(config[optional_path_key])
+            logger.debug(f"✓ Verified {optional_path_key}: {config[optional_path_key]}")
 
     # For wan2.2, check high and low noise checkpoints
     model_cls = config.get("model_cls", "")

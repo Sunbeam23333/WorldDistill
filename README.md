@@ -85,7 +85,7 @@ WorldDistill provides a **unified framework** for distilling video generation mo
 - **Inference Engine**: LightX2V-based multi-GPU inference, step-distill schedulers, stream/consistency schedulers.
 - **Data & Sampling**: cached latent dataset, bucket sampler for variable resolution/frames.
 - **Utilities**: model downloader, fast sync, weight conversion, camera pose generator.
-- **Logging**: console logging with optional WandB.
+- **Logging / Dashboards**: console, TensorBoard, and optional W&B with runtime/cache/performance metrics.
 - **Evaluation**: periodic validation via `val_data_json` and `eval_every`.
 
 ## Quick Start
@@ -107,6 +107,7 @@ pip install torch==2.5.1 --index-url https://download.pytorch.org/whl/cu121
 pip install flash-attn --no-build-isolation
 cd inference && pip install -e . && cd ..
 pip install -r requirements.txt
+pip install "transformers==4.57.1"
 ```
 
 ### 2. Download Models
@@ -261,6 +262,33 @@ torchrun --nproc_per_node=8 training/train_distill.py \
     --val_data_json data/val.json \
     --eval_every 5000 \
     --eval_batches 4
+```
+
+### Training Monitoring / Dashboards
+
+```bash
+bash scripts/run_train.sh \
+    --method context_forcing \
+    --teacher_model ./models/HunyuanVideo-WorldPlay \
+    --data_json data/train.json \
+    --report_to console,tensorboard,wandb \
+    --wandb_project worlddistill \
+    --wandb_run_name context-forcing-dpp
+```
+
+Tracked metrics now include:
+
+- training loss / eval loss / learning rate / grad norm
+- optimizer skip count for unstable steps
+- step time, steps/sec, samples/sec, ETA
+- GPU allocated/reserved/peak memory (when running on CUDA)
+- runtime cache hits/misses, prefetch count, DPP async launch/wait stats
+
+Useful commands:
+
+```bash
+tensorboard --logdir results/training/tensorboard --port 6006
+wandb sync ./results/training/wandb
 ```
 
 ### 5. Benchmarking

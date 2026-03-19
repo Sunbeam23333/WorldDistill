@@ -13,7 +13,7 @@ class VideoGenerationService(BaseGenerationService):
         return ".mp4"
 
     def get_task_type(self) -> str:
-        return "t2v,i2v,s2v"
+        return "t2v,i2v,flf2v,vace,animate,s2v,rs2v,t2av,i2av"
 
     async def generate_with_stop_event(self, message: Any, stop_event) -> Optional[Any]:
         return await super().generate_with_stop_event(message, stop_event)

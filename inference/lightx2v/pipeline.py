@@ -10,6 +10,8 @@ import torch
 import torch.distributed as dist
 from loguru import logger
 
+from lightx2v.models.runners.bagel.bagel_runner import BagelRunner  # noqa: F401
+from lightx2v.models.runners.hunyuan_video.hunyuan_video_15_distill_runner import HunyuanVideo15DistillRunner  # noqa: F401
 from lightx2v.models.runners.hunyuan_video.hunyuan_video_15_runner import HunyuanVideo15Runner  # noqa: F401
 from lightx2v.models.runners.longcat_image.longcat_image_runner import LongCatImageRunner  # noqa: F401
 from lightx2v.models.runners.ltx2.ltx2_runner import LTX2Runner  # noqa: F401
@@ -19,13 +21,27 @@ from lightx2v.models.runners.wan.wan_audio_runner import Wan22AudioRunner, WanAu
 from lightx2v.models.runners.wan.wan_distill_runner import WanDistillRunner  # noqa: F401
 from lightx2v.models.runners.wan.wan_matrix_game2_runner import WanSFMtxg2Runner  # noqa: F401
 from lightx2v.models.runners.wan.wan_runner import Wan22MoeRunner, WanRunner  # noqa: F401
+from lightx2v.models.runners.wan.lingbot_runner import LingBotCamMoeRunner  # noqa: F401
 from lightx2v.models.runners.wan.wan_sf_runner import WanSFRunner  # noqa: F401
 from lightx2v.models.runners.wan.wan_vace_runner import WanVaceRunner  # noqa: F401
+from lightx2v.models.runners.world_models import (  # noqa: F401
+    CAMRunner,
+    GameCraftRunner,
+    GameFactoryRunner,
+    GameGenXRunner,
+    GenieRunner,
+    InfiniteWorldRunner,
+    MirageRunner,
+    SkyReelsV2Runner,
+    SPMemRunner,
+    VMemRunner,
+)
 from lightx2v.models.runners.worldplay.worldplay_ar_runner import WorldPlayARRunner  # noqa: F401
 from lightx2v.models.runners.worldplay.worldplay_bi_runner import WorldPlayBIRunner  # noqa: F401
 from lightx2v.models.runners.worldplay.worldplay_distill_runner import WorldPlayDistillRunner  # noqa: F401
 from lightx2v.models.runners.z_image.z_image_runner import ZImageRunner  # noqa: F401
 from lightx2v.utils.input_info import init_empty_input_info, update_input_info_from_dict
+from lightx2v.utils.model_catalog import normalize_model_cls, resolve_model_metadata
 from lightx2v.utils.registry_factory import RUNNER_REGISTER
 from lightx2v.utils.set_config import set_config, set_parallel_config
 from lightx2v.utils.utils import seed_all, validate_config_paths
@@ -73,7 +89,19 @@ class LightX2VPipeline:
     ):
         self.task = task
         self.model_path = model_path
-        self.model_cls = model_cls
+        self.raw_model_cls = model_cls
+        self.model_cls = normalize_model_cls(model_cls)
+        self.model_metadata = resolve_model_metadata(self.model_cls, model_path=model_path, task=task)
+        self.model_architecture = self.model_metadata["architecture"]
+        self.model_family = self.model_metadata["model_family"]
+        self.checkpoint_format = self.model_metadata["checkpoint_format"]
+        self.supported_tasks = self.model_metadata["tasks"]
+        self.model_modalities = self.model_metadata["modalities"]
+        self.input_modalities = self.model_metadata["input_modalities"]
+        self.output_modalities = self.model_metadata["output_modalities"]
+        self.primary_modality = self.model_metadata["primary_modality"]
+        self.distill_stage = self.model_metadata["distill_stage"]
+        self.teacher_model_cls = self.model_metadata["teacher_model_cls"]
         self.sf_model_path = sf_model_path
         self.dit_original_ckpt = dit_original_ckpt
         self.low_noise_original_ckpt = low_noise_original_ckpt
@@ -88,10 +116,10 @@ class LightX2VPipeline:
             "wan2.1_sf_mtxg2",
             "seko_talk",
             "wan2.2_moe",
-            "wan2.2_moe_audio",
             "wan2.2_audio",
             "wan2.2_moe_distill",
             "wan2.2_animate",
+            "lingbot_cam_moe",
         ]:
             self.vae_stride = (4, 8, 8)
             if self.model_cls.startswith("wan2.2"):
@@ -106,10 +134,10 @@ class LightX2VPipeline:
             self.num_channels_latents = 128
             self.audio_mel_bins = 16
 
-        if model_cls in ["qwen-image", "qwen-image-2512", "qwen-image-edit", "qwen-image-edit-2509", "qwen-image-edit-2511"]:
+        if self.raw_model_cls in ["qwen-image", "qwen-image-2512", "qwen-image-edit", "qwen-image-edit-2509", "qwen-image-edit-2511"]:
             self.CONDITION_IMAGE_SIZE = 147456
             self.USE_IMAGE_ID_IN_PROMPT = True
-            if model_cls == "qwen-image-edit":
+            if self.raw_model_cls == "qwen-image-edit":
                 self.CONDITION_IMAGE_SIZE = 1048576
                 self.USE_IMAGE_ID_IN_PROMPT = False
             self.model_cls = "qwen_image"
@@ -121,7 +149,7 @@ class LightX2VPipeline:
                 self.prompt_template_encode_start_idx = 34
         elif self.model_cls in ["z_image"]:
             self.model_cls = "z_image"
-        elif model_cls in ["longcat_image", "longcat-image"]:
+        elif self.raw_model_cls in ["longcat_image", "longcat-image"]:
             self.model_cls = "longcat_image"
 
         self.input_info = init_empty_input_info(self.task)
@@ -315,7 +343,6 @@ class LightX2VPipeline:
             "seko_talk",
             "wan2.2_moe",
             "wan2.2",
-            "wan2.2_moe_audio",
             "wan2.2_audio",
             "wan2.2_moe_distill",
             "wan2.2_animate",
@@ -396,6 +423,18 @@ class LightX2VPipeline:
             "seq_p_attn_type": seq_p_attn_type,
         }
 
+    def _result_label(self) -> str:
+        outputs = set(self.output_modalities)
+        if "video" in outputs and "audio" in outputs:
+            return "audio-video result"
+        if "video" in outputs:
+            return "video"
+        if "image" in outputs:
+            return "image"
+        if "audio" in outputs:
+            return "audio"
+        return "result"
+
     @torch.no_grad()
     def generate(
         self,
@@ -410,6 +449,12 @@ class LightX2VPipeline:
         src_ref_images=None,
         src_video=None,
         src_mask=None,
+        src_pose_path=None,
+        src_face_path=None,
+        src_bg_path=None,
+        src_mask_path=None,
+        pose=None,
+        action_path=None,
         return_result_tensor=False,
         target_shape=[],
     ):
@@ -423,6 +468,12 @@ class LightX2VPipeline:
         self.src_ref_images = src_ref_images
         self.src_video = src_video
         self.src_mask = src_mask
+        self.src_pose_path = src_pose_path
+        self.src_face_path = src_face_path
+        self.src_bg_path = src_bg_path
+        self.src_mask_path = src_mask_path
+        self.pose = pose
+        self.action_path = action_path
         self.prompt = prompt
         self.negative_prompt = negative_prompt
         self.save_result_path = save_result_path
@@ -434,8 +485,9 @@ class LightX2VPipeline:
         seed_all(self.seed)
         update_input_info_from_dict(input_info, self)
         self.runner.run_pipeline(input_info)
-        logger.info("Video generated successfully!")
-        logger.info(f"Video Saved in {save_result_path}")
+        result_label = self._result_label()
+        logger.info(f"{result_label.capitalize()} generated successfully!")
+        logger.info(f"{result_label.capitalize()} saved in {save_result_path}")
 
     def _init_runner(self, config):
         torch.set_grad_enabled(False)

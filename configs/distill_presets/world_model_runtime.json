@@ -1,0 +1,20 @@
+{
+  "distill_method": "context_forcing",
+  "enable_runtime": true,
+  "runtime_name": "world_model",
+  "runtime_cache_backend": "hybrid",
+  "runtime_cache_max_entries": 256,
+  "runtime_cache_hot_entries": 64,
+  "runtime_cache_pin_memory": true,
+  "runtime_freshness_steps": 200,
+  "runtime_teacher_cache_mode": "teacher_context",
+  "runtime_prefetch_policy": "next_chunk",
+  "runtime_memory_policy": "hybrid_sparse",
+  "runtime_memory_budget_frames": 20,
+  "runtime_memory_recent_ratio": 0.6,
+  "runtime_enable_heterogeneous": true,
+  "runtime_teacher_offload": "cpu",
+  "runtime_enable_dpp": true,
+  "enable_fused_supervision_kernel": true,
+  "fused_supervision_backend": "triton"
+}

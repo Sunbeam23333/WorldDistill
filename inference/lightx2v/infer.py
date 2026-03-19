@@ -37,8 +37,10 @@ from lightx2v.models.runners.world_models import (  # noqa: F401
     CAMRunner,
     MirageRunner,
 )
+from lightx2v.utils.env_compat import validate_runtime_dependency_versions
 from lightx2v.utils.envs import *
 from lightx2v.utils.input_info import init_empty_input_info, update_input_info_from_dict
+from lightx2v.utils.model_catalog import get_supported_model_inputs, resolve_model_metadata
 from lightx2v.utils.profiler import *
 from lightx2v.utils.registry_factory import RUNNER_REGISTER
 from lightx2v.utils.set_config import print_config, set_config, set_parallel_config
@@ -60,51 +62,16 @@ def main():
         "--model_cls",
         type=str,
         required=True,
-        choices=[
-            "wan2.1",
-            "wan2.1_distill",
-            "wan2.1_mean_flow_distill",
-            "wan2.1_vace",
-            "wan2.1_sf",
-            "wan2.1_sf_mtxg2",
-            "seko_talk",
-            "wan2.2_moe",
-            "wan2.2",
-            "wan2.2_moe_audio",
-            "wan2.2_audio",
-            "wan2.2_moe_distill",
-            "wan2.2_moe_vace",
-            "qwen_image",
-            "longcat_image",
-            "wan2.2_animate",
-            "hunyuan_video_1.5",
-            "hunyuan_video_1.5_distill",
-            "worldplay_distill",
-            "worldplay_ar",
-            "worldplay_bi",
-            "z_image",
-            "ltx2",
-            "bagel",
-            "lingbot_cam_moe",
-            # World models
-            "skyreels_v2",
-            "gamecraft",
-            "gamefactory",
-            "infinite_world",
-            "genie",
-            "gamegen_x",
-            "vmem",
-            "spmem",
-            "cam",
-            "mirage",
-        ],
+        choices=list(get_supported_model_inputs()),
         default="wan2.1",
+        help="Model key or alias. Canonical names and common aliases are both accepted.",
     )
 
-    parser.add_argument("--task", type=str, choices=["t2v", "i2v", "t2i", "i2i", "flf2v", "vace", "animate", "s2v", "rs2v", "t2av", "i2av"], default="t2v")
+    parser.add_argument("--task", type=str, choices=["t2v", "i2v", "t2i", "i2i", "flf2v", "vace", "animate", "s2v", "rs2v", "t2av", "i2av", "game"], default="t2v")
     parser.add_argument("--model_path", type=str, required=True)
     parser.add_argument("--sf_model_path", type=str, required=False)
-    parser.add_argument("--config_json", type=str, required=True)
+    parser.add_argument("--config_json", type=str, default="")
+    parser.add_argument("--transformer_model_name", type=str, default="")
     parser.add_argument("--use_prompt_enhancer", action="store_true")
 
     parser.add_argument("--prompt", type=str, default="", help="The input prompt for text-to-video generation")
@@ -180,13 +147,33 @@ def main():
         default=None,
         help="Path to camera pose file (JSON/NPY/NPZ) for LingBot camera control.",
     )
-    parser.add_argument("--save_result_path", type=str, default=None, help="The path to save video path/file")
+    parser.add_argument("--save_result_path", type=str, default=None, help="The path to save generated result file (video/image/audio-video)")
     parser.add_argument("--return_result_tensor", action="store_true", help="Whether to return result tensor. (Useful for comfyui)")
     parser.add_argument("--target_shape", nargs="+", default=[], help="Set return video or image shape")
     parser.add_argument("--aspect_ratio", type=str, default="")
 
     args = parser.parse_args()
+    validate_runtime_dependency_versions()
     validate_task_arguments(args)
+
+    metadata = resolve_model_metadata(args.model_cls, model_path=args.model_path, task=args.task)
+    logger.info(
+        "Resolved model metadata | canonical={} | architecture={} | family={} | checkpoint={} | runner={}",
+        metadata["canonical_model_cls"],
+        metadata["architecture"],
+        metadata["model_family"],
+        metadata["checkpoint_format"],
+        metadata["runner_cls"],
+    )
+    logger.info(
+        "Execution profile | primary_modality={} | inputs={} | outputs={} | distill_stage={} | teacher_ref={} | default_config={}",
+        metadata["primary_modality"],
+        metadata["input_modalities"],
+        metadata["output_modalities"],
+        metadata["distill_stage"],
+        metadata["teacher_model_cls"] or "-",
+        metadata["default_config_path"] or "-",
+    )
 
     seed_all(args.seed)
 

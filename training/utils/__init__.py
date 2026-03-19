@@ -21,6 +21,7 @@ from training.utils.distributed import (
     scatter_sequence,
     gather_sequence,
 )
+from training.utils.experiment_tracking import ExperimentTracker
 
 __all__ = [
     "build_optimizer",
@@ -37,4 +38,5 @@ __all__ = [
     "init_sequence_parallel",
     "scatter_sequence",
     "gather_sequence",
+    "ExperimentTracker",
 ]

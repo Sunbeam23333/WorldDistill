@@ -145,9 +145,7 @@ class DMDDistillTrainer(BaseDistillTrainer):
 
         student_input = self.prepare_student_input(batch, noise, timesteps)
         with torch.no_grad():
-            student_v = self.student_model(**student_input)
-            if isinstance(student_v, (tuple, list)):
-                student_v = student_v[0]
+            student_v = self.run_student(student_input, batch)
 
         sigma = 0.999
         x0_pred = noise.float() - sigma * student_v.float()
@@ -159,9 +157,7 @@ class DMDDistillTrainer(BaseDistillTrainer):
         timesteps = torch.full((bs,), self.num_train_timesteps * 0.999, device=self.device)
 
         student_input = self.prepare_student_input(batch, noise, timesteps)
-        student_v = self.student_model(**student_input)
-        if isinstance(student_v, (tuple, list)):
-            student_v = student_v[0]
+        student_v = self.run_student(student_input, batch)
 
         sigma = 0.999
         x0_pred = noise.float() - sigma * student_v.float()
@@ -229,10 +225,11 @@ class DMDDistillTrainer(BaseDistillTrainer):
             student_xt = (1 - sigma_fake_exp) * student_x0 + sigma_fake_exp * noise_fake
 
             teacher_input = self.prepare_teacher_input(batch, student_xt.to(latents.dtype), t_fake)
-            with torch.no_grad():
-                teacher_v_on_student = self.teacher_model(**teacher_input)
-                if isinstance(teacher_v_on_student, (tuple, list)):
-                    teacher_v_on_student = teacher_v_on_student[0]
+            teacher_v_on_student = self.run_teacher(
+                teacher_input,
+                batch,
+                cache_extra={"mode": "dmd_fake_score_teacher", "timesteps": t_fake},
+            )
 
             fake_input = self.prepare_teacher_input(batch, student_xt.to(latents.dtype), t_fake)
             fake_score_v = self.fake_score_model(**fake_input)
@@ -260,17 +257,15 @@ class DMDDistillTrainer(BaseDistillTrainer):
         noisy_latents = (1 - sigmas_expanded) * latents + sigmas_expanded * noise
 
         teacher_input = self.prepare_teacher_input(batch, noisy_latents, timesteps)
-        with torch.no_grad():
-            teacher_output = self.teacher_model(**teacher_input)
-            if isinstance(teacher_output, (tuple, list)):
-                teacher_output = teacher_output[0]
-
         student_input = self.prepare_student_input(batch, noisy_latents, timesteps)
-        student_output = self.student_model(**student_input)
-        if isinstance(student_output, (tuple, list)):
-            student_output = student_output[0]
+        teacher_output, student_output = self._run_teacher_student_pair(
+            teacher_input=teacher_input,
+            student_input=student_input,
+            batch=batch,
+            cache_extra={"mode": "dmd_teacher", "timesteps": timesteps},
+        )
 
-        distill_loss = F.mse_loss(student_output.float(), teacher_output.float())
+        distill_loss = self.compute_supervision_loss(student_output, teacher_output.detach())
 
         reg_loss = torch.tensor(0.0, device=self.device)
         if self.enable_fake_score and self.lambda_reg > 0:
@@ -327,11 +322,7 @@ class DMDDistillTrainer(BaseDistillTrainer):
             "hidden_states": noisy_latents,
             "timestep": timesteps,
         }
-        if "encoder_hidden_states" in batch:
-            input_kwargs["encoder_hidden_states"] = batch["encoder_hidden_states"]
-        if "image_cond" in batch:
-            input_kwargs["image_cond"] = batch["image_cond"]
-        return input_kwargs
+        return self._augment_model_input(input_kwargs, batch)
 
     def on_train_step_end(self, metrics: Dict[str, float]):
         metrics["distill_loss"] = self._distill_loss_ema

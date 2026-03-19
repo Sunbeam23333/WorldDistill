@@ -201,9 +201,7 @@ class AdversarialDistillTrainer(BaseDistillTrainer):
             x_0 = x_t - sigma * v
         """
         student_input = self.prepare_student_input(batch, noisy_latents, timesteps)
-        student_v = self.student_model(**student_input)
-        if isinstance(student_v, (tuple, list)):
-            student_v = student_v[0]
+        student_v = self.run_student(student_input, batch)
 
         sigmas = timesteps / self.num_train_timesteps
         bs = noisy_latents.shape[0]
@@ -290,18 +288,15 @@ class AdversarialDistillTrainer(BaseDistillTrainer):
         # ---- Step 2: Generator (student) update ----
         # Score distillation loss
         teacher_input = self.prepare_teacher_input(batch, noisy_latents, timesteps)
-        with torch.no_grad():
-            teacher_output = self.teacher_model(**teacher_input)
-            if isinstance(teacher_output, (tuple, list)):
-                teacher_output = teacher_output[0]
-
         student_input = self.prepare_student_input(batch, noisy_latents, timesteps)
-        student_output = self.student_model(**student_input)
-        if isinstance(student_output, (tuple, list)):
-            student_output = student_output[0]
+        teacher_output, student_output = self._run_teacher_student_pair(
+            teacher_input=teacher_input,
+            student_input=student_input,
+            batch=batch,
+            cache_extra={"mode": "adversarial_teacher", "timesteps": timesteps},
+        )
 
-        # MSE distillation loss (score matching)
-        distill_loss = F.mse_loss(student_output.float(), teacher_output.float())
+        distill_loss = self.compute_supervision_loss(student_output, teacher_output.detach())
 
         # Adversarial loss (generator wants discriminator to output high scores)
         gen_adv_loss = torch.tensor(0.0, device=self.device)
@@ -340,11 +335,7 @@ class AdversarialDistillTrainer(BaseDistillTrainer):
             "hidden_states": noisy_latents,
             "timestep": timesteps,
         }
-        if "encoder_hidden_states" in batch:
-            input_kwargs["encoder_hidden_states"] = batch["encoder_hidden_states"]
-        if "image_cond" in batch:
-            input_kwargs["image_cond"] = batch["image_cond"]
-        return input_kwargs
+        return self._augment_model_input(input_kwargs, batch)
 
     def on_train_step_end(self, metrics: Dict[str, float]):
         """Log discriminator and generator losses."""

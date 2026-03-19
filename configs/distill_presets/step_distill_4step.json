@@ -1,17 +1,21 @@
 {
-    "method": "step_distill",
+    "distill_method": "step_distill",
     "description": "Fixed 4-step distillation. Teacher generates targets at fixed timesteps, student learns direct prediction.",
     "num_inference_steps": 4,
     "denoising_step_list": [1000, 750, 500, 250],
-    "use_cfg": false,
-    "dual_model": true,
+    "use_dual_model": true,
     "boundary_step_index": 2,
-    "loss": "mse",
+    "loss_type": "mse",
     "optimizer": "adamw",
     "learning_rate": 1e-5,
     "weight_decay": 0.0,
-    "gradient_clip": 1.0,
+    "max_grad_norm": 1.0,
     "warmup_steps": 500,
     "mixed_precision": "bf16",
-    "gradient_checkpointing": true
+    "gradient_checkpointing": true,
+    "enable_runtime": true,
+    "runtime_name": "teacher_student",
+    "runtime_enable_dpp": true,
+    "enable_fused_supervision_kernel": true,
+    "fused_supervision_backend": "triton"
 }

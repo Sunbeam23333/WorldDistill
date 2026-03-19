@@ -123,21 +123,28 @@ class ConsistencyDistillTrainer(BaseDistillTrainer):
         sigma_n_expanded = sigma_n.view(bs, *([1] * (latents.dim() - 1)))
         noisy_latents_n = (1 - sigma_n_expanded) * latents + sigma_n_expanded * noise
 
+        teacher_input = self.prepare_teacher_input(batch, noisy_latents_n, t_n)
+        pending_teacher = self.launch_teacher(
+            teacher_input,
+            batch,
+            cache_extra={"mode": "consistency_teacher", "timesteps": t_n},
+        )
+
         # --- Student prediction at t_n ---
         student_input = self.prepare_student_input(batch, noisy_latents_n, t_n)
-        student_output = self.student_model(**student_input)
-        if isinstance(student_output, (tuple, list)):
-            student_output = student_output[0]
+        student_output = self.run_student(student_input, batch)
 
         # Consistency function: student's x_0 prediction
         student_x0 = self._consistency_function(student_output, noisy_latents_n, sigma_n_expanded)
 
         # --- One-step ODE solve: x_{t_n} -> x_{t_{n-1}} using teacher ---
-        teacher_input = self.prepare_teacher_input(batch, noisy_latents_n, t_n)
-        with torch.no_grad():
-            teacher_v = self.teacher_model(**teacher_input)
-            if isinstance(teacher_v, (tuple, list)):
-                teacher_v = teacher_v[0]
+        teacher_v = self.wait_teacher(pending_teacher)
+        if teacher_v is None:
+            teacher_v = self.run_teacher(
+                teacher_input,
+                batch,
+                cache_extra={"mode": "consistency_teacher", "timesteps": t_n},
+            )
 
         # Euler step: dx = v * dsigma, so x_{t-dt} = x_t - dt * v
         dt = sigma_n - sigma_n1
@@ -195,11 +202,7 @@ class ConsistencyDistillTrainer(BaseDistillTrainer):
             "hidden_states": noisy_latents,
             "timestep": timesteps,
         }
-        if "encoder_hidden_states" in batch:
-            input_kwargs["encoder_hidden_states"] = batch["encoder_hidden_states"]
-        if "image_cond" in batch:
-            input_kwargs["image_cond"] = batch["image_cond"]
-        return input_kwargs
+        return self._augment_model_input(input_kwargs, batch)
 
     def on_train_step_end(self, metrics):
         """Update EMA after each step."""

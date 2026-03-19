@@ -8,6 +8,7 @@ from torch.distributed.tensor.device_mesh import init_device_mesh
 
 from lightx2v.utils.input_info import ALL_INPUT_INFO_KEYS
 from lightx2v.utils.lockable_dict import LockableDict
+from lightx2v.utils.model_catalog import apply_model_metadata, resolve_default_config_path
 from lightx2v.utils.utils import is_main_process
 from lightx2v_platform.base.global_var import AI_DEVICE
 
@@ -41,95 +42,104 @@ def set_args2config(args):
     return config
 
 
+def _load_json_if_exists(config, candidate_paths):
+    for config_path in candidate_paths:
+        if not config_path or not os.path.exists(config_path):
+            continue
+        with open(config_path, "r") as f:
+            model_config = json.load(f)
+        config.update(model_config)
+        return config_path
+    return None
+
+
 def auto_calc_config(config):
-    if config.get("config_json", None) is not None:
+    apply_model_metadata(config)
+
+    if config.get("config_json"):
         logger.info(f"Loading some config from {config['config_json']}")
         with open(config["config_json"], "r") as f:
             config_json = json.load(f)
         config.update(config_json)
-
-    if config["model_cls"] in ["hunyuan_video_1.5", "hunyuan_video_1.5_distill"]:  # Special config for hunyuan video 1.5 model folder structure
-        config["transformer_model_path"] = os.path.join(config["model_path"], "transformer", config["transformer_model_name"])  # transformer_model_name: [480p_t2v, 480p_i2v, 720p_t2v, 720p_i2v]
-        if os.path.exists(os.path.join(config["transformer_model_path"], "config.json")):
-            with open(os.path.join(config["transformer_model_path"], "config.json"), "r") as f:
-                model_config = json.load(f)
-            config.update(model_config)
-    elif config["model_cls"] in ["worldplay_distill", "worldplay_ar", "worldplay_bi"]:  # Special config for WorldPlay models
-        config["transformer_model_path"] = os.path.join(config["model_path"], "transformer", config["transformer_model_name"])
-        if os.path.exists(os.path.join(config["transformer_model_path"], "config.json")):
-            with open(os.path.join(config["transformer_model_path"], "config.json"), "r") as f:
-                model_config = json.load(f)
-            config.update(model_config)
-    elif config["model_cls"] == "longcat_image":  # Special config for longcat_image: load both root and transformer config
-        if os.path.exists(os.path.join(config["model_path"], "config.json")):
-            with open(os.path.join(config["model_path"], "config.json"), "r") as f:
-                model_config = json.load(f)
-            config.update(model_config)
-        if os.path.exists(os.path.join(config["model_path"], "transformer", "config.json")):
-            with open(os.path.join(config["model_path"], "transformer", "config.json"), "r") as f:
-                model_config = json.load(f)
-            config.update(model_config)
+        apply_model_metadata(config)
     else:
-        if os.path.exists(os.path.join(config["model_path"], "config.json")):
-            with open(os.path.join(config["model_path"], "config.json"), "r") as f:
-                model_config = json.load(f)
-            config.update(model_config)
-        elif os.path.exists(os.path.join(config["model_path"], "low_noise_model", "config.json")):  # 需要一个更优雅的update方法
-            with open(os.path.join(config["model_path"], "low_noise_model", "config.json"), "r") as f:
-                model_config = json.load(f)
-            config.update(model_config)
-        elif os.path.exists(os.path.join(config["model_path"], "distill_models", "low_noise_model", "config.json")):  # 需要一个更优雅的update方法
-            with open(os.path.join(config["model_path"], "distill_models", "low_noise_model", "config.json"), "r") as f:
-                model_config = json.load(f)
-            config.update(model_config)
-        elif os.path.exists(os.path.join(config["model_path"], "original", "config.json")):
-            with open(os.path.join(config["model_path"], "original", "config.json"), "r") as f:
-                model_config = json.load(f)
-            config.update(model_config)
-        elif os.path.exists(os.path.join(config["model_path"], "transformer", "config.json")):
-            with open(os.path.join(config["model_path"], "transformer", "config.json"), "r") as f:
-                model_config = json.load(f)
+        default_config_path = resolve_default_config_path(config.get("model_cls", ""), task=config.get("task"))
+        if default_config_path:
+            logger.info(f"Auto-loading default config from {default_config_path}")
+            _load_json_if_exists(config, [default_config_path])
+            apply_model_metadata(config)
 
-            if config["model_cls"] == "z_image":
-                # https://huggingface.co/Tongyi-MAI/Z-Image-Turbo/blob/main/transformer/config.json
-                z_image_patch_size = model_config.pop("all_patch_size", [2])
-                z_image_f_patch_size = model_config.pop("all_f_patch_size", [1])
-                if not (len(z_image_patch_size) == 1 and len(z_image_f_patch_size) == 1):
-                    raise ValueError(
-                        f"Expected 'all_patch_size' and 'all_f_patch_size' in z_image config to be lists of length 1, "
-                        f"but got lengths {len(z_image_patch_size)} and {len(z_image_f_patch_size)} respectively. "
-                        f"If the official z-image configs have been updated, ensure the current lightx2v's z-image model "
-                        f"implementation matches the new configs then update this check."
-                    )
+    loaded_config_path = None
+    canonical_model_cls = config["model_cls"]
 
-                model_config["patch_size"] = z_image_patch_size[0]
-                model_config["f_patch_size"] = z_image_f_patch_size[0]
+    if canonical_model_cls in ["hunyuan_video_1.5", "hunyuan_video_1.5_distill", "worldplay_distill", "worldplay_ar", "worldplay_bi"]:
+        transformer_model_name = config.get("transformer_model_name", "")
+        if transformer_model_name:
+            config["transformer_model_path"] = os.path.join(config["model_path"], "transformer", transformer_model_name)
+            loaded_config_path = _load_json_if_exists(config, [os.path.join(config["transformer_model_path"], "config.json")])
+        else:
+            logger.warning(f"Model {canonical_model_cls} usually expects transformer_model_name; skip transformer config auto-load.")
+    elif canonical_model_cls == "longcat_image":
+        loaded_config_path = _load_json_if_exists(
+            config,
+            [
+                os.path.join(config["model_path"], "config.json"),
+                os.path.join(config["model_path"], "transformer", "config.json"),
+            ],
+        )
+    else:
+        loaded_config_path = _load_json_if_exists(
+            config,
+            [
+                os.path.join(config["model_path"], "config.json"),
+                os.path.join(config["model_path"], "low_noise_model", "config.json"),
+                os.path.join(config["model_path"], "high_noise_model", "config.json"),
+                os.path.join(config["model_path"], "distill_models", "low_noise_model", "config.json"),
+                os.path.join(config["model_path"], "distill_models", "high_noise_model", "config.json"),
+                os.path.join(config["model_path"], "original", "config.json"),
+                os.path.join(config["model_path"], "transformer", "config.json"),
+            ],
+        )
 
+    if loaded_config_path:
+        logger.info(f"Loaded model config from {loaded_config_path}")
+
+    if canonical_model_cls == "z_image" and "all_patch_size" in config and "all_f_patch_size" in config:
+        z_image_patch_size = config.pop("all_patch_size", [2])
+        z_image_f_patch_size = config.pop("all_f_patch_size", [1])
+        if not (len(z_image_patch_size) == 1 and len(z_image_f_patch_size) == 1):
+            raise ValueError(
+                f"Expected 'all_patch_size' and 'all_f_patch_size' in z_image config to be lists of length 1, "
+                f"but got lengths {len(z_image_patch_size)} and {len(z_image_f_patch_size)} respectively. "
+                f"If the official z-image configs have been updated, ensure the current lightx2v's z-image model "
+                f"implementation matches the new configs then update this check."
+            )
+        config["patch_size"] = z_image_patch_size[0]
+        config["f_patch_size"] = z_image_f_patch_size[0]
+
+    if "num_attention_heads" in config and "num_heads" not in config:
+        config["num_heads"] = config["num_attention_heads"]
+    if "attention_head_dim" in config and "dim" not in config:
+        config["dim"] = config["num_heads"] * config["attention_head_dim"]
+    if "in_channels" in config and "in_dim" not in config:
+        config["in_dim"] = config["in_channels"]
+    if "out_channels" in config and "out_dim" not in config:
+        config["out_dim"] = config["out_channels"]
+
+    if config.get("dit_quantized_ckpt", None) is not None:
+        config_path = os.path.join(config["dit_quantized_ckpt"], "config.json")
+        if os.path.exists(config_path):
+            with open(config_path, "r") as f:
+                model_config = json.load(f)
             config.update(model_config)
-        # Diffusers config compatibility: map diffusers field names to LightX2V internal names
-        if "num_attention_heads" in config and "num_heads" not in config:
-            config["num_heads"] = config["num_attention_heads"]
-        if "attention_head_dim" in config and "dim" not in config:
-            config["dim"] = config["num_heads"] * config["attention_head_dim"]
-        if "in_channels" in config and "in_dim" not in config:
-            config["in_dim"] = config["in_channels"]
-        if "out_channels" in config and "out_dim" not in config:
-            config["out_dim"] = config["out_channels"]
 
-        # load quantized config
-        if config.get("dit_quantized_ckpt", None) is not None:
-            config_path = os.path.join(config["dit_quantized_ckpt"], "config.json")
-            if os.path.exists(config_path):
-                with open(config_path, "r") as f:
-                    model_config = json.load(f)
-                config.update(model_config)
+    apply_model_metadata(config)
 
     if config["task"] in ["i2v", "s2v", "rs2v"]:
         if config["target_video_length"] % config["vae_stride"][0] != 1:
             logger.warning(f"`num_frames - 1` has to be divisible by {config['vae_stride'][0]}. Rounding to the nearest number.")
             config["target_video_length"] = config["target_video_length"] // config["vae_stride"][0] * config["vae_stride"][0] + 1
 
-    # Load diffusers vae config
     if os.path.exists(os.path.join(config["model_path"], "vae", "config.json")):
         with open(os.path.join(config["model_path"], "vae", "config.json"), "r") as f:
             vae_config = json.load(f)

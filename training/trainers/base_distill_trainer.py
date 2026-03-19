@@ -18,6 +18,8 @@ References:
 - Consistency Models (Song et al., 2023): EMA target network
 """
 
+from __future__ import annotations
+
 import contextlib
 import copy
 import math
@@ -34,6 +36,9 @@ import torch.nn.functional as F
 from loguru import logger
 from torch.utils.data import DataLoader
 
+from training.runtime.distill_cache import DistillCache
+from training.runtime.fused_supervision import fused_masked_mse_loss, fused_supervision_available
+from training.runtime.teacher_student_runtime import PendingTeacherForward, TeacherStudentRuntime
 from training.trainer_args import TrainerArgs
 from training.utils.distributed import (
     wrap_model,
@@ -44,6 +49,7 @@ from training.utils.distributed import (
     scatter_sequence,
     gather_sequence,
 )
+from training.utils.experiment_tracking import ExperimentTracker
 
 
 @contextlib.contextmanager
@@ -136,6 +142,9 @@ class BaseDistillTrainer(ABC):
         train_dataloader: DataLoader,
         val_dataloader: Optional[DataLoader] = None,
         device: torch.device = None,
+        batch_encoder: Optional[Any] = None,
+        runtime: Optional[TeacherStudentRuntime] = None,
+        distill_cache: Optional[DistillCache] = None,
     ):
         self.args = args
         self.teacher_model = teacher_model
@@ -145,6 +154,12 @@ class BaseDistillTrainer(ABC):
         self.train_dataloader = train_dataloader
         self.val_dataloader = val_dataloader
         self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.batch_encoder = batch_encoder
+        self.runtime = runtime
+        self.distill_cache = distill_cache
+        self.enable_fused_supervision = bool(getattr(args, "enable_fused_supervision_kernel", False))
+        self.fused_supervision_backend = getattr(args, "fused_supervision_backend", "auto")
+        self._fused_supervision_warned = False
 
         self.global_step = 0
         self.epoch = 0
@@ -196,6 +211,12 @@ class BaseDistillTrainer(ABC):
                 decay=getattr(args, "ema_decay", 0.9999),
                 warmup_steps=getattr(args, "ema_warmup_steps", 0),
             )
+
+        self._tracker: Optional[ExperimentTracker] = None
+        self._optimizer_skipped_steps = 0
+        self._train_start_time = time.perf_counter()
+        if self.is_main_process:
+            self._tracker = ExperimentTracker(args)
 
     # ==================== Abstract Methods ====================
 
@@ -270,6 +291,9 @@ class BaseDistillTrainer(ABC):
             f"Parallel: {self.parallel_mode}"
         )
 
+        if self._tracker is not None:
+            self._tracker.log_config(vars(self.args))
+
         if self.args.resume_from:
             self.load_checkpoint(self.args.resume_from)
 
@@ -292,50 +316,55 @@ class BaseDistillTrainer(ABC):
         self.student_model.train()
         self._data_iter = iter(self.train_dataloader)
 
-        while self.global_step < self.args.max_train_steps:
-            # Get next batch
-            batch = self._next_batch()
+        try:
+            while self.global_step < self.args.max_train_steps:
+                # Get next batch
+                batch = self._next_batch()
 
-            # Move batch to device
-            batch = self._move_batch_to_device(batch)
+                # Move batch to device and encode raw inputs if needed
+                batch = self._move_batch_to_device(batch)
+                batch = self._prepare_batch_for_model(batch)
 
-            # Sequence parallel: scatter video latents along temporal dim
-            if self.sp_group is not None and "latents" in batch:
-                batch["latents"] = scatter_sequence(batch["latents"], self.sp_group, dim=2)
+                # Sequence parallel: scatter video latents along temporal dim
+                if self.sp_group is not None and "latents" in batch:
+                    batch["latents"] = scatter_sequence(batch["latents"], self.sp_group, dim=2)
 
-            # Train one step (with gradient accumulation)
-            step_metrics = self.train_step(batch)
+                step_start_time = time.perf_counter()
+                step_metrics = self.train_step(batch)
+                self.global_step += 1
+                step_metrics = self._augment_step_metrics(step_metrics, batch, step_start_time)
 
-            self.global_step += 1
+                # EMA update
+                if self.ema is not None:
+                    self.ema.update(self._unwrap_model(self.student_model))
 
-            # EMA update
-            if self.ema is not None:
-                self.ema.update(self._unwrap_model(self.student_model))
+                # Logging
+                if self.is_main_process and self.global_step % self.args.log_every == 0:
+                    self._log_metrics(step_metrics)
 
-            # Logging
-            if self.is_main_process and self.global_step % self.args.log_every == 0:
-                self._log_metrics(step_metrics)
+                # Evaluation
+                if (
+                    self.val_dataloader is not None
+                    and self.args.eval_every > 0
+                    and self.global_step % self.args.eval_every == 0
+                ):
+                    eval_metrics = self.evaluate()
+                    if self.is_main_process and eval_metrics:
+                        self._log_metrics(eval_metrics)
 
-            # Evaluation
-            if (
-                self.val_dataloader is not None
-                and self.args.eval_every > 0
-                and self.global_step % self.args.eval_every == 0
-            ):
-                eval_metrics = self.evaluate()
-                if self.is_main_process and eval_metrics:
-                    self._log_metrics(eval_metrics)
+                # Save checkpoint
+                if self.is_main_process and self.global_step % self.args.save_every == 0:
+                    self.save_checkpoint(self.global_step, self.args.output_dir)
 
-            # Save checkpoint
-            if self.is_main_process and self.global_step % self.args.save_every == 0:
+                # Custom per-step hook
+                self.on_train_step_end(step_metrics)
+
+            logger.info(f"Training completed at step {self.global_step}.")
+            if self.is_main_process:
                 self.save_checkpoint(self.global_step, self.args.output_dir)
-
-            # Custom per-step hook
-            self.on_train_step_end(step_metrics)
-
-        logger.info(f"Training completed at step {self.global_step}.")
-        if self.is_main_process:
-            self.save_checkpoint(self.global_step, self.args.output_dir)
+        finally:
+            if self._tracker is not None:
+                self._tracker.close()
 
     def _init_deepspeed(self):
         """Initialize DeepSpeed engine for training."""
@@ -432,6 +461,7 @@ class BaseDistillTrainer(ABC):
             if accum_idx > 0:
                 batch = self._next_batch()
                 batch = self._move_batch_to_device(batch)
+                batch = self._prepare_batch_for_model(batch)
                 if self.sp_group is not None and "latents" in batch:
                     batch["latents"] = scatter_sequence(batch["latents"], self.sp_group, dim=2)
 
@@ -471,11 +501,13 @@ class BaseDistillTrainer(ABC):
         # Skip step if gradient is too large (following HY-WorldPlay)
         grad_skip_threshold = self.args.grad_skip_threshold
         grad_norm_val = grad_norm.item() if isinstance(grad_norm, torch.Tensor) else grad_norm
+        optimizer_skipped = 0.0
         if grad_norm_val < grad_skip_threshold:
             self.scaler.step(self.optimizer)
             self.scaler.update()
             self.lr_scheduler.step()
         else:
+            optimizer_skipped = 1.0
             logger.warning(
                 f"Step {self.global_step}: grad_norm={grad_norm_val:.2f} > {grad_skip_threshold}, skipping."
             )
@@ -485,6 +517,7 @@ class BaseDistillTrainer(ABC):
             "loss": total_loss,
             "grad_norm": grad_norm_val,
             "lr": self.optimizer.param_groups[0]["lr"],
+            "optimizer_skipped": optimizer_skipped,
         }
 
     def _train_step_deepspeed(self, batch: Dict[str, Any]) -> Dict[str, float]:
@@ -494,12 +527,14 @@ class BaseDistillTrainer(ABC):
         gradient clipping internally through its engine.
         """
         engine = self._deepspeed_engine
+        assert engine is not None, "DeepSpeed engine should be initialized before calling _train_step_deepspeed"
         total_loss = 0.0
 
         for accum_idx in range(self.args.gradient_accumulation_steps):
             if accum_idx > 0:
                 batch = self._next_batch()
                 batch = self._move_batch_to_device(batch)
+                batch = self._prepare_batch_for_model(batch)
                 if self.sp_group is not None and "latents" in batch:
                     batch["latents"] = scatter_sequence(batch["latents"], self.sp_group, dim=2)
 
@@ -522,7 +557,49 @@ class BaseDistillTrainer(ABC):
             "loss": total_loss,
             "grad_norm": grad_norm if isinstance(grad_norm, float) else 0.0,
             "lr": engine.get_lr()[0] if hasattr(engine, "get_lr") else self.args.learning_rate,
+            "optimizer_skipped": 0.0,
         }
+
+    def _augment_step_metrics(
+        self,
+        metrics: Dict[str, float],
+        batch: Dict[str, Any],
+        step_start_time: float,
+    ) -> Dict[str, float]:
+        enriched = dict(metrics)
+        step_time = max(time.perf_counter() - step_start_time, 1e-6)
+        effective_batch_size = (
+            self._infer_batch_size(batch)
+            * self.args.gradient_accumulation_steps
+            * self.world_size
+        )
+        self._optimizer_skipped_steps += int(enriched.get("optimizer_skipped", 0.0))
+
+        enriched["epoch"] = float(self.epoch)
+        enriched["progress"] = self.global_step / max(1, self.args.max_train_steps)
+        enriched["step_time_sec"] = step_time
+        enriched["steps_per_sec"] = 1.0 / step_time
+        enriched["elapsed_hours"] = max(time.perf_counter() - self._train_start_time, 0.0) / 3600.0
+        enriched["eta_hours"] = max(self.args.max_train_steps - self.global_step, 0) * step_time / 3600.0
+        enriched["optimizer_skipped_total"] = float(self._optimizer_skipped_steps)
+        if effective_batch_size > 0:
+            enriched["samples_per_sec"] = effective_batch_size / step_time
+
+        if self.device.type == "cuda" and torch.cuda.is_available():
+            enriched["gpu_mem_allocated_gb"] = torch.cuda.memory_allocated(self.device) / (1024 ** 3)
+            enriched["gpu_mem_reserved_gb"] = torch.cuda.memory_reserved(self.device) / (1024 ** 3)
+            enriched["gpu_mem_peak_gb"] = torch.cuda.max_memory_allocated(self.device) / (1024 ** 3)
+
+        if self.runtime is not None:
+            runtime_stats = self.runtime.stats()
+            for key, value in runtime_stats.items():
+                enriched[f"runtime/{key}"] = float(value)
+            hits = int(runtime_stats.get("hits", 0))
+            misses = int(runtime_stats.get("misses", 0))
+            if hits + misses > 0:
+                enriched["runtime/cache_hit_rate"] = hits / (hits + misses)
+
+        return enriched
 
     def _forward_and_loss(self, batch: Dict[str, Any]) -> torch.Tensor:
         """Run teacher + student forward and compute distillation loss.
@@ -546,18 +623,14 @@ class BaseDistillTrainer(ABC):
         sigmas_expanded = sigmas.view(bs, *([1] * (latents.dim() - 1)))
         noisy_latents = (1 - sigmas_expanded) * latents + sigmas_expanded * noise
 
-        # Teacher forward (no grad)
         teacher_input = self.prepare_teacher_input(batch, noisy_latents, timesteps)
-        with torch.no_grad():
-            teacher_output = self.teacher_model(**teacher_input)
-            if isinstance(teacher_output, (tuple, list)):
-                teacher_output = teacher_output[0]
-
-        # Student forward
         student_input = self.prepare_student_input(batch, noisy_latents, timesteps)
-        student_output = self.student_model(**student_input)
-        if isinstance(student_output, (tuple, list)):
-            student_output = student_output[0]
+        teacher_output, student_output = self._run_teacher_student_pair(
+            teacher_input=teacher_input,
+            student_input=student_input,
+            batch=batch,
+            cache_extra={"timesteps": timesteps},
+        )
 
         # Compute loss
         loss = self.compute_distill_loss(teacher_output, student_output, batch, timesteps)
@@ -587,6 +660,182 @@ class BaseDistillTrainer(ABC):
         """Prepare input for student model. Default: same as teacher."""
         return self.prepare_teacher_input(batch, noisy_latents, timesteps)
 
+    def _augment_model_input(self, input_kwargs: Dict[str, Any], batch: Dict[str, Any]) -> Dict[str, Any]:
+        for key in ("encoder_hidden_states", "image_cond", "camera_poses", "actions"):
+            if key in batch and batch[key] is not None:
+                input_kwargs[key] = batch[key]
+        return input_kwargs
+
+    def run_teacher(
+        self,
+        input_kwargs: Dict[str, Any],
+        batch: Dict[str, Any],
+        cache_namespace: str = "teacher_output",
+        cache_extra: Optional[Dict[str, Any]] = None,
+        allow_cache: bool = True,
+    ) -> torch.Tensor:
+        if self.runtime is not None:
+            return self.runtime.run_teacher(
+                input_kwargs=input_kwargs,
+                batch=batch,
+                global_step=self.global_step,
+                cache_namespace=cache_namespace,
+                cache_extra=cache_extra,
+                allow_cache=allow_cache,
+            )
+
+        with torch.no_grad():
+            output = self.teacher_model(**input_kwargs)
+        if isinstance(output, (tuple, list)):
+            output = output[0]
+        return output
+
+    def launch_teacher(
+        self,
+        input_kwargs: Dict[str, Any],
+        batch: Dict[str, Any],
+        cache_namespace: str = "teacher_output",
+        cache_extra: Optional[Dict[str, Any]] = None,
+        allow_cache: bool = True,
+    ) -> Optional[PendingTeacherForward]:
+        if self.runtime is None or not self.runtime.can_pipeline_teacher_student():
+            return None
+        return self.runtime.launch_teacher(
+            input_kwargs=input_kwargs,
+            batch=batch,
+            global_step=self.global_step,
+            cache_namespace=cache_namespace,
+            cache_extra=cache_extra,
+            allow_cache=allow_cache,
+        )
+
+    def wait_teacher(self, pending_teacher: Optional[PendingTeacherForward]) -> Optional[torch.Tensor]:
+        if pending_teacher is None:
+            return None
+        assert self.runtime is not None
+        return self.runtime.wait_teacher(pending_teacher)
+
+    def run_student(
+        self,
+        input_kwargs: Dict[str, Any],
+        batch: Dict[str, Any],
+        model: Optional[nn.Module] = None,
+        tag: str = "student",
+    ) -> torch.Tensor:
+        student_model = model if model is not None else self.student_model
+        if self.runtime is not None:
+            return self.runtime.run_student(
+                model=student_model,
+                input_kwargs=input_kwargs,
+                batch=batch,
+                global_step=self.global_step,
+                tag=tag,
+            )
+        output = student_model(**input_kwargs)
+        if isinstance(output, (tuple, list)):
+            output = output[0]
+        return output
+
+    def select_runtime_memory_frames(
+        self,
+        all_frames: torch.Tensor,
+        current_chunk_idx: int,
+        chunk_size: int,
+        memory_frames: int,
+    ) -> Optional[torch.Tensor]:
+        if self.runtime is not None:
+            return self.runtime.select_memory_frames(
+                all_frames=all_frames,
+                current_chunk_idx=current_chunk_idx,
+                chunk_size=chunk_size,
+                memory_frames=memory_frames,
+            )
+
+        start_frame = current_chunk_idx * chunk_size
+        mem_start = max(0, start_frame - memory_frames)
+        mem_end = start_frame
+        if mem_end <= mem_start:
+            return None
+        return all_frames[:, :, mem_start:mem_end]
+
+    def _run_teacher_student_pair(
+        self,
+        teacher_input: Dict[str, Any],
+        student_input: Dict[str, Any],
+        batch: Dict[str, Any],
+        cache_namespace: str = "teacher_output",
+        cache_extra: Optional[Dict[str, Any]] = None,
+        allow_cache: bool = True,
+        student_model: Optional[nn.Module] = None,
+        student_tag: str = "student",
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        pending_teacher = self.launch_teacher(
+            teacher_input,
+            batch,
+            cache_namespace=cache_namespace,
+            cache_extra=cache_extra,
+            allow_cache=allow_cache,
+        )
+        student_output = self.run_student(
+            student_input,
+            batch,
+            model=student_model,
+            tag=student_tag,
+        )
+        if pending_teacher is not None:
+            teacher_output = self.wait_teacher(pending_teacher)
+        else:
+            teacher_output = self.run_teacher(
+                teacher_input,
+                batch,
+                cache_namespace=cache_namespace,
+                cache_extra=cache_extra,
+                allow_cache=allow_cache,
+            )
+        assert teacher_output is not None
+        return teacher_output, student_output
+
+    def compute_supervision_loss(
+        self,
+        prediction: torch.Tensor,
+        target: torch.Tensor,
+        mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        use_fused = self.enable_fused_supervision and self._should_use_fused_supervision(prediction, target)
+        return fused_masked_mse_loss(
+            prediction=prediction,
+            target=target,
+            mask=mask,
+            enabled=use_fused,
+        )
+
+    def _should_use_fused_supervision(
+        self,
+        prediction: torch.Tensor,
+        target: torch.Tensor,
+    ) -> bool:
+        if self.fused_supervision_backend == "none":
+            return False
+        if self.fused_supervision_backend not in {"auto", "triton"}:
+            return False
+        if not fused_supervision_available() and not self._fused_supervision_warned:
+            logger.warning("请求启用 fused supervision kernel，但当前环境不可用，将自动回退到 PyTorch loss。")
+            self._fused_supervision_warned = True
+            return False
+        if prediction.shape != target.shape:
+            return False
+        return fused_supervision_available()
+
+    def _prepare_batch_for_model(self, batch: Dict[str, Any]) -> Dict[str, Any]:
+        if self.batch_encoder is None or "latents" in batch:
+            return batch
+        if "pixel_values" not in batch:
+            return batch
+
+        prepared_batch = dict(batch)
+        prepared_batch = self.batch_encoder.encode_batch(prepared_batch)
+        return prepared_batch
+
     # ==================== Evaluation ====================
 
     def _forward_and_loss_eval(self, batch: Dict[str, Any]) -> torch.Tensor:
@@ -602,15 +851,14 @@ class BaseDistillTrainer(ABC):
         noisy_latents = (1 - sigmas_expanded) * latents + sigmas_expanded * noise
 
         teacher_input = self.prepare_teacher_input(batch, noisy_latents, timesteps)
-        with torch.no_grad():
-            teacher_output = self.teacher_model(**teacher_input)
-            if isinstance(teacher_output, (tuple, list)):
-                teacher_output = teacher_output[0]
+        teacher_output = self.run_teacher(
+            teacher_input,
+            batch,
+            cache_extra={"timesteps": timesteps, "mode": "eval"},
+        )
 
         student_input = self.prepare_student_input(batch, noisy_latents, timesteps)
-        student_output = self.student_model(**student_input)
-        if isinstance(student_output, (tuple, list)):
-            student_output = student_output[0]
+        student_output = self.run_student(student_input, batch)
 
         loss = self.compute_distill_loss(teacher_output, student_output, batch, timesteps)
         return loss
@@ -631,6 +879,7 @@ class BaseDistillTrainer(ABC):
         with torch.no_grad():
             for batch in self.val_dataloader:
                 batch = self._move_batch_to_device(batch)
+                batch = self._prepare_batch_for_model(batch)
                 if self.sp_group is not None and "latents" in batch:
                     batch["latents"] = scatter_sequence(batch["latents"], self.sp_group, dim=2)
 
@@ -779,6 +1028,15 @@ class BaseDistillTrainer(ABC):
                 result[k] = v
         return result
 
+    @staticmethod
+    def _infer_batch_size(batch: Dict[str, Any]) -> int:
+        for value in batch.values():
+            if isinstance(value, torch.Tensor) and value.dim() > 0:
+                return int(value.shape[0])
+            if isinstance(value, list):
+                return len(value)
+        return 0
+
     def _compute_grad_norm(self) -> torch.Tensor:
         """Compute total gradient norm across all parameters."""
         total_norm = torch.tensor(0.0, device=self.device)
@@ -796,3 +1054,5 @@ class BaseDistillTrainer(ABC):
             else:
                 msg_parts.append(f"{k}={v}")
         logger.info(" | ".join(msg_parts))
+        if self._tracker is not None:
+            self._tracker.log_metrics(metrics, step=self.global_step)

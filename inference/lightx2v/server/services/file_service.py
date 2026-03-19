@@ -13,6 +13,7 @@ class FileService:
         self.cache_dir = cache_dir
         self.input_image_dir = cache_dir / "inputs" / "imgs"
         self.input_audio_dir = cache_dir / "inputs" / "audios"
+        self.input_video_dir = cache_dir / "inputs" / "videos"
         self.output_video_dir = cache_dir / "outputs"
 
         self._http_client = None
@@ -26,6 +27,7 @@ class FileService:
             self.input_image_dir,
             self.output_video_dir,
             self.input_audio_dir,
+            self.input_video_dir,
         ]:
             directory.mkdir(parents=True, exist_ok=True)
 
