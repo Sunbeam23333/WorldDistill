@@ -4,7 +4,7 @@
 
 # WorldDistill
 
-**A unified toolkit for distilling and accelerating video generation models and world models.**
+**A unified toolkit for distilling and accelerating video, image, and audio-video generation models and world models.**
 
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
 [![Python](https://img.shields.io/badge/Python-3.10+-green.svg)](https://python.org)
@@ -16,10 +16,12 @@
 
 ## Overview
 
-WorldDistill provides a **unified framework** for distilling video generation models and interactive world models into faster, smaller variants. It integrates:
+WorldDistill provides a **unified framework** for distilling video generation models, audio-video models, image generation/editing models, and interactive world models into faster, smaller variants. It integrates:
 
-- **Inference Engine** — High-performance multi-GPU inference with step distillation, adapted from [LightX2V](https://github.com/ModelTC/lightx2v)
+- **Multimodal Inference Engine** — High-performance multi-GPU inference for **video, image, and audio-video** tasks, with automatic config discovery and modality-aware output handling. Adapted from [LightX2V](https://github.com/ModelTC/lightx2v)
 - **Training Pipeline** — Multiple distillation methods (step, stream, progressive, consistency, context forcing, adversarial ADD/LADD, DMD), referencing [Open-Sora](https://github.com/hpcaitech/Open-Sora) and [HY-WorldPlay](https://github.com/Tencent/HunyuanVideo)
+- **Train-Infer Unified Metadata** — Shared `model_catalog` across training and inference: model family, architecture, supported tasks, modality I/O profile, and distillation stage (base/teacher/student) are resolved from a single `model_zoo.yaml`
+- **Teacher-Student Runtime** — Built-in `TeacherStudentRuntime` with distillation cache, fused supervision, and experiment tracking for tightly coupled train-infer workflows (e.g., OPD, context forcing)
 - **Distributed/Acceleration** — DDP/FSDP/DeepSpeed (ZeRO), Sequence Parallelism, gradient checkpointing, mixed precision
 - **Extensible Architecture** — Registry-based Runner/Scheduler system for easy model integration
 
@@ -39,8 +41,32 @@ WorldDistill provides a **unified framework** for distilling video generation mo
 |:------|:------------|:------|:-------------------|:------:|
 | **Wan 2.1 / 2.2** | Wan DiT | T2V, I2V | Step, LoRA, Full, FP8 | ✅ |
 | **Wan 2.2 MoE (A14B)** | Wan MoE DiT | T2V, I2V | Step (4-step, dual model) | ✅ |
+| **Wan 2.1 Self-Forcing** | Wan DiT | T2V | Self-Forcing / Streaming | ✅ |
+| **Wan 2.1 MeanFlow Distill** | Wan DiT | T2V | Mean-Flow Distillation | ✅ |
 | **HunyuanVideo 1.5** | HY DiT | T2V, I2V | Step | ✅ |
+| **LTX-Video 2** | DiT | T2V, I2V, T2AV, I2AV | Step | ✅ |
 | **SkyReels-V2** | Wan + Diffusion Forcing | T2V, I2V | Stream (Diffusion Forcing) | 🔧 |
+
+### Audio-Video & Talking Head Models
+
+| Model | Architecture | Tasks | Features | Status |
+|:------|:------------|:------|:---------|:------:|
+| **Wan 2.2 Audio** | Wan Dense | S2V, RS2V | Audio conditioning, streaming | ✅ |
+| **SekoTalk** | Wan | S2V, RS2V | Audio conditioning, reference speech | ✅ |
+
+### Image Generation & Editing Models
+
+| Model | Architecture | Tasks | Features | Status |
+|:------|:------------|:------|:---------|:------:|
+| **Qwen Image Edit 2511** | Qwen | T2I, I2I | Image generation & editing | ✅ |
+
+### Video Editing & Animation Models
+
+| Model | Architecture | Tasks | Features | Status |
+|:------|:------------|:------|:---------|:------:|
+| **Wan 2.1 VACE** | Wan DiT | VACE | Video editing | ✅ |
+| **Wan 2.2 MoE VACE** | Wan MoE | VACE | Video editing | ✅ |
+| **Wan 2.2 Animate** | Wan MoE | Animate | Motion guidance, pose conditioning | ✅ |
 
 ### World Models (Interactive / Game Generation)
 
@@ -79,14 +105,18 @@ WorldDistill provides a **unified framework** for distilling video generation mo
 
 ## Feature Checklist (功能清单)
 
+- **Multimodal Inference**: unified pipeline for video, image, and audio-video tasks with modality-aware output labeling and automatic config discovery from `model_zoo.yaml`.
+- **Train-Infer Unified Metadata**: shared `model_catalog` resolves architecture, model family, modality I/O profile, distillation stage (base/teacher/student), and teacher-student pairing across both training and inference.
 - **Training Pipeline**: unified trainer loop, gradient accumulation, EMA, checkpointing, resume.
-- **Distillation Methods**: Step, Stream (Diffusion Forcing), Progressive, Consistency (TCD), Context Forcing, Adversarial (ADD/LADD), DMD.
+- **Teacher-Student Runtime**: `TeacherStudentRuntime` with `DistillCache`, `FusedSupervision`, and `ExperimentTracker` for OPD / context forcing / adversarial distillation loops.
+- **Distillation Methods**: Step, Stream (Diffusion Forcing), Progressive, Consistency (TCD), Context Forcing, Adversarial (ADD/LADD), DMD, Mean-Flow.
 - **Distributed/Acceleration**: DDP, FSDP (FULL/HYBRID), DeepSpeed ZeRO (1/2/3), Sequence Parallelism, mixed precision, gradient checkpointing.
 - **Inference Engine**: LightX2V-based multi-GPU inference, step-distill schedulers, stream/consistency schedulers.
 - **Data & Sampling**: cached latent dataset, bucket sampler for variable resolution/frames.
 - **Utilities**: model downloader, fast sync, weight conversion, camera pose generator.
 - **Logging / Dashboards**: console, TensorBoard, and optional W&B with runtime/cache/performance metrics.
 - **Evaluation**: periodic validation via `val_data_json` and `eval_every`.
+- **Smoke Tests**: lightweight `test_runtime_smoke.py` validates catalog resolution, trainer args, and inference metadata without GPU.
 
 ## Quick Start
 
@@ -94,7 +124,7 @@ WorldDistill provides a **unified framework** for distilling video generation mo
 
 ```bash
 # Clone & install
-git clone https://github.com/your-org/WorldDistill.git
+git clone https://github.com/Sunbeam23333/WorldDistill.git
 cd WorldDistill
 bash scripts/setup_env.sh
 ```
@@ -154,6 +184,37 @@ bash scripts/run_infer.sh \
     --task t2v \
     --prompt "An astronaut floating in space, Earth in the background." \
     --gpus 8
+```
+
+**Audio-Video (SekoTalk, speech-to-video):**
+
+```bash
+bash scripts/run_infer.sh \
+    --model seko_talk \
+    --task s2v \
+    --gpus 1 \
+    --save_path results/talking_head.mp4
+```
+
+**Image Editing (Qwen, image-to-image):**
+
+```bash
+bash scripts/run_infer.sh \
+    --model qwen-image-edit-2511 \
+    --task i2i \
+    --prompt "Turn the scene into a watercolor painting." \
+    --gpus 1 \
+    --save_path results/edited.png
+```
+
+**Self-Forcing streaming generation:**
+
+```bash
+bash scripts/run_infer.sh \
+    --model wan2.1_sf \
+    --task t2v \
+    --prompt "A river flowing through a forest in autumn." \
+    --gpus 4
 ```
 
 ### 4. Distillation Training
@@ -312,23 +373,36 @@ bash scripts/benchmarks/bench_hunyuan.sh
 WorldDistill/
 ├── inference/                  # Inference engine (adapted from LightX2V)
 │   ├── lightx2v/
-│   │   ├── infer.py            # Inference entry point
+│   │   ├── infer.py            # Inference entry point (prints modality & distill profile)
+│   │   ├── pipeline.py         # Unified pipeline with modality-aware result labeling
 │   │   ├── models/
 │   │   │   ├── runners/        # Model-specific runners
-│   │   │   │   ├── wan/        # Wan 2.1/2.2/MoE runners
+│   │   │   │   ├── wan/        # Wan 2.1/2.2/MoE/Audio/VACE/SF/Animate runners
 │   │   │   │   ├── hunyuan_video/ 
 │   │   │   │   ├── worldplay/  # WorldPlay runner
+│   │   │   │   ├── ltx2/       # LTX-Video 2 runner (T2V/I2V/T2AV/I2AV)
 │   │   │   │   └── world_models/  # World model stubs (10 models)
 │   │   │   └── schedulers/
 │   │   │       ├── wan/step_distill/        # Step distillation scheduler
 │   │   │       ├── stream_distill/          # Stream (Diffusion Forcing) scheduler
 │   │   │       └── consistency_distill/     # Consistency (TCD) scheduler
 │   │   └── utils/
+│   │       ├── model_catalog.py  # Inference-side multimodal & distill metadata resolver
+│   │       ├── set_config.py     # Auto config discovery from catalog when no explicit JSON
+│   │       └── env_compat.py     # Version-tolerant import utilities
 │   └── configs/                # Model-specific inference configs
+│       ├── wan22/              # Wan 2.2 (video, audio, MoE)
+│       ├── seko_talk/          # SekoTalk (S2V, RS2V)
+│       ├── self_forcing/       # Self-Forcing streaming
+│       ├── meanflow/           # Mean-Flow distillation
+│       ├── wan22_vace/         # VACE video editing
+│       └── ...
 │
 ├── training/                   # Distillation training pipeline
 │   ├── train_distill.py        # Training entry point
-│   ├── trainer_args.py         # All configurable hyperparameters
+│   ├── trainer_args.py         # All configurable hyperparameters (+ modality & distill fields)
+│   ├── model_catalog.py        # Training-side model metadata (mirrors inference catalog)
+│   ├── env_compat.py           # Version-tolerant import utilities
 │   ├── trainers/
 │   │   ├── base_distill_trainer.py      # Base class (flow matching, DDP/FSDP/DS, grad accum)
 │   │   ├── step_distill_trainer.py      # Fixed N-step + dual-model MoE
@@ -338,13 +412,22 @@ WorldDistill/
 │   │   ├── context_forcing_trainer.py   # Memory-aware + curriculum
 │   │   ├── adversarial_distill_trainer.py # ADD/LADD adversarial distillation
 │   │   └── dmd_distill_trainer.py       # Distribution Matching Distillation (DMD/DMD2)
+│   ├── runtime/                # Train-infer coupled runtime modules
+│   │   ├── teacher_student_runtime.py   # Teacher-Student execution runtime
+│   │   ├── world_model_runtime.py       # World model specific runtime
+│   │   ├── distill_cache.py             # Distillation cache for teacher outputs
+│   │   └── fused_supervision.py         # Fused multi-loss supervision
+│   ├── tests/
+│   │   └── test_runtime_smoke.py  # Smoke tests (catalog, args, metadata — no GPU needed)
 │   ├── data/
 │   │   ├── video_dataset.py    # Raw video + cached latent datasets
 │   │   └── bucket_sampler.py   # Resolution/frame bucketed sampling
 │   └── utils/
 │       ├── optimizers.py       # AdamW + Muon optimizer
 │       ├── schedulers.py       # LR schedulers (cosine, linear, etc.)
-│       └── distributed.py      # DDP + FSDP + DeepSpeed utilities
+│       ├── distributed.py      # DDP + FSDP + DeepSpeed utilities
+│       ├── batch_encoder.py    # Batch encoding utilities
+│       └── experiment_tracking.py # Experiment tracker (console/TB/W&B)
 │
 ├── tools/                      # Utility scripts
 │   ├── download_models.py      # Model downloader (HuggingFace)
@@ -354,12 +437,12 @@ WorldDistill/
 │
 ├── scripts/                    # Shell scripts
 │   ├── setup_env.sh            # Environment setup
-│   ├── run_infer.sh            # Unified inference runner
+│   ├── run_infer.sh            # Unified inference runner (task-aware output: .mp4/.png/.wav)
 │   ├── run_train.sh            # Unified training runner
 │   └── benchmarks/             # Model-specific benchmark scripts
 │
 ├── configs/
-│   ├── model_zoo.yaml          # Model registry (architectures, tasks, papers)
+│   ├── model_zoo.yaml          # Model registry (architectures, tasks, modalities, distill pairs)
 │   └── distill_presets/        # Distillation method presets (JSON)
 │
 ├── pics/                       # Project images
@@ -474,6 +557,7 @@ TRAINER_REGISTRY["your_method"] = YourMethodTrainer
 
 - **Runner-based training**: Training-side Runner integration is a placeholder; use diffusers or explicit weight files.
 - **FSDP checkpoints**: Optimizer state is not fully captured in FSDP saves (model weights only).
+- **VLM/LLM distillation**: Not currently supported in the `LightX2V` inference runtime. The multimodal metadata layer is designed to be modality-agnostic, so a future `vlm_llm` runtime can be added without disrupting the existing diffusion/video pipeline.
 - **Unused args**: `denoising_steps_per_frame`, `generator_update_interval`, and `loss_type` are currently not wired into training loops.
 
 ## Acknowledgments
