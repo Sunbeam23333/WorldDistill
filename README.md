@@ -42,7 +42,7 @@ WorldDistill provides a **unified framework** for distilling video generation mo
 | **Wan 2.1 / 2.2** | Wan DiT | T2V, I2V | Step, LoRA, Full, FP8 | ✅ |
 | **Wan 2.2 MoE (A14B)** | Wan MoE DiT | T2V, I2V | Step (4-step, dual model) | ✅ |
 | **Wan 2.1 Self-Forcing** | Wan DiT | T2V | Self-Forcing / Streaming | ✅ |
-| **Wan 2.1 MeanFlow Distill** | Wan DiT | T2V | Mean-Flow Distillation | ✅ |
+| **Wan 2.1 MeanFlow Distill** | Wan DiT | T2V | Mean-Flow Distillation | ◐ |
 | **HunyuanVideo 1.5** | HY DiT | T2V, I2V | Step | ✅ |
 | **LTX-Video 2** | DiT | T2V, I2V, T2AV, I2AV | Step | ✅ |
 | **SkyReels-V2** | Wan + Diffusion Forcing | T2V, I2V | Stream (Diffusion Forcing) | 🔧 |
@@ -59,6 +59,9 @@ WorldDistill provides a **unified framework** for distilling video generation mo
 | Model | Architecture | Tasks | Features | Status |
 |:------|:------------|:------|:---------|:------:|
 | **Qwen Image Edit 2511** | Qwen | T2I, I2I | Image generation & editing | ✅ |
+| **LongCat Image** | LongCat | T2I, I2I | Image generation & editing | ✅ |
+| **Z-Image** | Z-Image | T2I, I2I | Image generation & editing | ✅ |
+| **BAGEL** | BAGEL | T2I, I2I | Image generation & editing | ✅ |
 
 ### Video Editing & Animation Models
 
@@ -77,14 +80,14 @@ WorldDistill provides a **unified framework** for distilling video generation mo
 | **GameFactory** | Custom | Game Video | Step | 🔧 |
 | **Hunyuan-GameCraft** | HY DiT | Game Video | Step, Context Forcing | 🔧 |
 | **Infinite-World** | Custom | Open-World Game | Step | 🔧 |
-| **Matrix-Game 2.0** | Wan + Self-Forcing | Game | Step | 🔧 |
+| **Matrix-Game 2.0** | Wan + Self-Forcing | Game | Step | ✅ |
 | **Genie / Genie 2** | Autoregressive | Game | Progressive | 🔧 |
 | **GameGen-X** | Custom | Game | Step | 🔧 |
 | **V-Mem / SPMem** | Memory-augmented | Long Video | Context Forcing | 🔧 |
 | **CAM** | Memory-augmented | Long Video | Context Forcing | 🔧 |
 | **Mirage (Decart)** | Custom | Game | Step | 🔧 |
 
-> ✅ = Fully supported &nbsp;|&nbsp; 🔧 = Runner interface defined, implementation in progress — contributions welcome!
+> ✅ = Fully supported &nbsp;|&nbsp; ◐ = Metadata/inference available, unified training entry pending &nbsp;|&nbsp; 🔧 = Runner interface defined, implementation in progress — contributions welcome!
 
 ---
 
@@ -118,6 +121,31 @@ WorldDistill provides a **unified framework** for distilling video generation mo
 - **Evaluation**: periodic validation via `val_data_json` and `eval_every`.
 - **Smoke Tests**: lightweight `test_runtime_smoke.py` validates catalog resolution, trainer args, and inference metadata without GPU.
 
+## CUDA Compatibility
+
+WorldDistill keeps hardware capability detection separate from optional CUDA
+kernels. Run the compatibility probe inside the exact environment used for
+training or inference:
+
+```bash
+python tools/check_cuda_compat.py
+python tools/check_cuda_compat.py --json
+python tools/check_cuda_compat.py --strict
+```
+
+The current policy covers the primary data-center targets:
+
+| Device family | Compute capability | Native CUDA target | Safe attention fallback |
+|:--------------|:------------------:|:------------------:|:------------------------|
+| A100 | 8.0 | CUDA 11.0+ | FlashAttention-2 → Torch SDPA |
+| H20 / Hopper | 9.0 | CUDA 11.8+ | FlashAttention-3 → FlashAttention-2 → Torch SDPA |
+| B200 | 10.0 | CUDA 12.8+ | SageAttention-3 / FlashAttention-3 → Torch SDPA |
+| B300 | 10.3 | CUDA 12.9+ | SageAttention-3 / FlashAttention-3 → Torch SDPA |
+
+`--strict` checks for native toolchain support. Older CUDA-built applications
+may still run on Blackwell through embedded PTX, but that path must be verified
+on the target host and should not be reported as native B200/B300 validation.
+
 ## Quick Start
 
 ### 1. Environment Setup
@@ -138,6 +166,7 @@ pip install flash-attn --no-build-isolation
 cd inference && pip install -e . && cd ..
 pip install -r requirements.txt
 pip install "transformers==4.57.1"
+pip install -e .
 ```
 
 ### 2. Download Models

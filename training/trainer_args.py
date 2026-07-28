@@ -198,6 +198,14 @@ class TrainerArgs:
     deepspeed_stage: int = 2  # ZeRO stage (1, 2, or 3) when parallel_mode=deepspeed
     gradient_checkpointing: bool = True
     cpu_offload: bool = False
+    enable_tf32: bool = False
+    float32_matmul_precision: str = "high"  # highest | high | medium
+    enable_torch_compile: bool = False
+    torch_compile_scope: str = "student"  # student | teacher | both
+    torch_compile_mode: str = "reduce-overhead"
+    torch_compile_backend: str = "inductor"
+    torch_compile_fullgraph: bool = False
+    torch_compile_dynamic: bool = False
 
     # --- Teacher-Student Runtime / DistillCache ---
     enable_runtime: bool = False
@@ -306,8 +314,8 @@ class TrainerArgs:
         return cls(**kwargs)
 
 
-def parse_training_args() -> TrainerArgs:
-    """Parse command-line arguments into TrainerArgs."""
+def build_training_arg_parser() -> argparse.ArgumentParser:
+    """Build the command-line argument parser for distillation training."""
     parser = argparse.ArgumentParser(description="WorldDistill Training")
 
     # Model
@@ -399,6 +407,19 @@ def parse_training_args() -> TrainerArgs:
     parser.add_argument("--deepspeed_stage", type=int, default=2, choices=[1, 2, 3], help="DeepSpeed ZeRO stage")
     parser.add_argument("--gradient_checkpointing", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--cpu_offload", action="store_true")
+    parser.add_argument("--enable_tf32", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--float32_matmul_precision", type=str, default="high", choices=["highest", "high", "medium"])
+    parser.add_argument("--enable_torch_compile", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--torch_compile_scope", type=str, default="student", choices=["student", "teacher", "both"])
+    parser.add_argument(
+        "--torch_compile_mode",
+        type=str,
+        default="reduce-overhead",
+        choices=["default", "reduce-overhead", "max-autotune", "max-autotune-no-cudagraphs"],
+    )
+    parser.add_argument("--torch_compile_backend", type=str, default="inductor")
+    parser.add_argument("--torch_compile_fullgraph", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--torch_compile_dynamic", action=argparse.BooleanOptionalAction, default=False)
 
     # Teacher-Student Runtime / DistillCache
     parser.add_argument("--enable_runtime", action="store_true")
@@ -456,5 +477,11 @@ def parse_training_args() -> TrainerArgs:
     parser.add_argument("--wandb_run_name", type=str, default="")
     parser.add_argument("--wandb_tags", type=str, default="")
 
+    return parser
+
+
+def parse_training_args() -> TrainerArgs:
+    """Parse command-line arguments into TrainerArgs."""
+    parser = build_training_arg_parser()
     args = parser.parse_args()
     return TrainerArgs.from_args(args)

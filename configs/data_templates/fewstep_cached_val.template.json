@@ -1,0 +1,18 @@
+[
+  {
+    "sample_id": "wan22_val_0001",
+    "latent_path": "/path/to/cache/latents/val/video_0001.pt",
+    "text_embed_path": "/path/to/cache/text_embeds/val/video_0001.pt",
+    "num_frames": 81,
+    "resolution": [90, 160],
+    "text": "A robot barista preparing coffee inside a warm industrial cafe."
+  },
+  {
+    "sample_id": "wan22_val_0002",
+    "latent_path": "/path/to/cache/latents/val/video_0002.pt",
+    "text_embed_path": "/path/to/cache/text_embeds/val/video_0002.pt",
+    "num_frames": 81,
+    "resolution": [90, 160],
+    "text": "An underwater reef scene with fish swirling around coral pillars."
+  }
+]

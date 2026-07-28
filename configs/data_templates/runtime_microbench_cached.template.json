@@ -1,0 +1,18 @@
+[
+  {
+    "sample_id": "runtime_case_0001",
+    "latent_path": "/path/to/cache/latents/runtime/case_0001.pt",
+    "text_embed_path": "/path/to/cache/text_embeds/runtime/case_0001.pt",
+    "num_frames": 81,
+    "resolution": [90, 160],
+    "text": "A benchmark prompt for measuring teacher cache reuse and async overlap overheads."
+  },
+  {
+    "sample_id": "runtime_case_0002",
+    "latent_path": "/path/to/cache/latents/runtime/case_0002.pt",
+    "text_embed_path": "/path/to/cache/text_embeds/runtime/case_0002.pt",
+    "num_frames": 81,
+    "resolution": [90, 160],
+    "text": "A second microbenchmark sample with different temporal dynamics for runtime ablation."
+  }
+]

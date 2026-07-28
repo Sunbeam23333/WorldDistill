@@ -18,7 +18,7 @@
 #   # With TensorBoard + W&B logging
 #   bash scripts/run_train.sh --method context_forcing --teacher_model ./models/HY-WorldPlay --model_cls worldplay_distill --data_json ./data/train.json --report_to console,tensorboard,wandb
 # ============================================================================
-set -e
+set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(dirname "${SCRIPT_DIR}")"
@@ -52,6 +52,21 @@ WANDB_PROJECT="worlddistill"
 WANDB_ENTITY=""
 WANDB_RUN_NAME=""
 WANDB_TAGS=""
+VIDEO_DIR=""
+CACHE_DIR=""
+VAL_CACHE_DIR=""
+RESOLUTION="480p"
+NUM_FRAMES=49
+SEED=42
+NUM_WORKERS=4
+ENABLE_TF32=""
+FLOAT32_MATMUL_PRECISION="high"
+ENABLE_TORCH_COMPILE=""
+TORCH_COMPILE_SCOPE="student"
+TORCH_COMPILE_MODE="reduce-overhead"
+TORCH_COMPILE_BACKEND="inductor"
+TORCH_COMPILE_FULLGRAPH=""
+TORCH_COMPILE_DYNAMIC=""
 
 resolve_default_config() {
     case "${METHOD}" in
@@ -117,8 +132,23 @@ while [[ $# -gt 0 ]]; do
         --wandb_entity) WANDB_ENTITY="$2"; shift 2 ;;
         --wandb_run_name) WANDB_RUN_NAME="$2"; shift 2 ;;
         --wandb_tags) WANDB_TAGS="$2"; shift 2 ;;
+        --video_dir) VIDEO_DIR="$2"; shift 2 ;;
+        --cache_dir) CACHE_DIR="$2"; shift 2 ;;
+        --val_cache_dir) VAL_CACHE_DIR="$2"; shift 2 ;;
+        --resolution) RESOLUTION="$2"; shift 2 ;;
+        --num_frames) NUM_FRAMES="$2"; shift 2 ;;
+        --seed) SEED="$2"; shift 2 ;;
+        --num_workers) NUM_WORKERS="$2"; shift 2 ;;
         --gradient_checkpointing) GRADIENT_CHECKPOINTING="--gradient_checkpointing"; shift ;;
         --cpu_offload) CPU_OFFLOAD="--cpu_offload"; shift ;;
+        --enable_tf32) ENABLE_TF32="--enable_tf32"; shift ;;
+        --float32_matmul_precision) FLOAT32_MATMUL_PRECISION="$2"; shift 2 ;;
+        --enable_torch_compile) ENABLE_TORCH_COMPILE="--enable_torch_compile"; shift ;;
+        --torch_compile_scope) TORCH_COMPILE_SCOPE="$2"; shift 2 ;;
+        --torch_compile_mode) TORCH_COMPILE_MODE="$2"; shift 2 ;;
+        --torch_compile_backend) TORCH_COMPILE_BACKEND="$2"; shift 2 ;;
+        --torch_compile_fullgraph) TORCH_COMPILE_FULLGRAPH="--torch_compile_fullgraph"; shift ;;
+        --torch_compile_dynamic) TORCH_COMPILE_DYNAMIC="--torch_compile_dynamic"; shift ;;
         --help)
             echo "Usage: bash run_train.sh [OPTIONS]"
             echo ""
@@ -163,8 +193,23 @@ while [[ $# -gt 0 ]]; do
             echo "  --wandb_entity        W&B entity/team (optional)"
             echo "  --wandb_run_name      W&B run name (optional)"
             echo "  --wandb_tags          Comma-separated W&B tags (optional)"
+            echo "  --video_dir           Root directory for raw-video manifests (optional)"
+            echo "  --cache_dir           Root directory for cached latent manifests (optional)"
+            echo "  --val_cache_dir       Cache directory for validation manifest (optional)"
+            echo "  --resolution          Training resolution tag, e.g. 480p/720p (default: 480p)"
+            echo "  --num_frames          Number of frames sampled per clip (default: 49)"
+            echo "  --seed                Random seed (default: 42)"
+            echo "  --num_workers         Dataloader workers per rank (default: 4)"
             echo "  --gradient_checkpointing  Enable gradient checkpointing"
             echo "  --cpu_offload         Enable CPU offloading (FSDP/DeepSpeed)"
+            echo "  --enable_tf32         Enable TF32 matmul/cudnn on supported GPUs"
+            echo "  --float32_matmul_precision highest|high|medium (default: high)"
+            echo "  --enable_torch_compile Enable training-time torch.compile"
+            echo "  --torch_compile_scope student|teacher|both (default: student)"
+            echo "  --torch_compile_mode  default|reduce-overhead|max-autotune|max-autotune-no-cudagraphs"
+            echo "  --torch_compile_backend torch.compile backend (default: inductor)"
+            echo "  --torch_compile_fullgraph  Enable fullgraph compilation"
+            echo "  --torch_compile_dynamic    Enable dynamic-shape compilation"
             exit 0 ;;
         *) echo "Unknown option: $1"; exit 1 ;;
     esac
@@ -226,12 +271,15 @@ echo "============================================"
 
 torchrun --nproc_per_node=${NUM_GPUS} \
     -m training.train_distill \
-    --method ${METHOD} \
+    --distill_method ${METHOD} \
     --teacher_model_path ${TEACHER_MODEL} \
     --model_cls ${MODEL_CLS} \
     ${STUDENT_MODEL:+--student_model_path ${STUDENT_MODEL}} \
     ${DATA_JSON:+--data_json ${DATA_JSON}} \
+    ${VIDEO_DIR:+--video_dir ${VIDEO_DIR}} \
+    ${CACHE_DIR:+--cache_dir ${CACHE_DIR}} \
     ${VAL_DATA_JSON:+--val_data_json ${VAL_DATA_JSON}} \
+    ${VAL_CACHE_DIR:+--val_cache_dir ${VAL_CACHE_DIR}} \
     ${EVAL_EVERY:+--eval_every ${EVAL_EVERY}} \
     ${EVAL_BATCHES:+--eval_batches ${EVAL_BATCHES}} \
     --output_dir ${OUTPUT_DIR} \
@@ -240,6 +288,10 @@ torchrun --nproc_per_node=${NUM_GPUS} \
     --learning_rate ${LR} \
     --max_train_steps ${MAX_TRAIN_STEPS} \
     --save_every ${SAVE_EVERY} \
+    --seed ${SEED} \
+    --num_workers ${NUM_WORKERS} \
+    --resolution ${RESOLUTION} \
+    --num_frames ${NUM_FRAMES} \
     --parallel_mode ${PARALLEL_MODE} \
     --sp_size ${SP_SIZE} \
     --deepspeed_stage ${DS_STAGE} \
@@ -252,6 +304,14 @@ torchrun --nproc_per_node=${NUM_GPUS} \
     ${WANDB_TAGS:+--wandb_tags ${WANDB_TAGS}} \
     ${GRADIENT_CHECKPOINTING} \
     ${CPU_OFFLOAD} \
+    ${ENABLE_TF32} \
+    --float32_matmul_precision ${FLOAT32_MATMUL_PRECISION} \
+    ${ENABLE_TORCH_COMPILE} \
+    --torch_compile_scope ${TORCH_COMPILE_SCOPE} \
+    --torch_compile_mode ${TORCH_COMPILE_MODE} \
+    --torch_compile_backend ${TORCH_COMPILE_BACKEND} \
+    ${TORCH_COMPILE_FULLGRAPH} \
+    ${TORCH_COMPILE_DYNAMIC} \
     ${CONFIG:+--config ${CONFIG}}
 
 echo ""

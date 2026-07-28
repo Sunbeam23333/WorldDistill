@@ -9,6 +9,8 @@
 #   - default_configs: task -> default inference config path under `inference/configs/`
 #   - teacher_model_cls: canonical teacher model used by distilled/student variant
 #   - distill_stage: base | teacher | student
+#   - distill_methods: broad capability tags; not every tag is a registry-backed `--distill_method`
+#   - catalog_only_distill_methods: methods exposed in metadata/inference but not yet in the unified trainer registry
 #   - input_modalities / output_modalities / modalities: multimodal IO hints
 
 models:

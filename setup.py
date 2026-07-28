@@ -9,6 +9,7 @@ setup(
     url="https://github.com/worlddistill/WorldDistill",
     license="Apache-2.0",
     packages=find_packages(exclude=["tests", "docs"]),
+    py_modules=["distill_capabilities", "cuda_compat"],
     python_requires=">=3.10",
     install_requires=[
         "torch>=2.5.1",

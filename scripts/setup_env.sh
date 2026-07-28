@@ -34,6 +34,7 @@ echo "Step 5: Install additional dependencies"
 echo "============================================"
 cd "${PROJECT_ROOT}"
 pip install -r requirements.txt
+pip install -e .
 
 echo "============================================"
 echo "Setup complete!"

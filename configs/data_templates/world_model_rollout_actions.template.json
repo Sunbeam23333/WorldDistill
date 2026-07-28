@@ -1,0 +1,15 @@
+{
+  "episode_id": "world_model_rollout_0001",
+  "num_frames": 125,
+  "fps": 16,
+  "actions": [
+    {"frame": 0, "steer": 0.0, "throttle": 0.8, "brake": 0.0},
+    {"frame": 16, "steer": 0.1, "throttle": 0.7, "brake": 0.0},
+    {"frame": 32, "steer": -0.2, "throttle": 0.6, "brake": 0.0},
+    {"frame": 48, "steer": 0.0, "throttle": 0.7, "brake": 0.0},
+    {"frame": 64, "steer": 0.25, "throttle": 0.5, "brake": 0.0},
+    {"frame": 80, "steer": -0.15, "throttle": 0.6, "brake": 0.0},
+    {"frame": 96, "steer": 0.0, "throttle": 0.4, "brake": 0.2},
+    {"frame": 112, "steer": 0.0, "throttle": 0.0, "brake": 0.4}
+  ]
+}

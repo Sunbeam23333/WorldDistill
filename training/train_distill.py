@@ -104,6 +104,75 @@ def set_seed(seed: int):
     # torch.backends.cudnn.benchmark = False
 
 
+def _configure_cuda_backend(args) -> None:
+    """Configure low-level CUDA math knobs used by the training runtime."""
+    if not torch.cuda.is_available():
+        return
+
+    enable_tf32 = bool(getattr(args, "enable_tf32", False))
+    torch.backends.cuda.matmul.allow_tf32 = enable_tf32
+    torch.backends.cudnn.allow_tf32 = enable_tf32
+
+    precision = str(getattr(args, "float32_matmul_precision", "high") or "high").lower()
+    if hasattr(torch, "set_float32_matmul_precision") and precision in {"highest", "high", "medium"}:
+        torch.set_float32_matmul_precision(precision)
+
+    if is_main_process():
+        logger.info(
+            f"CUDA backend | TF32={'on' if enable_tf32 else 'off'} | "
+            f"float32 matmul precision={precision}"
+        )
+
+
+
+def _compile_model_if_requested(model: torch.nn.Module, args, role: str):
+    """Optionally compile teacher/student models for DDP training."""
+    if not getattr(args, "enable_torch_compile", False):
+        return model
+
+    scope = getattr(args, "torch_compile_scope", "student")
+    if scope not in {role, "both"}:
+        return model
+
+    compile_fn = getattr(torch, "compile", None)
+    if compile_fn is None:
+        if is_main_process():
+            logger.warning("当前 PyTorch 不支持 torch.compile，跳过编译优化。")
+        return model
+
+    parallel_mode = getattr(args, "parallel_mode", "ddp")
+    if parallel_mode != "ddp":
+        if is_main_process():
+            logger.warning(
+                f"当前 parallel_mode={parallel_mode}，为避免与封装器冲突，暂时只在 DDP 路径启用 torch.compile。"
+            )
+        return model
+
+    fullgraph = bool(getattr(args, "torch_compile_fullgraph", False))
+    if role == "student" and getattr(args, "gradient_checkpointing", False) and fullgraph:
+        if is_main_process():
+            logger.warning("student 同时开启 gradient checkpointing 与 fullgraph 编译较不稳定，自动回退为 fullgraph=False。")
+        fullgraph = False
+
+    compile_kwargs = {
+        "backend": getattr(args, "torch_compile_backend", "inductor"),
+        "mode": getattr(args, "torch_compile_mode", "reduce-overhead"),
+        "fullgraph": fullgraph,
+        "dynamic": bool(getattr(args, "torch_compile_dynamic", False)),
+    }
+
+    try:
+        compiled_model = compile_fn(model, **compile_kwargs)
+        if is_main_process():
+            logger.info(f"torch.compile 已启用 | role={role} | kwargs={compile_kwargs}")
+        return compiled_model
+    except Exception as exc:
+        if is_main_process():
+            logger.warning(f"torch.compile 在 {role} 上启用失败，自动回退到 eager: {exc}")
+        return model
+
+
+
 def _resolve_data_mode(data_json: str, requested_mode: str) -> str:
     if requested_mode != "auto":
         return requested_mode
@@ -154,6 +223,7 @@ def main():
 
     # Set seed for reproducibility
     set_seed(args.seed + rank)  # Different seed per rank for data diversity
+    _configure_cuda_backend(args)
 
     if is_main_process():
         logger.info(f"WorldDistill Training | Method: {args.distill_method} | Model: {args.model_cls}")
@@ -257,6 +327,9 @@ def main():
             student_model.gradient_checkpointing_enable()
         elif hasattr(student_model, "enable_gradient_checkpointing"):
             student_model.enable_gradient_checkpointing()
+
+    teacher_model = _compile_model_if_requested(teacher_model, args, role="teacher")
+    student_model = _compile_model_if_requested(student_model, args, role="student")
 
     # --- Build Optimizer & Scheduler ---
     # Note: For FSDP, optimizer will be re-created after wrapping in base_distill_trainer.

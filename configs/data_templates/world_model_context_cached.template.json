@@ -1,0 +1,22 @@
+[
+  {
+    "sample_id": "world_model_0001",
+    "latent_path": "/path/to/cache/latents/world_model/episode_0001_chunk_00.pt",
+    "text_embed_path": "/path/to/cache/text_embeds/world_model/episode_0001_chunk_00.pt",
+    "camera_path": "/path/to/cache/camera/world_model/episode_0001_chunk_00.pt",
+    "action_path": "/path/to/cache/actions/world_model/episode_0001_chunk_00.pt",
+    "num_frames": 125,
+    "resolution": [60, 106],
+    "text": "Arcade driving rollout with stable lane following and long-horizon consistency."
+  },
+  {
+    "sample_id": "world_model_0002",
+    "latent_path": "/path/to/cache/latents/world_model/episode_0002_chunk_00.pt",
+    "text_embed_path": "/path/to/cache/text_embeds/world_model/episode_0002_chunk_00.pt",
+    "camera_path": "/path/to/cache/camera/world_model/episode_0002_chunk_00.pt",
+    "action_path": "/path/to/cache/actions/world_model/episode_0002_chunk_00.pt",
+    "num_frames": 125,
+    "resolution": [60, 106],
+    "text": "Open-world exploration sequence used for context-forcing drift evaluation."
+  }
+]

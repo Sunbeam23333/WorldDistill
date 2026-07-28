@@ -139,6 +139,30 @@ class PresetSmokeTests(unittest.TestCase):
         self.assertTrue(args.use_bucket_sampler)
         self.assertEqual(args.required_transformers_version, EXPECTED_TRANSFORMERS_VERSION)
 
+    def test_parse_training_args_accepts_cuda_compile_flags(self) -> None:
+        argv = [
+            "train_distill.py",
+            "--teacher_model_path", "/tmp/teacher",
+            "--data_json", "/tmp/train.json",
+            "--enable_tf32",
+            "--float32_matmul_precision", "medium",
+            "--enable_torch_compile",
+            "--torch_compile_scope", "both",
+            "--torch_compile_mode", "max-autotune-no-cudagraphs",
+            "--torch_compile_fullgraph",
+            "--torch_compile_dynamic",
+        ]
+        with patch.object(sys, "argv", argv):
+            args = parse_training_args()
+
+        self.assertTrue(args.enable_tf32)
+        self.assertEqual(args.float32_matmul_precision, "medium")
+        self.assertTrue(args.enable_torch_compile)
+        self.assertEqual(args.torch_compile_scope, "both")
+        self.assertEqual(args.torch_compile_mode, "max-autotune-no-cudagraphs")
+        self.assertTrue(args.torch_compile_fullgraph)
+        self.assertTrue(args.torch_compile_dynamic)
+
     def test_inference_catalog_resolves_distill_pair_and_image_defaults(self) -> None:
         metadata = resolve_inference_metadata("wan2.1_distill", task="t2v")
         default_config = resolve_default_inference_config("qwen-image-edit-2511", task="i2i")
