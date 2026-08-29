@@ -13,6 +13,7 @@ References:
 """
 
 import math
+import copy
 from typing import Any, Dict, Iterable, Optional
 
 import torch
@@ -68,7 +69,16 @@ class Muon(Optimizer):
                     eps=adamw_eps,
                     weight_decay=adamw_wd,
                 )
-                param_groups.append({"params": adamw_params_list, "type": "adamw"})
+                param_groups.append(
+                    {
+                        "params": adamw_params_list,
+                        "type": "adamw",
+                        "lr": adamw_lr,
+                        "betas": adamw_betas,
+                        "eps": adamw_eps,
+                        "weight_decay": adamw_wd,
+                    }
+                )
 
         super().__init__(param_groups, defaults)
 
@@ -160,6 +170,12 @@ class Muon(Optimizer):
 
         # Step AdamW for 1D params
         if self.adamw_optimizer is not None:
+            outer_group = next(
+                group for group in self.param_groups if group.get("type") == "adamw"
+            )
+            for inner_group in self.adamw_optimizer.param_groups:
+                for key in ("lr", "betas", "eps", "weight_decay"):
+                    inner_group[key] = outer_group[key]
             self.adamw_optimizer.step()
 
         return loss
@@ -169,6 +185,54 @@ class Muon(Optimizer):
         super().zero_grad(set_to_none=set_to_none)
         if self.adamw_optimizer is not None:
             self.adamw_optimizer.zero_grad(set_to_none=set_to_none)
+
+    def state_dict(self):
+        """Include momentum owned by the nested AdamW fallback."""
+
+        state = super().state_dict()
+        state["adamw_optimizer"] = (
+            self.adamw_optimizer.state_dict()
+            if self.adamw_optimizer is not None
+            else None
+        )
+        return state
+
+    def load_state_dict(self, state_dict):
+        """Restore both Muon and nested AdamW state strictly."""
+
+        state = copy.deepcopy(state_dict)
+        if "adamw_optimizer" not in state:
+            raise KeyError("Muon checkpoint is missing nested adamw_optimizer state")
+        adamw_state = state.pop("adamw_optimizer")
+        super().load_state_dict(state)
+        if self.adamw_optimizer is None:
+            if adamw_state is not None:
+                raise ValueError("Checkpoint has AdamW fallback state but optimizer has no AdamW parameters")
+        else:
+            if adamw_state is None:
+                raise ValueError("Checkpoint is missing state for Muon's AdamW fallback parameters")
+            self.adamw_optimizer.load_state_dict(adamw_state)
+
+
+def partition_adamw_parameters(model: nn.Module) -> tuple[list[nn.Parameter], list[nn.Parameter]]:
+    """Classify decay groups while original parameter shapes are visible."""
+
+    decay_params: list[nn.Parameter] = []
+    no_decay_params: list[nn.Parameter] = []
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+        normalized_name = name.lower()
+        if (
+            param.ndim < 2
+            or "bias" in normalized_name
+            or "norm" in normalized_name
+            or "ln" in normalized_name
+        ):
+            no_decay_params.append(param)
+        else:
+            decay_params.append(param)
+    return decay_params, no_decay_params
 
 
 def build_optimizer(
@@ -197,16 +261,7 @@ def build_optimizer(
         Configured optimizer instance.
     """
     if optimizer_type == "adamw":
-        # Separate weight decay and no-decay params
-        decay_params = []
-        no_decay_params = []
-        for name, param in model.named_parameters():
-            if not param.requires_grad:
-                continue
-            if param.ndim < 2 or "bias" in name or "norm" in name or "ln" in name:
-                no_decay_params.append(param)
-            else:
-                decay_params.append(param)
+        decay_params, no_decay_params = partition_adamw_parameters(model)
 
         param_groups = [
             {"params": decay_params, "weight_decay": weight_decay},

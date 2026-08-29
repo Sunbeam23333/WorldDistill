@@ -12,6 +12,7 @@ import torch
 import torch.distributed as dist
 from loguru import logger
 
+from lightx2v.deploy.common.security import require_secret_env
 from lightx2v.deploy.data_manager import LocalDataManager, S3DataManager
 from lightx2v.deploy.task_manager import TaskStatus
 from lightx2v.deploy.worker.hub import DiTWorker, ImageEncoderWorker, PipelineWorker, SegmentDiTWorker, TextEncoderWorker, VaeDecoderWorker, VaeEncoderWorker
@@ -29,7 +30,7 @@ RUNNER_MAP = {
 
 # {task_id: {"server": xx, "worker_name": xx, "identity": xx}}
 RUNNING_SUBTASKS = {}
-WORKER_SECRET_KEY = os.getenv("WORKER_SECRET_KEY", "worker-secret-key-change-in-production")
+WORKER_SECRET_KEY = require_secret_env("WORKER_SECRET_KEY")
 HEADERS = {"Authorization": f"Bearer {WORKER_SECRET_KEY}", "Content-Type": "application/json"}
 STOPPED = False
 WORLD_SIZE = int(os.environ.get("WORLD_SIZE", 1))
@@ -115,7 +116,7 @@ async def fetch_subtasks(server_url, worker_keys, worker_identity, max_batch, ti
                         sub["server_url"] = server_url
                         sub["worker_identity"] = worker_identity
                         RUNNING_SUBTASKS[sub["task_id"]] = sub
-                    logger.info(f"{worker_identity} fetch {worker_keys} ok: {subtasks}")
+                    logger.info("{} fetched {} subtasks for {}", worker_identity, len(subtasks), worker_keys)
                     return subtasks
                 else:
                     error_text = await ret.text()
@@ -180,7 +181,7 @@ async def boradcast_subtasks(subtasks):
         if RANK != TARGET_RANK:
             subtasks_data = subtasks_tensor.cpu().numpy().tobytes()
             subtasks = json.loads(subtasks_data.decode("utf-8"))
-            logger.info(f"rank {RANK} recv subtasks: {subtasks}")
+            logger.info("Rank {} received {} broadcast subtasks", RANK, len(subtasks))
         return subtasks
 
     except:  # noqa
@@ -355,7 +356,14 @@ if __name__ == "__main__":
     if args.identity == "":
         # TODO: spec worker instance identity by k8s env
         args.identity = "worker-" + str(uuid.uuid4())[:8]
-    logger.info(f"args: {args}")
+    logger.info(
+        "Starting worker {} (task: {}, model class: {}, stage: {}, role: {})",
+        args.identity,
+        args.task,
+        args.model_cls,
+        args.stage,
+        args.worker,
+    )
 
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)

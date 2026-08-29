@@ -154,6 +154,7 @@ def wrap_model_fsdp(
         auto_wrap_policy=auto_wrap_policy,
         device_id=torch.cuda.current_device(),
         use_orig_params=True,  # Required for compatibility with torch.compile and some optimizers
+        sync_module_states=True,
     )
     logger.info(f"FSDP wrapped | strategy={shard_strategy}, offload={cpu_offload}, mp={mixed_precision}")
     return model

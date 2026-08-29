@@ -1,4 +1,5 @@
-#!/bin/bash
+#!/usr/bin/env bash
+set -euo pipefail
 
 # Lightx2v Gradio Demo Startup Script
 # Supports both Image-to-Video (i2v) and Text-to-Video (t2v) modes
@@ -12,28 +13,29 @@
 # 🐌 Using mechanical hard drives (HDD) may cause slow model loading and affect overall experience
 
 
-# Lightx2v project root directory path
-# Example: /home/user/lightx2v or /data/video_gen/lightx2v
-lightx2v_path=/data/video_gen/lightx2v_debug/LightX2V
+# LightX2V package root. Override with LIGHTX2V_PATH when embedding this app in
+# another checkout; the public default is derived from this script's location.
+app_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+lightx2v_path="${LIGHTX2V_PATH:-$(dirname "${app_dir}")}"
 
 # Model path configuration
 # Example: /path/to/Wan2.1-I2V-14B-720P-Lightx2v
-model_path=/models/
+model_path="${MODEL_PATH:-}"
 
 # Server configuration
 server_name="0.0.0.0"
 server_port=8036
 
 # Output directory configuration
-output_dir="./outputs"
+output_dir="${app_dir}/outputs"
 
 # GPU configuration
 gpu_id=0
 
 # ==================== Environment Variables Setup ====================
-export CUDA_VISIBLE_DEVICES=$gpu_id
+export CUDA_VISIBLE_DEVICES="$gpu_id"
 export CUDA_LAUNCH_BLOCKING=1
-export PYTHONPATH=${lightx2v_path}:$PYTHONPATH
+export PYTHONPATH="${lightx2v_path}${PYTHONPATH:+:${PYTHONPATH}}"
 export PROFILING_DEBUG_LEVEL=2
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
@@ -54,7 +56,7 @@ while [[ $# -gt 0 ]]; do
             ;;
         --gpu)
             gpu_id="$2"
-            export CUDA_VISIBLE_DEVICES=$gpu_id
+            export CUDA_VISIBLE_DEVICES="$gpu_id"
             shift 2
             ;;
         --output_dir)
@@ -76,7 +78,7 @@ while [[ $# -gt 0 ]]; do
             echo "                     en: English interface"
             echo "  --port PORT       Server port (default: 8032)"
             echo "  --gpu GPU_ID      GPU device ID (default: 0)"
-            echo "  --model_path PATH Model path (default: configured in script)"
+            echo "  --model_path PATH Model path (required unless MODEL_PATH is set)"
             echo "  --output_dir DIR  Output video save directory (default: ./outputs)"
             echo "  --help            Show this help message"
             echo ""
@@ -104,7 +106,7 @@ if [[ "$lang" != "zh" && "$lang" != "en" ]]; then
 fi
 
 # Check if model path exists
-if [[ ! -d "$model_path" ]]; then
+if [[ -z "$model_path" || ! -d "$model_path" ]]; then
     echo "❌ Error: Model path does not exist"
     echo "📁 Path: $model_path"
     echo "🔧 Solutions:"
@@ -116,7 +118,7 @@ if [[ ! -d "$model_path" ]]; then
 fi
 
 # 使用新的统一入口文件
-demo_file="gradio_demo.py"
+demo_file="${app_dir}/gradio_demo.py"
 echo "🌏 Using unified interface (language: $lang)"
 
 # Check if demo file exists
@@ -145,7 +147,9 @@ echo "=========================================="
 
 # Display system resource information
 echo "💻 System resource information:"
-free -h | grep -E "Mem|Swap"
+if command -v free >/dev/null 2>&1; then
+    free -h | grep -E "Mem|Swap" || true
+fi
 echo ""
 
 # Display GPU information
@@ -164,14 +168,14 @@ echo "=========================================="
 
 # Start Python demo
 if [[ "$demo_file" == "gradio_demo.py" ]]; then
-    python $demo_file \
+    python "$demo_file" \
         --model_path "$model_path" \
         --server_name "$server_name" \
         --server_port "$server_port" \
         --output_dir "$output_dir" \
         --lang "$lang"
 else
-python $demo_file \
+python "$demo_file" \
     --model_path "$model_path" \
     --server_name "$server_name" \
     --server_port "$server_port" \

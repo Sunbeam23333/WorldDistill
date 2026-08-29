@@ -12,6 +12,7 @@ ACTION_CKPT="${ACTION_CKPT:-${MODEL_ROOT_DIR}/worldplay/action_model.safetensors
 ACTION_PATH="${ACTION_PATH:-${PROJECT_ROOT}/configs/data_templates/world_model_rollout_actions.template.json}"
 INPUT_IMAGE="${INPUT_IMAGE:-${PROJECT_ROOT}/inference/assets/inputs/imgs/img_0.jpg}"
 NUM_GPUS="${NUM_GPUS:-8}"
+INFER_NUM_GPUS="${INFER_NUM_GPUS:-1}"
 MAX_TRAIN_STEPS="${MAX_TRAIN_STEPS:-40000}"
 OUTPUT_ROOT="${OUTPUT_ROOT:-${RESULT_ROOT:-${PROJECT_ROOT}/results}/paper/world_model}"
 PROMPT="${PROMPT:-A first-person driving scene through a colorful arcade city with stable long-horizon world consistency.}"
@@ -54,7 +55,7 @@ run_infer_phase() {
         --action_path "${ACTION_PATH}" \
         --image_path "${INPUT_IMAGE}" \
         --prompt "${PROMPT}" \
-        --gpus "${NUM_GPUS}" \
+        --gpus "${INFER_NUM_GPUS}" \
         --save_path "${OUTPUT_ROOT}/samples/worldplay_distill.mp4"
 
     print_header "World-model AR baseline rollout"
@@ -67,7 +68,7 @@ run_infer_phase() {
         --action_path "${ACTION_PATH}" \
         --image_path "${INPUT_IMAGE}" \
         --prompt "${PROMPT}" \
-        --gpus "${NUM_GPUS}" \
+        --gpus "${INFER_NUM_GPUS}" \
         --save_path "${OUTPUT_ROOT}/samples/worldplay_ar.mp4"
 }
 

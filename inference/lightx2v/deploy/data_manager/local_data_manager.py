@@ -88,10 +88,10 @@ async def test():
     import torch
     from PIL import Image
 
-    m = LocalDataManager("/data/nvme1/liuliang1/lightx2v/local_data", None)
+    m = LocalDataManager(os.environ.get("LIGHTX2V_LOCAL_DATA_DIR", "./local_data"), None)
     await m.init()
 
-    img = Image.open("/data/nvme1/liuliang1/lightx2v/assets/img_lightx2v.png")
+    img = Image.open(os.environ["LIGHTX2V_TEST_IMAGE"])
     tensor = torch.Tensor([233, 456, 789]).to(dtype=torch.bfloat16, device="cuda:0")
 
     await m.save_image(img, "test_img.png")

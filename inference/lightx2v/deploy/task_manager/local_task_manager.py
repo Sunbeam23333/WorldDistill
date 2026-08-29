@@ -501,8 +501,8 @@ class LocalTaskManager(BaseTaskManager):
 async def test():
     from lightx2v.deploy.common.pipeline import Pipeline
 
-    p = Pipeline("/data/nvme1/liuliang1/lightx2v/configs/model_pipeline.json")
-    m = LocalTaskManager("/data/nvme1/liuliang1/lightx2v/local_task")
+    p = Pipeline(os.environ.get("LIGHTX2V_PIPELINE_CONFIG", "./configs/model_pipeline.json"))
+    m = LocalTaskManager(os.environ.get("LIGHTX2V_LOCAL_TASK_DIR", "./local_task"))
     await m.init()
 
     keys = ["t2v", "wan2.1", "multi_stage"]

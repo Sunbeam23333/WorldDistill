@@ -179,12 +179,7 @@ function addCacheBustingParam(url) {
     }
     // 对于 API URL，添加缓存破坏参数
     const separator = url.includes('?') ? '&' : '?'
-    let newUrl = `${url}${separator}t=${Date.now()}`;
-    const token = localStorage.getItem('accessToken')
-    if (token) {
-        newUrl = `${newUrl}&token=${token}`
-    }
-    return newUrl;
+    return `${url}${separator}t=${Date.now()}`
 }
 
 // 检测是否为移动端
@@ -1902,7 +1897,15 @@ async function loadAudio(autoPlay = false, retryCount = 0) {
         if (mergedAudioUrl.startsWith('http://') || mergedAudioUrl.startsWith('https://')) {
             audioUrl.value = mergedAudioUrl
         } else {
-            audioUrl.value = addCacheBustingParam(mergedAudioUrl)
+            const response = await apiCall(addCacheBustingParam(mergedAudioUrl))
+            if (!response || !response.ok) {
+                throw new Error(`Failed to load protected audio: ${response ? response.status : 'no response'}`)
+            }
+            const protectedAudioUrl = URL.createObjectURL(await response.blob())
+            if (audioUrl.value && audioUrl.value.startsWith('blob:')) {
+                URL.revokeObjectURL(audioUrl.value)
+            }
+            audioUrl.value = protectedAudioUrl
         }
         // 确保音频元素已加载
         await nextTick()
@@ -2458,15 +2461,20 @@ async function generatePodcast() {
 
     try {
         const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
-        // 获取 token 用于 WebSocket 认证
         const token = localStorage.getItem('accessToken')
-        const wsUrl = token
-            ? `${protocol}//${window.location.host}/api/v1/podcast/generate?token=${encodeURIComponent(token)}`
-            : `${protocol}//${window.location.host}/api/v1/podcast/generate`
+        const wsUrl = `${protocol}//${window.location.host}/api/v1/podcast/generate`
         wsConnection = new WebSocket(wsUrl)
 
         wsConnection.onopen = () => {
-            wsConnection.send(JSON.stringify({ input: input.value }))
+            if (!token) {
+                wsConnection.close(1008, 'Authentication required')
+                showAlert(t('authFailedPleaseRelogin'), 'warning')
+                return
+            }
+            // Browser WebSockets cannot set an Authorization header. Authenticate
+            // in the encrypted first frame so the token never enters the URL or
+            // an HTTP access log.
+            wsConnection.send(JSON.stringify({ type: 'authenticate', access_token: token }))
         }
 
         // 设置 WebSocket 接收二进制数据
@@ -2486,6 +2494,17 @@ async function generatePodcast() {
                 message = JSON.parse(event.data)
             } catch (e) {
                 console.error('Failed to parse WebSocket message:', e, event.data)
+                return
+            }
+
+            if (message.type === 'authenticated') {
+                wsConnection.send(JSON.stringify({ input: input.value }))
+                return
+            }
+
+            if (message.type === 'auth_error') {
+                showAlert(t('authFailedPleaseRelogin'), 'warning')
+                wsConnection.close(1008, 'Authentication failed')
                 return
             }
 
@@ -2771,17 +2790,31 @@ function stopGeneration() {
 }
 
 // 下载音频
-function downloadAudio() {
+async function downloadAudio() {
     // 优先使用 sessionAudioUrl（详情模式），然后是 currentAudioUrl（生成完成），最后是 mergedAudioUrl（生成中）
     // 如果都没有，尝试使用 audioUrl.value（响应式音频 URL）
     const urlToDownload = sessionAudioUrl || currentAudioUrl || mergedAudioUrl || audioUrl.value
     if (urlToDownload) {
+        let downloadUrl = urlToDownload
+        let revokeDownloadUrl = false
+        if (!urlToDownload.startsWith('http://') && !urlToDownload.startsWith('https://') && !urlToDownload.startsWith('blob:')) {
+            const response = await apiCall(addCacheBustingParam(urlToDownload))
+            if (!response || !response.ok) {
+                showAlert(t('podcast.noAudioToDownload'), 'warning')
+                return
+            }
+            downloadUrl = URL.createObjectURL(await response.blob())
+            revokeDownloadUrl = true
+        }
         const link = document.createElement('a')
-        link.href = addCacheBustingParam(urlToDownload);
+        link.href = downloadUrl
         link.download = 'podcast.mp3'
         document.body.appendChild(link)
         link.click()
         document.body.removeChild(link)
+        if (revokeDownloadUrl) {
+            setTimeout(() => URL.revokeObjectURL(downloadUrl), 0)
+        }
     } else {
         showAlert(t('podcast.noAudioToDownload'), 'warning')
     }

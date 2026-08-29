@@ -179,7 +179,7 @@ _FALLBACK_MODEL_ZOO: dict[str, dict[str, Any]] = {
     ),
     "wan2.2": _spec(
         "wan_dense",
-        ["t2v", "i2v", "ti2v"],
+        ["t2v", "i2v"],
         "wan2.2",
         model_family="video",
         checkpoint_formats=["directory", "original", "diffusers", "state_dict"],
@@ -227,14 +227,13 @@ _FALLBACK_MODEL_ZOO: dict[str, dict[str, Any]] = {
     ),
     "wan2.2_audio": _spec(
         "wan_dense",
-        ["s2v", "rs2v"],
+        ["s2v"],
         "wan2.2_audio",
         model_family="audio_video",
         checkpoint_formats=["directory", "state_dict"],
         features=["audio_conditioning", "streaming_generation"],
         default_configs={
             "s2v": "wan22/wan_moe_i2v_audio.json",
-            "rs2v": "wan22/wan_moe_i2v_audio.json",
         },
     ),
     "wan2.2_animate": _spec(
@@ -255,7 +254,7 @@ _FALLBACK_MODEL_ZOO: dict[str, dict[str, Any]] = {
         features=["audio_conditioning", "reference_speech"],
         default_configs={
             "s2v": "seko_talk/shot/stream/s2v.json",
-            "rs2v": "seko_talk/shot/rs2v/rs2v.json",
+            "rs2v": "seko_talk/shot/rs2v/main.json",
         },
     ),
     "hunyuan_video_1.5": _spec(
@@ -271,7 +270,7 @@ _FALLBACK_MODEL_ZOO: dict[str, dict[str, Any]] = {
     ),
     "hunyuan_video_1.5_distill": _spec(
         "hunyuan_video",
-        ["t2v", "i2v"],
+        ["t2v"],
         "hunyuan_video_1.5_distill",
         model_family="video",
         checkpoint_formats=["directory", "diffusers", "state_dict"],
@@ -281,7 +280,7 @@ _FALLBACK_MODEL_ZOO: dict[str, dict[str, Any]] = {
     ),
     "worldplay_distill": _spec(
         "hunyuan_video",
-        ["t2v", "i2v", "game"],
+        ["i2v", "game"],
         "worldplay_distill",
         model_family="world_model",
         checkpoint_formats=["directory", "diffusers", "state_dict"],

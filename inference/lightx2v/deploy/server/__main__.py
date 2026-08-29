@@ -10,6 +10,7 @@ import tempfile
 import traceback
 import uuid
 from contextlib import asynccontextmanager
+from urllib.parse import urlencode, urlsplit
 
 import aiofiles
 import uvicorn
@@ -26,6 +27,13 @@ from lightx2v.deploy.common.audio_separator import AudioSeparator
 from lightx2v.deploy.common.face_detector import FaceDetector
 from lightx2v.deploy.common.pipeline import Pipeline
 from lightx2v.deploy.common.podcasts import VolcEnginePodcastClient
+from lightx2v.deploy.common.security import (
+    INTERNAL_SERVER_ERROR,
+    bearer_token_from_headers,
+    cors_allowed_origins,
+    oauth_state_cookie_name,
+    public_error_detail,
+)
 from lightx2v.deploy.common.sensetime_voice_clone import SenseTimeTTSClient
 from lightx2v.deploy.common.utils import check_params, data_name, fetch_resource, format_audio_data, format_image_data, load_inputs, media_to_audio
 from lightx2v.deploy.common.volcengine_asr import VolcEngineASRClient
@@ -113,7 +121,9 @@ app = FastAPI(lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    # Empty means same-origin only. Cross-origin deployments must explicitly
+    # enumerate exact origins in LIGHTX2V_CORS_ALLOWED_ORIGINS.
+    allow_origins=cors_allowed_origins(),
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -122,8 +132,14 @@ app.add_middleware(
 
 @app.exception_handler(HTTPException)
 async def http_exception_handler(request: Request, exc: HTTPException):
-    logger.error(f"HTTP Exception: {exc.status_code} - {exc.detail} for {request.url}")
-    return JSONResponse(status_code=exc.status_code, content={"message": exc.detail})
+    if exc.status_code >= 500:
+        logger.error("HTTP Exception: {} for {}", exc.status_code, request.url.path)
+    else:
+        logger.error("HTTP Exception: {} - {} for {}", exc.status_code, exc.detail, request.url.path)
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={"message": public_error_detail(exc.detail, exc.status_code)},
+    )
 
 
 static_dir = os.path.join(os.path.dirname(__file__), "static")
@@ -145,18 +161,13 @@ async def verify_user_access(credentials: HTTPAuthorizationCredentials = Depends
     return user
 
 
-async def verify_user_access_from_query(request: Request):
-    """从查询参数中验证用户访问权限"""
-    # 首先尝试从 Authorization 头部获取 token
-    auth_header = request.headers.get("Authorization")
-    token = None
-
-    if auth_header and auth_header.startswith("Bearer "):
-        token = auth_header[7:]  # 移除 "Bearer " 前缀
-    else:
-        # 如果没有 Authorization 头部，尝试从查询参数获取
-        token = request.query_params.get("token")
-
+async def verify_user_access_for_asset(request: Request):
+    """Authenticate asset requests without accepting credentials in the URL."""
+    if "token" in request.query_params:
+        raise HTTPException(status_code=400, detail="Query-string tokens are disabled; use an Authorization header")
+    token = bearer_token_from_headers(request.headers)
+    if not token:
+        raise HTTPException(status_code=401, detail="Missing bearer token")
     payload = auth_manager.verify_jwt_token(token)
     user_id = payload.get("user_id", None)
     if not user_id:
@@ -175,7 +186,8 @@ async def verify_worker_access(credentials: HTTPAuthorizationCredentials = Depen
 
 
 def error_response(e, code):
-    return JSONResponse({"message": f"error: {e}!"}, status_code=code)
+    detail = public_error_detail(f"error: {e}!", code)
+    return JSONResponse({"message": detail}, status_code=code)
 
 
 def format_user_response(user):
@@ -209,57 +221,124 @@ async def sitemap():
         return HTMLResponse(content=f.read())
 
 
+def oauth_login_response(provider, authorization_url, parameters):
+    """Issue a browser-bound, short-lived state and return the provider URL."""
+
+    state, redirect_uri = auth_manager.issue_oauth_state(provider)
+    query = urlencode({**parameters, "redirect_uri": redirect_uri, "state": state})
+    response = JSONResponse(
+        {"auth_url": f"{authorization_url}?{query}"},
+        headers={"Cache-Control": "no-store"},
+    )
+    response.set_cookie(
+        oauth_state_cookie_name(state),
+        state,
+        max_age=auth_manager.oauth_state_ttl_seconds,
+        httponly=True,
+        secure=urlsplit(redirect_uri).scheme.lower() == "https",
+        samesite="lax",
+        path="/",
+    )
+    return response
+
+
 @app.get("/auth/login/github")
-async def github_auth(request: Request):
-    client_id = auth_manager.github_client_id
-    redirect_uri = f"{request.base_url}"
-    auth_url = f"https://github.com/login/oauth/authorize?client_id={client_id}&redirect_uri={redirect_uri}"
-    return {"auth_url": auth_url}
+async def github_auth():
+    return oauth_login_response(
+        "github",
+        "https://github.com/login/oauth/authorize",
+        {"client_id": auth_manager.github_client_id},
+    )
+
+
+@app.get("/auth/login/google")
+async def google_auth():
+    logger.info("Google authentication URL created")
+    return oauth_login_response(
+        "google",
+        "https://accounts.google.com/o/oauth2/v2/auth",
+        {
+            "client_id": auth_manager.google_client_id,
+            "response_type": "code",
+            "scope": "openid email profile",
+            "access_type": "offline",
+        },
+    )
+
+
+async def oauth_callback(request: Request, expected_provider=None):
+    """Validate and consume OAuth state before exchanging an authorization code."""
+
+    state = request.query_params.get("state")
+    cookie_name = oauth_state_cookie_name(state) if state else None
+    cookie_state = request.cookies.get(cookie_name) if cookie_name else None
+    record = auth_manager.consume_oauth_state(state, cookie_state, expected_provider)
+    cookie_secure = (
+        urlsplit(record.redirect_uri).scheme.lower() == "https"
+        if record is not None
+        else request.url.scheme.lower() == "https"
+    )
+
+    try:
+        if record is None:
+            response = error_response("Invalid or expired OAuth state", 400)
+        elif request.query_params.get("error"):
+            response = error_response("OAuth authorization was denied", 400)
+        else:
+            code = request.query_params.get("code")
+            if not code:
+                response = error_response("Missing authorization code", 400)
+            else:
+                if record.provider == "github":
+                    user_info = await auth_manager.auth_github(code, record.redirect_uri)
+                elif record.provider == "google":
+                    user_info = await auth_manager.auth_google(code, record.redirect_uri)
+                else:
+                    raise HTTPException(status_code=400, detail="Unsupported OAuth provider")
+
+                user_id = await task_manager.create_user(user_info)
+                user_info["user_id"] = user_id
+                user_response = format_user_response(user_info)
+                access_token, refresh_token = auth_manager.create_tokens(user_response)
+                logger.info("{} authentication succeeded; access token issued", record.provider.title())
+                response = JSONResponse(
+                    {
+                        "access_token": access_token,
+                        "refresh_token": refresh_token,
+                        "user_info": user_response,
+                    },
+                    headers={"Cache-Control": "no-store"},
+                )
+    except HTTPException as exc:
+        response = error_response(exc.detail, exc.status_code)
+    except Exception as exc:
+        logger.error("OAuth callback failed: {}", type(exc).__name__)
+        response = error_response(INTERNAL_SERVER_ERROR, 500)
+
+    if cookie_name:
+        response.delete_cookie(
+            cookie_name,
+            httponly=True,
+            secure=cookie_secure,
+            samesite="lax",
+            path="/",
+        )
+    return response
+
+
+@app.get("/auth/callback/oauth")
+async def generic_oauth_callback(request: Request):
+    return await oauth_callback(request)
 
 
 @app.get("/auth/callback/github")
 async def github_callback(request: Request):
-    try:
-        code = request.query_params.get("code")
-        if not code:
-            return error_response("Missing authorization code", 400)
-        user_info = await auth_manager.auth_github(code)
-        user_id = await task_manager.create_user(user_info)
-        user_info["user_id"] = user_id
-        user_response = format_user_response(user_info)
-        access_token, refresh_token = auth_manager.create_tokens(user_response)
-        logger.info(f"GitHub callback: user_info: {user_response}, access token issued")
-        return {"access_token": access_token, "refresh_token": refresh_token, "user_info": user_response}
-    except Exception as e:
-        traceback.print_exc()
-        return error_response(str(e), 500)
-
-
-@app.get("/auth/login/google")
-async def google_auth(request: Request):
-    client_id = auth_manager.google_client_id
-    redirect_uri = auth_manager.google_redirect_uri
-    auth_url = f"https://accounts.google.com/o/oauth2/v2/auth?client_id={client_id}&redirect_uri={redirect_uri}&response_type=code&scope=openid%20email%20profile&access_type=offline"
-    logger.info(f"Google auth: auth_url: {auth_url}")
-    return {"auth_url": auth_url}
+    return await oauth_callback(request, expected_provider="github")
 
 
 @app.get("/auth/callback/google")
 async def google_callback(request: Request):
-    try:
-        code = request.query_params.get("code")
-        if not code:
-            return error_response("Missing authorization code", 400)
-        user_info = await auth_manager.auth_google(code)
-        user_id = await task_manager.create_user(user_info)
-        user_info["user_id"] = user_id
-        user_response = format_user_response(user_info)
-        access_token, refresh_token = auth_manager.create_tokens(user_response)
-        logger.info(f"Google callback: user_info: {user_response}, access token issued")
-        return {"access_token": access_token, "refresh_token": refresh_token, "user_info": user_response}
-    except Exception as e:
-        traceback.print_exc()
-        return error_response(str(e), 500)
+    return await oauth_callback(request, expected_provider="google")
 
 
 @app.get("/auth/login/sms")
@@ -292,7 +371,7 @@ async def sms_callback(request: Request):
         user_info["user_id"] = user_id
         user_response = format_user_response(user_info)
         access_token, refresh_token = auth_manager.create_tokens(user_response)
-        logger.info(f"SMS callback: user_info: {user_response}, access token issued")
+        logger.info("SMS authentication succeeded; access token issued")
         return {"access_token": access_token, "refresh_token": refresh_token, "user_info": user_response}
 
     except Exception as e:
@@ -374,7 +453,7 @@ async def api_v1_task_submit(request: Request, user=Depends(verify_user_access))
 
         # init task (we need task_id before preprocessing to save processed files)
         task_id = await task_manager.create_task(keys, workers, params, inputs, outputs, user["user_id"])
-        logger.info(f"Submit task: {task_id} {params}")
+        logger.info("Submitted task {} with parameter keys {}", task_id, sorted(params))
 
         # save multimodal inputs data
         for inp, data in inputs_data.items():
@@ -512,7 +591,7 @@ async def api_v1_task_input_url(request: Request, user=Depends(verify_user_acces
 
 
 @app.get("/assets/task/result")
-async def assets_task_result(request: Request, user=Depends(verify_user_access_from_query)):
+async def assets_task_result(request: Request, user=Depends(verify_user_access_for_asset)):
     try:
         name = request.query_params["name"]
         task_id = request.query_params["task_id"]
@@ -535,7 +614,7 @@ async def assets_task_result(request: Request, user=Depends(verify_user_access_f
 
 
 @app.get("/assets/task/input")
-async def assets_task_input(request: Request, user=Depends(verify_user_access_from_query)):
+async def assets_task_input(request: Request, user=Depends(verify_user_access_for_asset)):
     try:
         name = request.query_params["name"]
         task_id = request.query_params["task_id"]
@@ -632,7 +711,7 @@ async def api_v1_task_delete(request: Request, user=Depends(verify_user_access))
 async def api_v1_worker_fetch(request: Request, valid=Depends(verify_worker_access)):
     try:
         params = await request.json()
-        logger.info(f"Worker fetching: {params}")
+        logger.info("Worker fetch request received with keys {}", sorted(params))
         keys = params.pop("worker_keys")
         identity = params.pop("worker_identity")
         max_batch = params.get("max_batch", 1)
@@ -643,7 +722,7 @@ async def api_v1_worker_fetch(request: Request, valid=Depends(verify_worker_acce
             while True:
                 msg = await request.receive()
                 if msg["type"] == "http.disconnect":
-                    logger.warning(f"Worker {identity} {queue} disconnected, req: {request.client}, {msg}")
+                    logger.warning("Worker {} disconnected from queue {}", identity, queue)
                     fetch_task.cancel()
                     await server_monitor.worker_update(queue, identity, WorkerStatus.DISCONNECT)
                     return
@@ -670,7 +749,7 @@ async def api_v1_worker_fetch(request: Request, valid=Depends(verify_worker_acce
 
         if len(valid_subtasks) > 0:
             await server_monitor.worker_update(worker["queue"], identity, WorkerStatus.FETCHED)
-            logger.info(f"Worker {identity} {keys} {request.client} fetched {valids}")
+            logger.info("Worker {} fetched {} subtasks for {}", identity, len(valids), keys)
         else:
             await server_monitor.worker_update(worker["queue"], identity, WorkerStatus.DISCONNECT)
         return {"subtasks": valid_subtasks}
@@ -684,7 +763,7 @@ async def api_v1_worker_fetch(request: Request, valid=Depends(verify_worker_acce
 async def api_v1_worker_report(request: Request, valid=Depends(verify_worker_access)):
     try:
         params = await request.json()
-        logger.info(f"{params}")
+        logger.info("Worker report received with keys {}", sorted(params))
         task_id = params.pop("task_id")
         worker_name = params.pop("worker_name")
         status = TaskStatus[params.pop("status")]
@@ -728,7 +807,7 @@ async def api_v1_worker_report(request: Request, valid=Depends(verify_worker_acc
 async def api_v1_worker_ping_subtask(request: Request, valid=Depends(verify_worker_access)):
     try:
         params = await request.json()
-        logger.info(f"{params}")
+        logger.info("Worker heartbeat received with keys {}", sorted(params))
         task_id = params.pop("task_id")
         worker_name = params.pop("worker_name")
         identity = params.pop("worker_identity")
@@ -1132,8 +1211,8 @@ async def api_v1_tts_generate(request: TTSRequest):
             return JSONResponse({"error": "TTS generation failed"}, status_code=500)
 
     except Exception as e:
-        logger.error(f"TTS generation error: {e}")
-        return JSONResponse({"error": f"TTS generation failed: {str(e)}"}, status_code=500)
+        logger.error("TTS generation error: {}", type(e).__name__)
+        return JSONResponse({"error": INTERNAL_SERVER_ERROR}, status_code=500)
 
 
 @app.post("/api/v1/voice/clone")
@@ -1164,17 +1243,17 @@ async def api_v1_voice_clone(request: Request, user=Depends(verify_user_access))
 
                 if use_user_text:
                     asr_text = user_text
-                    logger.info(f"Using user input text (skipping ASR): {asr_text}")
+                    logger.info("Using supplied voice-clone transcript (length: {})", len(asr_text))
                 else:
                     if volcengine_asr_client is None:
                         return JSONResponse({"error": "ASR client not initialized"}, status_code=500)
                     asr_success, asr_result = await volcengine_asr_client.recognize_request(file_path=audio_path)
                     if not asr_success:
-                        return JSONResponse({"error": f"ASR failed: {asr_result}"}, status_code=500)
+                        return JSONResponse({"error": INTERNAL_SERVER_ERROR}, status_code=500)
                     asr_text = asr_result.get("result", {}).get("text", "")
                     if not asr_text:
                         return JSONResponse({"error": "Failed to extract text from audio"}, status_code=500)
-                    logger.info(f"ASR recognized text: {asr_text}")
+                    logger.info("ASR produced a voice-clone transcript (length: {})", len(asr_text))
 
                 clone_success, clone_result = await sensetime_voice_clone_client.upload_audio_clone(
                     audio_path=audio_path,
@@ -1184,10 +1263,10 @@ async def api_v1_voice_clone(request: Request, user=Depends(verify_user_access))
                     err_msg = str(clone_result).lower()
                     cur_duration -= step_duration
                     if "text length" in err_msg and "too long" in err_msg and cur_duration >= min_duration:
-                        logger.warning(f"Voice clone failed: {err_msg}, reducing duration to {cur_duration}s")
+                        logger.warning("Voice clone input was too long; reducing duration to {}s", cur_duration)
                         continue
-                    return JSONResponse({"error": f"Voice clone failed: {clone_result}"}, status_code=500)
-                logger.info(f"Voice clone successful with duration: {cur_duration}s, speaker_id: {clone_result}")
+                    return JSONResponse({"error": INTERNAL_SERVER_ERROR}, status_code=500)
+                logger.info("Voice clone succeeded with duration {}s", cur_duration)
                 return JSONResponse({"speaker_id": clone_result, "text": asr_text, "message": "Voice clone successful. Please save the voice to add it to your collection."}, status_code=200)
     except Exception:
         traceback.print_exc()
@@ -1283,24 +1362,44 @@ async def api_v1_voice_clone_list(user=Depends(verify_user_access)):
 async def api_v1_podcast_generate_ws(websocket: WebSocket):
     await websocket.accept()
 
-    def ws_get_user_id():
-        token = websocket.query_params.get("token")
-        if not token:
-            token = websocket.headers.get("authorization") or websocket.headers.get("Authorization")
-            if token and token.startswith("Bearer "):
-                token = token[7:]
-        payload = auth_manager.verify_jwt_token(token)
-        user_id = payload["user_id"]
-        return user_id
-
     async def safe_send_json(payload):
         try:
             await websocket.send_json(payload)
         except (WebSocketDisconnect, RuntimeError) as e:
-            logger.warning(f"WebSocket send skipped: {e}")
+            logger.warning("WebSocket send skipped: {}", type(e).__name__)
+
+    async def ws_get_user_id():
+        if "token" in websocket.query_params:
+            raise HTTPException(status_code=400, detail="Query-string WebSocket tokens are disabled")
+
+        token = bearer_token_from_headers(websocket.headers)
+        if not token:
+            auth_data = await asyncio.wait_for(websocket.receive_json(), timeout=10)
+            if not isinstance(auth_data, dict) or auth_data.get("type") != "authenticate":
+                raise HTTPException(status_code=401, detail="WebSocket authentication is required")
+            token = auth_data.get("access_token")
+        if not isinstance(token, str) or not token:
+            raise HTTPException(status_code=401, detail="Missing WebSocket bearer token")
+
+        payload = auth_manager.verify_jwt_token(token)
+        user_id = payload.get("user_id")
+        if not user_id:
+            raise HTTPException(status_code=401, detail="Invalid user")
+        user = await task_manager.query_user(user_id)
+        if user is None or user.get("user_id") != user_id:
+            raise HTTPException(status_code=401, detail="Invalid user")
+        return user_id
 
     try:
-        user_id = ws_get_user_id()
+        try:
+            user_id = await ws_get_user_id()
+        except (HTTPException, ValueError, asyncio.TimeoutError):
+            logger.warning("WebSocket authentication failed")
+            await safe_send_json({"type": "auth_error", "error": "WebSocket authentication failed"})
+            await websocket.close(code=1008)
+            return
+
+        await safe_send_json({"type": "authenticated"})
         data = await websocket.receive_text()
         request_data = json.loads(data)
 
@@ -1328,7 +1427,12 @@ async def api_v1_podcast_generate_ws(websocket: WebSocket):
             "use_tail_music": False,
             "skip_round_audio_save": False,
         }
-        logger.info(f"WebSocket generating podcast with params: {params}")
+        logger.info(
+            "WebSocket podcast generation started (session: {}, input kind: {}, input length: {})",
+            session_id,
+            "url" if is_url else "text",
+            len(input_text),
+        )
 
         # 使用回调函数实时推送音频
         async def on_round_complete(round_info):
@@ -1351,7 +1455,7 @@ async def api_v1_podcast_generate_ws(websocket: WebSocket):
                 except asyncio.TimeoutError:
                     continue
                 except Exception as e:
-                    logger.warning(f"Stop listener ended: {e}")
+                    logger.warning("Stop listener ended: {}", type(e).__name__)
                     return
 
         podcast_task = asyncio.create_task(volcengine_podcast_client.podcast_request(**params))
@@ -1393,13 +1497,13 @@ async def api_v1_podcast_generate_ws(websocket: WebSocket):
     except WebSocketDisconnect:
         logger.info("WebSocket disconnected")
 
-    except Exception:
-        logger.error(f"Error in websocket: {traceback.format_exc()}")
+    except Exception as e:
+        logger.error("Podcast WebSocket failed: {}", type(e).__name__)
         await safe_send_json({"error": "websocket internal error, please try again later!"})
 
 
 @app.get("/api/v1/podcast/audio")
-async def api_v1_podcast_audio(request: Request, user=Depends(verify_user_access_from_query)):
+async def api_v1_podcast_audio(request: Request, user=Depends(verify_user_access_for_asset)):
     try:
         user_id = user["user_id"]
         session_id = request.query_params.get("session_id")
@@ -1429,7 +1533,7 @@ async def api_v1_podcast_audio(request: Request, user=Depends(verify_user_access
             func = data_manager.load_podcast_temp_session_file
             func_args = (session_id, filename)
 
-        logger.debug(f"Serving audio file from {func.__name__} with args: {func_args}, start_byte: {start_byte}, end_byte: {end_byte}")
+        logger.debug("Serving audio via {} (start byte: {}, end byte: {})", func.__name__, start_byte, end_byte)
         file_bytes = await func(*func_args)
         file_size = len(file_bytes)
         file_bytes = file_bytes[start_byte:end_byte]
@@ -1445,9 +1549,9 @@ async def api_v1_podcast_audio(request: Request, user=Depends(verify_user_access
         return Response(content=file_bytes, media_type=media_type, status_code=status_code, headers=headers)
 
     except Exception as e:
-        logger.error(f"Error serving audio: {e}")
+        logger.error("Error serving audio: {}", type(e).__name__)
         traceback.print_exc()
-        return JSONResponse({"error": str(e)}, status_code=500)
+        return JSONResponse({"error": INTERNAL_SERVER_ERROR}, status_code=500)
 
 
 @app.get("/api/v1/podcast/history")
@@ -1477,7 +1581,7 @@ async def api_v1_podcast_history(request: Request, user=Depends(verify_user_acce
         return {"sessions": sessions, "pagination": page_info}
 
     except Exception as e:
-        logger.error(f"Error getting podcast history: {e}")
+        logger.error("Error getting podcast history: {}", type(e).__name__)
         traceback.print_exc()
         return {"sessions": []}
 
@@ -1497,9 +1601,9 @@ async def api_v1_podcast_session_audio_url(session_id: str, user=Depends(verify_
         return {"audio_url": audio_url}
 
     except Exception as e:
-        logger.error(f"Error getting podcast session audio URL: {e}")
+        logger.error("Error getting podcast session audio URL: {}", type(e).__name__)
         traceback.print_exc()
-        return JSONResponse({"error": str(e)}, status_code=500)
+        return JSONResponse({"error": INTERNAL_SERVER_ERROR}, status_code=500)
 
 
 class FaceDetectRequest(BaseModel):
@@ -1538,20 +1642,20 @@ async def api_v1_face_detect(request: FaceDetectRequest, user=Depends(verify_use
             if request.image.startswith(("http://", "https://")):
                 timeout = int(os.getenv("REQUEST_TIMEOUT", "10"))
                 image_bytes = await fetch_resource(request.image, timeout=timeout)
-                logger.debug(f"Fetched image from URL for face detection: {request.image[:100]}... (size: {len(image_bytes)} bytes)")
+                logger.debug("Fetched image for face detection (size: {} bytes)", len(image_bytes))
             else:
                 encoded = request.image
                 # Data URL format: "data:image/png;base64,..."
                 if encoded.startswith("data:image"):
                     _, encoded = encoded.split(",", 1)
                 image_bytes = base64.b64decode(encoded)
-                logger.debug(f"Decoded base64 image: {request.image[:100]}... (size: {len(image_bytes)} bytes)")
+                logger.debug("Decoded base64 image (size: {} bytes)", len(image_bytes))
 
             # Validate image format before passing to face detector
             image_bytes = await asyncio.to_thread(format_image_data, image_bytes)
 
         except Exception as e:
-            logger.error(f"Failed to decode base64 image: {e}, image length: {len(request.image) if request.image else 0}")
+            logger.error("Failed to decode image (input length: {}, error: {})", len(request.image) if request.image else 0, type(e).__name__)
             return error_response(f"Invalid image format: {str(e)}", 400)
 
         # Detect faces only (no cropping)
@@ -1591,7 +1695,7 @@ async def api_v1_audio_separate(request: AudioSeparateRequest, user=Depends(veri
             logger.debug(f"Successfully decoded base64 audio, size: {len(audio_bytes)} bytes")
 
         except Exception as e:
-            logger.error(f"Failed to decode base64 audio {request.audio[:100]}..., error: {str(e)}")
+            logger.error("Failed to decode base64 audio: {}", type(e).__name__)
             return error_response(f"Invalid base64 audio data", 400)
 
         # Separate speakers
@@ -1641,7 +1745,7 @@ async def api_v1_audio_extract(request: AudioExtractRequest, user=Depends(verify
             logger.debug(f"Successfully decoded base64 video, size: {len(video_bytes)} bytes")
 
         except Exception as e:
-            logger.error(f"Failed to decode base64 video {request.video[:100]}..., error: {str(e)}")
+            logger.error("Failed to decode base64 video: {}", type(e).__name__)
             return error_response(f"Invalid base64 video data", 400)
 
         # Extract audio from video
@@ -1720,7 +1824,13 @@ if __name__ == "__main__":
     parser.add_argument("--face_detector_method", type=str, default="yolo")
     parser.add_argument("--audio_separator_model_path", type=str, default="")
     args = parser.parse_args()
-    logger.info(f"args: {args}")
+    logger.info(
+        "Starting deployment server on {}:{} (face detector: {}, Redis monitor: {})",
+        args.ip,
+        args.port,
+        args.face_detector_method,
+        bool(args.redis_url),
+    )
 
     model_pipelines = Pipeline(args.pipeline_json)
     volcengine_tts_client = VolcEngineTTSClient(args.volcengine_tts_list_json)
@@ -1731,7 +1841,7 @@ if __name__ == "__main__":
     try:
         audio_separator = AudioSeparator(model_path=args.audio_separator_model_path)
     except Exception as e:
-        logger.warning(f"Failed to initialize audio_separator, audio separation feature will be disabled: {e}")
+        logger.warning("Failed to initialize audio separator; feature disabled: {}", type(e).__name__)
         audio_separator = None
     auth_manager = AuthManager()
     if args.task_url.startswith("/"):
@@ -1757,4 +1867,7 @@ if __name__ == "__main__":
     else:
         server_monitor = ServerMonitor(model_pipelines, task_manager, queue_manager)
 
-    uvicorn.run(app, host=args.ip, port=args.port, reload=False, workers=1)
+    # Application logs deliberately record paths only. Disable Uvicorn's raw
+    # request-target logging so credentials accidentally supplied in a query
+    # string cannot be persisted by the access logger.
+    uvicorn.run(app, host=args.ip, port=args.port, reload=False, workers=1, access_log=False)

@@ -1,7 +1,8 @@
 #!/bin/bash
 
-lightx2v_path=/data/wq/proj/sd/code/LightX2V
-model_path=/root/SekoTalk-Distill
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+lightx2v_path="${LIGHTX2V_PATH:-$(cd "${SCRIPT_DIR}/../.." && pwd)}"
+model_path="${MODEL_PATH:?Set MODEL_PATH to the SekoTalk checkpoint}"
 
 export ASCEND_RT_VISIBLE_DEVICES=0
 export PLATFORM=ascend_npu

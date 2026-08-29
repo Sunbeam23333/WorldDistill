@@ -22,10 +22,5 @@
     "fps": 24,
     "use_image_encoder": false,
     "use_31_block": false,
-    "lora_configs": [
-        {
-            "path": "/mnt/aigc/rtxiang/pretrain/qianhai_weights/lora_model.safetensors",
-            "strength": 0.125
-        }
-    ]
+    "lora_configs": null
 }

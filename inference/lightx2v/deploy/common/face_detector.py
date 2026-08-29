@@ -9,6 +9,8 @@ from PIL import Image, ImageDraw
 from loguru import logger
 from ultralytics import YOLO
 
+from lightx2v.deploy.common.security import safe_url_host
+
 # Try to import transformers for Grounding DINO
 try:
     from transformers import AutoModelForZeroShotObjectDetection, AutoProcessor
@@ -98,11 +100,11 @@ class FaceDetector:
                     # Try to load YOLO World small model first (lighter and faster)
                     self.model = YOLO("yolov8s-world.pt")
                 except Exception as e:
-                    logger.warning(f"Failed to load yolov8s-world.pt, trying yolov8m-world.pt: {e}")
+                    logger.warning("Failed to load yolov8s-world.pt ({}); trying yolov8m-world.pt", type(e).__name__)
                     try:
                         self.model = YOLO("yolov8m-world.pt")
                     except Exception as e2:
-                        logger.warning(f"Failed to load yolov8m-world.pt, trying yolov8l-world.pt: {e2}")
+                        logger.warning("Failed to load yolov8m-world.pt ({}); trying yolov8l-world.pt", type(e2).__name__)
                         self.model = YOLO("yolov8l-world.pt")
                 # Set custom classes for YOLO World
                 # YOLO World can detect any object described in natural language
@@ -127,13 +129,17 @@ class FaceDetector:
                 if https_proxy:
                     os.environ["HTTP_PROXY"] = https_proxy
                     os.environ["http_proxy"] = https_proxy
-                    logger.info(f"Using proxy from HTTPS_PROXY: {https_proxy}")
+                    logger.info("Using HTTPS proxy for model downloads (host: {})", safe_url_host(https_proxy))
 
             # Log proxy settings
             http_proxy = os.environ.get("HTTP_PROXY") or os.environ.get("http_proxy")
             https_proxy = os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy")
             if http_proxy or https_proxy:
-                logger.info(f"Using proxy - HTTP: {http_proxy}, HTTPS: {https_proxy}")
+                logger.info(
+                    "Model download proxies configured (HTTP host: {}, HTTPS host: {})",
+                    safe_url_host(http_proxy),
+                    safe_url_host(https_proxy),
+                )
 
             # Set custom classes (default to "face")
             if custom_classes is None:
@@ -164,7 +170,11 @@ class FaceDetector:
                 error_msg = str(e)
                 if "connection" in error_msg.lower() or "proxy" in error_msg.lower() or "network" in error_msg.lower():
                     logger.error(f"Failed to download model. Please check your network connection and proxy settings.")
-                    logger.error(f"Current proxy settings - HTTP_PROXY: {http_proxy}, HTTPS_PROXY: {https_proxy}")
+                    logger.error(
+                        "Current proxy hosts - HTTP: {}, HTTPS: {}",
+                        safe_url_host(http_proxy),
+                        safe_url_host(https_proxy),
+                    )
                     logger.error("You can set proxy with: export http_proxy=... && export https_proxy=...")
                 raise
             self.face_cascade = None

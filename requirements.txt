@@ -3,9 +3,6 @@ torch>=2.5.1
 torchvision>=0.20.1
 torchaudio>=2.5.1
 
-# Attention
-flash-attn>=2.5.0
-
 # Diffusion / Transformers
 diffusers>=0.33.0,<1
 transformers==4.57.1
@@ -15,13 +12,14 @@ safetensors>=0.4.5,<1
 peft>=0.17.0,<1
 huggingface_hub>=0.25.0,<1
 PyYAML>=6.0,<7
-packaging>=24.2,<26
+packaging>=24.2,<27
 
 # Video / Image
 opencv-python>=4.9.0.80
 imageio[ffmpeg]
 imageio-ffmpeg
 av
+decord
 Pillow
 
 # Utilities
@@ -32,15 +30,15 @@ tqdm
 numpy
 easydict
 ftfy
-huggingface_hub
 gguf
 prometheus_client
-sgl-kernel
+qtorch
+pydantic>=2,<3
+requests>=2.31,<3
 
 # Experiment Tracking
 tensorboard>=2.16.2
 wandb>=0.19.0
 
-# Training / Distributed
-deepspeed>=0.14.0
-# colossalai>=0.4.0  # Optional: Open-Sora style booster
+# Architecture-specific CUDA kernels and DeepSpeed are intentionally optional.
+# See requirements-kernels.txt and requirements-distributed.txt.

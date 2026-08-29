@@ -30,6 +30,7 @@ variants = {
     'eager': {
         'enable_runtime': False,
         'runtime_name': 'noop',
+        'runtime_cache_backend': 'none',
         'runtime_teacher_cache_mode': 'disabled',
         'runtime_enable_dpp': False,
         'enable_fused_supervision_kernel': False,
@@ -38,6 +39,7 @@ variants = {
     'cache_only': {
         'enable_runtime': True,
         'runtime_name': 'teacher_student',
+        'runtime_cache_backend': 'memory',
         'runtime_teacher_cache_mode': 'teacher_output',
         'runtime_enable_dpp': False,
         'enable_fused_supervision_kernel': False,
@@ -46,6 +48,7 @@ variants = {
     'cache_async': {
         'enable_runtime': True,
         'runtime_name': 'teacher_student',
+        'runtime_cache_backend': 'memory',
         'runtime_teacher_cache_mode': 'teacher_output',
         'runtime_enable_dpp': True,
         'enable_fused_supervision_kernel': False,
@@ -54,6 +57,7 @@ variants = {
     'cache_async_fused': {
         'enable_runtime': True,
         'runtime_name': 'teacher_student',
+        'runtime_cache_backend': 'memory',
         'runtime_teacher_cache_mode': 'teacher_output',
         'runtime_enable_dpp': True,
         'enable_fused_supervision_kernel': True,
@@ -62,6 +66,7 @@ variants = {
     'cache_async_fused_compile': {
         'enable_runtime': True,
         'runtime_name': 'teacher_student',
+        'runtime_cache_backend': 'memory',
         'runtime_teacher_cache_mode': 'teacher_output',
         'runtime_enable_dpp': True,
         'enable_fused_supervision_kernel': True,

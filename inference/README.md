@@ -16,6 +16,16 @@
 
 --------------------------------------------------------------------------------
 
+> **Vendored upstream documentation.** Performance and quality claims below
+> are retained from the upstream LightX2V project. They have not been reproduced
+> by the WorldDistill maintainers and are not evidence for WorldDistill's CUDA
+> compatibility or benchmark matrix.
+>
+> **License boundary.** The code shipped in this vendored tree is Apache-2.0.
+> WorldDistill does not bundle Tencent HY-WorldPlay source or weights; an optional
+> user-supplied provider remains subject to its own terms. See the repository
+> [third-party notices](../THIRD_PARTY_NOTICES).
+
 **LightX2V** is an advanced lightweight image/video generation inference framework engineered to deliver efficient, high-performance image/video synthesis solutions. This unified platform integrates multiple state-of-the-art image/video generation techniques, supporting diverse generation tasks including text-to-video (T2V), image-to-video (I2V), text-to-image (T2I), image-editing (I2I). **X2V represents the transformation of different input modalities (X, such as text or images) into vision output (Vision)**.
 
 > 🌐 **Try it online now!** Experience LightX2V without installation: **[LightX2V Online Service](https://x2v.light-ai.top/login)** - Free, lightweight, and fast AI digital human video generation platform.

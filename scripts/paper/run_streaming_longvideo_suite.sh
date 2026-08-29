@@ -8,6 +8,7 @@ TRAIN_JSON="${TRAIN_JSON:-${PROJECT_ROOT}/configs/data_templates/streaming_long_
 VIDEO_DIR="${VIDEO_DIR:-${PROJECT_ROOT}/data/streaming_videos}"
 TEACHER_MODEL="${TEACHER_MODEL:-${MODEL_ROOT:-${PROJECT_ROOT}/models}/Wan2.1-SelfForcing}"
 NUM_GPUS="${NUM_GPUS:-4}"
+INFER_NUM_GPUS="${INFER_NUM_GPUS:-1}"
 MAX_TRAIN_STEPS="${MAX_TRAIN_STEPS:-30000}"
 OUTPUT_ROOT="${OUTPUT_ROOT:-${RESULT_ROOT:-${PROJECT_ROOT}/results}/paper/streaming_longvideo}"
 LONG_PROMPT="${LONG_PROMPT:-A continuous handheld journey through a rainy neon city, weaving between alleys, storefront reflections, pedestrians, and passing vehicles over a long uninterrupted take.}"
@@ -45,7 +46,7 @@ run_infer_phase() {
         --model_path "${MODEL_ROOT:-${PROJECT_ROOT}/models}" \
         --config_json "${PROJECT_ROOT}/inference/configs/self_forcing/wan_t2v_sf.json" \
         --prompt "${LONG_PROMPT}" \
-        --gpus "${NUM_GPUS}" \
+        --gpus "${INFER_NUM_GPUS}" \
         --save_path "${OUTPUT_ROOT}/samples/streaming.mp4"
 }
 

@@ -8,38 +8,58 @@ from fastapi import HTTPException
 from loguru import logger
 
 from lightx2v.deploy.common.aliyun import AlibabaCloudClient
+from lightx2v.deploy.common.security import (
+    OAuthStateStore,
+    consume_browser_bound_oauth_state,
+    optional_env_group,
+    require_secret_env,
+)
 
 
 class AuthManager:
     def __init__(self):
         # Worker access token
-        self.worker_secret_key = os.getenv("WORKER_SECRET_KEY", "worker-secret-key-change-in-production")
+        self.worker_secret_key = require_secret_env("WORKER_SECRET_KEY")
 
         # GitHub OAuth
-        self.github_client_id = os.getenv("GITHUB_CLIENT_ID", "")
-        self.github_client_secret = os.getenv("GITHUB_CLIENT_SECRET", "")
+        github_oauth = optional_env_group(
+            "GitHub OAuth",
+            ("GITHUB_CLIENT_ID", "GITHUB_CLIENT_SECRET", "GITHUB_REDIRECT_URI"),
+        )
+        self.github_oauth_enabled = github_oauth is not None
+        self.github_client_id = github_oauth["GITHUB_CLIENT_ID"] if github_oauth else ""
+        self.github_client_secret = github_oauth["GITHUB_CLIENT_SECRET"] if github_oauth else ""
+        self.github_redirect_uri = github_oauth["GITHUB_REDIRECT_URI"] if github_oauth else ""
 
         # Google OAuth
-        self.google_client_id = os.getenv("GOOGLE_CLIENT_ID", "")
-        self.google_client_secret = os.getenv("GOOGLE_CLIENT_SECRET", "")
-        self.google_redirect_uri = os.getenv("GOOGLE_REDIRECT_URI", "")
+        google_oauth = optional_env_group(
+            "Google OAuth",
+            ("GOOGLE_CLIENT_ID", "GOOGLE_CLIENT_SECRET", "GOOGLE_REDIRECT_URI"),
+        )
+        self.google_oauth_enabled = google_oauth is not None
+        self.google_client_id = google_oauth["GOOGLE_CLIENT_ID"] if google_oauth else ""
+        self.google_client_secret = google_oauth["GOOGLE_CLIENT_SECRET"] if google_oauth else ""
+        self.google_redirect_uri = google_oauth["GOOGLE_REDIRECT_URI"] if google_oauth else ""
 
         self.jwt_algorithm = os.getenv("JWT_ALGORITHM", "HS256")
-        self.jwt_secret_key = os.getenv("JWT_SECRET_KEY", "your-secret-key-change-in-production")
+        self.jwt_secret_key = require_secret_env("JWT_SECRET_KEY")
         self.jwt_expiration_hours = int(os.getenv("JWT_EXPIRATION_HOURS", "168"))
         self.refresh_token_expiration_days = int(os.getenv("REFRESH_TOKEN_EXPIRATION_DAYS", "30"))
-        self.refresh_jwt_secret_key = os.getenv("REFRESH_JWT_SECRET_KEY", self.jwt_secret_key)
+        refresh_secret = os.getenv("REFRESH_JWT_SECRET_KEY")
+        self.refresh_jwt_secret_key = (
+            require_secret_env("REFRESH_JWT_SECRET_KEY") if refresh_secret is not None else self.jwt_secret_key
+        )
+        self.oauth_state_ttl_seconds = int(os.getenv("LIGHTX2V_OAUTH_STATE_TTL_SECONDS", "600"))
+        self.oauth_states = OAuthStateStore(ttl_seconds=self.oauth_state_ttl_seconds)
 
         # Aliyun SMS
         self.aliyun_client = AlibabaCloudClient()
 
-        logger.info(f"AuthManager: GITHUB_CLIENT_ID: {self.github_client_id}")
-        logger.info(f"AuthManager: GITHUB_CLIENT_SECRET: {self.github_client_secret}")
-        logger.info(f"AuthManager: GOOGLE_CLIENT_ID: {self.google_client_id}")
-        logger.info(f"AuthManager: GOOGLE_CLIENT_SECRET: {self.google_client_secret}")
-        logger.info(f"AuthManager: GOOGLE_REDIRECT_URI: {self.google_redirect_uri}")
-        logger.info(f"AuthManager: JWT_SECRET_KEY: {self.jwt_secret_key}")
-        logger.info(f"AuthManager: WORKER_SECRET_KEY: {self.worker_secret_key}")
+        logger.info(
+            "AuthManager initialized (GitHub OAuth enabled: {}, Google OAuth enabled: {})",
+            self.github_oauth_enabled,
+            self.google_oauth_enabled,
+        )
 
     def _create_token(self, data, expires_in_seconds, token_type, secret_key):
         now = int(time.time())
@@ -68,16 +88,40 @@ class AuthManager:
         # Backwards compatibility for callers that still expect this name
         return self.create_access_token(data)
 
-    async def auth_github(self, code):
+    def issue_oauth_state(self, provider):
+        if provider == "github" and self.github_oauth_enabled:
+            redirect_uri = self.github_redirect_uri
+        elif provider == "google" and self.google_oauth_enabled:
+            redirect_uri = self.google_redirect_uri
+        else:
+            raise HTTPException(status_code=503, detail=f"{provider.title()} OAuth is not configured")
+        state = self.oauth_states.issue(provider, redirect_uri)
+        return state, redirect_uri
+
+    def consume_oauth_state(self, state, cookie_state, expected_provider=None):
+        return consume_browser_bound_oauth_state(
+            self.oauth_states,
+            state,
+            cookie_state,
+            expected_provider=expected_provider,
+        )
+
+    async def auth_github(self, code, redirect_uri):
+        if not self.github_oauth_enabled:
+            raise HTTPException(status_code=503, detail="GitHub OAuth is not configured")
         try:
-            logger.info(f"GitHub OAuth code: {code}")
             token_url = "https://github.com/login/oauth/access_token"
-            token_data = {"client_id": self.github_client_id, "client_secret": self.github_client_secret, "code": code}
+            token_data = {
+                "client_id": self.github_client_id,
+                "client_secret": self.github_client_secret,
+                "code": code,
+                "redirect_uri": redirect_uri,
+            }
             headers = {"Accept": "application/json"}
 
             proxy = os.getenv("auth_https_proxy", None)
             if proxy:
-                logger.info(f"auth_github use proxy: {proxy}")
+                logger.info("GitHub authentication is using the configured HTTPS proxy")
             async with aiohttp.ClientSession() as session:
                 async with session.post(token_url, data=token_data, headers=headers, proxy=proxy) as response:
                     response.raise_for_status()
@@ -106,30 +150,33 @@ class AuthManager:
                 "avatar_url": user_info.get("avatar_url", ""),
             }
 
-        except aiohttp.ClientError as e:
-            logger.error(f"GitHub API request failed: {e}")
+        except HTTPException:
+            raise
+        except aiohttp.ClientError:
+            logger.error("GitHub API request failed")
             raise HTTPException(status_code=500, detail="Failed to authenticate with GitHub")
 
-        except Exception as e:
-            logger.error(f"Authentication error: {e}")
+        except Exception:
+            logger.error("GitHub authentication failed")
             raise HTTPException(status_code=500, detail="Authentication failed")
 
-    async def auth_google(self, code):
+    async def auth_google(self, code, redirect_uri):
+        if not self.google_oauth_enabled:
+            raise HTTPException(status_code=503, detail="Google OAuth is not configured")
         try:
-            logger.info(f"Google OAuth code: {code}")
             token_url = "https://oauth2.googleapis.com/token"
             token_data = {
                 "client_id": self.google_client_id,
                 "client_secret": self.google_client_secret,
                 "code": code,
-                "redirect_uri": self.google_redirect_uri,
+                "redirect_uri": redirect_uri,
                 "grant_type": "authorization_code",
             }
             headers = {"Content-Type": "application/x-www-form-urlencoded"}
 
             proxy = os.getenv("auth_https_proxy", None)
             if proxy:
-                logger.info(f"auth_google use proxy: {proxy}")
+                logger.info("Google authentication is using the configured HTTPS proxy")
             async with aiohttp.ClientSession() as session:
                 async with session.post(token_url, data=token_data, headers=headers, proxy=proxy) as response:
                     response.raise_for_status()
@@ -158,12 +205,14 @@ class AuthManager:
                 "avatar_url": user_info.get("picture", ""),
             }
 
-        except aiohttp.ClientError as e:
-            logger.error(f"Google API request failed: {e}")
+        except HTTPException:
+            raise
+        except aiohttp.ClientError:
+            logger.error("Google API request failed")
             raise HTTPException(status_code=500, detail="Failed to authenticate with Google")
 
-        except Exception as e:
-            logger.error(f"Google authentication error: {e}")
+        except Exception:
+            logger.error("Google authentication failed")
             raise HTTPException(status_code=500, detail="Google authentication failed")
 
     async def send_sms(self, phone_number):
@@ -192,7 +241,7 @@ class AuthManager:
         except jwt.ExpiredSignatureError:
             raise HTTPException(status_code=401, detail="Token has expired")
         except Exception as e:
-            logger.error(f"verify_jwt_token error: {e}")
+            logger.warning("JWT verification failed: {}", type(e).__name__)
             raise HTTPException(status_code=401, detail="Could not validate credentials")
 
     def verify_jwt_token(self, token):

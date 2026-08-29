@@ -21,16 +21,23 @@ class AlibabaCloudClient:
         self.runtime = util_models.RuntimeOptions()
 
     def check_ok(self, res, prefix):
-        logger.info(f"{prefix}: {res}")
-        if not isinstance(res, dict) or "statusCode" not in res or res["statusCode"] != 200:
-            logger.warning(f"{prefix}: error response: {res}")
+        if not isinstance(res, dict):
+            logger.warning("{} returned an invalid response type", prefix)
             return False
-        if "body" not in res or "Code" not in res["body"] or "Success" not in res["body"]:
-            logger.warning(f"{prefix}: error body: {res}")
+
+        status_code = res.get("statusCode")
+        body = res.get("body")
+        if status_code != 200:
+            logger.warning("{} failed with HTTP status {}", prefix, status_code)
             return False
-        if res["body"]["Code"] != "OK" or res["body"]["Success"] is not True:
-            logger.warning(f"{prefix}: sms error: {res}")
+        if not isinstance(body, dict) or "Code" not in body or "Success" not in body:
+            logger.warning("{} returned a malformed response body", prefix)
             return False
+        if body["Code"] != "OK" or body["Success"] is not True:
+            logger.warning("{} failed with provider code {}", prefix, body.get("Code"))
+            return False
+
+        logger.info("{} succeeded", prefix)
         return True
 
     async def send_sms(self, phone_number):
@@ -44,11 +51,11 @@ class AlibabaCloudClient:
             )
             res = await self.client.send_sms_verify_code_with_options_async(req, self.runtime)
             ok = self.check_ok(res.to_map(), "AlibabaCloudClient send sms")
-            logger.info(f"AlibabaCloudClient send sms for {phone_number}: {ok}")
+            logger.info("AlibabaCloudClient send SMS completed: {}", ok)
             return ok
 
         except Exception as e:
-            logger.warning(f"AlibabaCloudClient send sms for {phone_number}: {e}")
+            logger.warning("AlibabaCloudClient send SMS failed: {}", type(e).__name__)
             return False
 
     async def check_sms(self, phone_number, verify_code):
@@ -59,11 +66,11 @@ class AlibabaCloudClient:
             )
             res = await self.client.check_sms_verify_code_with_options_async(req, self.runtime)
             ok = self.check_ok(res.to_map(), "AlibabaCloudClient check sms")
-            logger.info(f"AlibabaCloudClient check sms for {phone_number} with {verify_code}: {ok}")
+            logger.info("AlibabaCloudClient check SMS completed: {}", ok)
             return ok
 
         except Exception as e:
-            logger.warning(f"AlibabaCloudClient check sms for {phone_number} with {verify_code}: {e}")
+            logger.warning("AlibabaCloudClient check SMS failed: {}", type(e).__name__)
             return False
 
 

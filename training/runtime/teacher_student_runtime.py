@@ -10,7 +10,10 @@ substrate for distillation-aware overlap:
 
 from __future__ import annotations
 
+import hashlib
 import json
+import os
+import uuid
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
 
@@ -19,6 +22,7 @@ import torch.nn as nn
 from loguru import logger
 
 from training.runtime.distill_cache import DistillCache, move_payload_to_device
+from training.utils.model_output import extract_prediction_tensor
 
 
 @dataclass
@@ -65,6 +69,8 @@ class PendingTeacherForward:
 class TeacherStudentRuntime:
     """Unified runtime boundary for teacher/student execution."""
 
+    CACHE_SCHEMA_VERSION = "worlddistill-runtime-cache-v2"
+
     def __init__(
         self,
         args: Any,
@@ -87,6 +93,7 @@ class TeacherStudentRuntime:
         self.teacher_offload = getattr(args, "runtime_teacher_offload", "none")
         self.enable_dpp = bool(getattr(args, "runtime_enable_dpp", False))
         self.teacher_stream_priority = int(getattr(args, "runtime_teacher_stream_priority", 0))
+        self.cache_identity = self._build_cache_identity()
 
         self._heterogeneous_notice_emitted = False
         self._placement_notice_emitted = False
@@ -300,12 +307,32 @@ class TeacherStudentRuntime:
         chunk_size: int,
         memory_frames: int,
     ) -> Optional[torch.Tensor]:
-        start_frame = current_chunk_idx * chunk_size
-        mem_start = max(0, start_frame - memory_frames)
-        mem_end = start_frame
-        if mem_end <= mem_start:
+        indices = self.select_memory_indices(
+            total_frames=all_frames.shape[2],
+            current_chunk_idx=current_chunk_idx,
+            chunk_size=chunk_size,
+            memory_frames=memory_frames,
+            device=all_frames.device,
+        )
+        if indices is None:
             return None
-        return all_frames[:, :, mem_start:mem_end]
+        return all_frames.index_select(2, indices)
+
+    def select_memory_indices(
+        self,
+        total_frames: int,
+        current_chunk_idx: int,
+        chunk_size: int,
+        memory_frames: int,
+        device: Optional[torch.device] = None,
+    ) -> Optional[torch.Tensor]:
+        """Return chronological frame indices for the default dense-recent policy."""
+
+        history_end = min(max(0, current_chunk_idx * chunk_size), total_frames)
+        if history_end == 0 or memory_frames <= 0:
+            return None
+        history_start = max(0, history_end - memory_frames)
+        return torch.arange(history_start, history_end, device=device, dtype=torch.long)
 
     def build_cache_key(
         self,
@@ -315,6 +342,8 @@ class TeacherStudentRuntime:
         extra: Optional[dict[str, Any]] = None,
     ) -> str:
         payload = {
+            "schema": self.CACHE_SCHEMA_VERSION,
+            "cache_identity": self.cache_identity,
             "namespace": namespace,
             "sample_ids": self._extract_sample_ids(batch),
             "manifest_indices": self._extract_manifest_indices(batch),
@@ -322,6 +351,70 @@ class TeacherStudentRuntime:
             "extra": self._summarize_object(extra or {}),
         }
         return json.dumps(payload, sort_keys=True, ensure_ascii=False)
+
+    def _build_cache_identity(self) -> str:
+        """Namespace persistent entries by immutable teacher/config identity.
+
+        A caller-provided revision is preferred. Otherwise checkpoint/config
+        path metadata is hashed. Pathless in-memory teachers receive a process-
+        local nonce so two independent runs can never share persistent values by
+        accident.
+        """
+
+        explicit_identity = str(getattr(self.args, "runtime_cache_identity", "") or "").strip()
+        teacher_path = str(getattr(self.args, "teacher_model_path", "") or "").strip()
+        config_path = str(getattr(self.args, "config_json", "") or "").strip()
+        preset_spec = str(getattr(self.args, "distill_preset", "") or "").strip()
+        identity_payload: dict[str, Any] = {
+            "schema": self.CACHE_SCHEMA_VERSION,
+            "explicit_identity": explicit_identity,
+            "teacher_model_cls": str(getattr(self.args, "teacher_model_cls", "") or ""),
+            "model_cls": str(getattr(self.args, "model_cls", "") or ""),
+            "checkpoint_format": str(getattr(self.args, "checkpoint_format", "") or ""),
+            "teacher_path": self._path_metadata_signature(teacher_path) if teacher_path else None,
+            "config_path": self._path_metadata_signature(config_path) if config_path else None,
+            "presets": [
+                self._path_metadata_signature(path.strip())
+                for path in preset_spec.split(",")
+                if path.strip()
+            ],
+        }
+        if not explicit_identity and not teacher_path:
+            identity_payload["pathless_run_nonce"] = uuid.uuid4().hex
+        serialized = json.dumps(identity_payload, sort_keys=True, ensure_ascii=False)
+        return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def _path_metadata_signature(path: str) -> dict[str, Any]:
+        expanded = os.path.abspath(os.path.expanduser(path))
+        if not os.path.exists(expanded):
+            return {"path": expanded, "exists": False}
+
+        records: list[tuple[Any, ...]] = []
+        if os.path.isfile(expanded):
+            stat = os.stat(expanded)
+            records.append((os.path.basename(expanded), stat.st_size, stat.st_mtime_ns))
+        else:
+            for root, dirs, files in os.walk(expanded):
+                dirs.sort()
+                files.sort()
+                for filename in files:
+                    candidate = os.path.join(root, filename)
+                    try:
+                        stat = os.stat(candidate)
+                    except OSError:
+                        continue
+                    records.append(
+                        (
+                            os.path.relpath(candidate, expanded),
+                            stat.st_size,
+                            stat.st_mtime_ns,
+                        )
+                    )
+        digest = hashlib.sha256(
+            json.dumps(records, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+        ).hexdigest()
+        return {"path": expanded, "exists": True, "metadata_sha256": digest}
 
     def stats(self) -> dict[str, int]:
         base_stats = {
@@ -354,9 +447,7 @@ class TeacherStudentRuntime:
 
     @staticmethod
     def _normalize_model_output(output: Any, tag: str = "model") -> Any:
-        if isinstance(output, (tuple, list)):
-            return output[0]
-        return output
+        return extract_prediction_tensor(output, tag=tag)
 
     def _build_teacher_placement_plan(self, namespace: str) -> RuntimePlacementPlan:
         execution_device = str(self.device)
@@ -509,12 +600,19 @@ class TeacherStudentRuntime:
     @classmethod
     def _summarize_object(cls, value: Any) -> Any:
         if isinstance(value, torch.Tensor):
-            flat = value.detach().float().cpu().reshape(-1)
-            preview = flat[: min(16, flat.numel())].tolist()
+            tensor = value.detach().contiguous().cpu()
+            # Cache correctness takes precedence over a cheap prefix signature.  The
+            # cache is opt-in, so paying the host copy/hash cost is preferable to
+            # silently reusing supervision for two tensors that share a short prefix.
+            # Flatten first because PyTorch cannot reinterpret a zero-dimensional
+            # scalar directly when the source and target dtypes have different
+            # element sizes.
+            byte_view = tensor.reshape(-1).view(torch.uint8)
+            digest = hashlib.sha256(byte_view.numpy().tobytes()).hexdigest()
             return {
                 "shape": list(value.shape),
                 "dtype": str(value.dtype),
-                "preview": [round(float(v), 6) for v in preview],
+                "sha256": digest,
             }
         if isinstance(value, dict):
             return {k: cls._summarize_object(v) for k, v in value.items()}

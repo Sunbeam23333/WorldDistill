@@ -1,5 +1,6 @@
 import asyncio
 import json
+import os
 import traceback
 from datetime import datetime
 
@@ -1218,7 +1219,7 @@ class PostgresSQLTaskManager(BaseTaskManager):
 async def test():
     from lightx2v.deploy.common.pipeline import Pipeline
 
-    p = Pipeline("/data/nvme1/liuliang1/lightx2v/configs/model_pipeline.json")
+    p = Pipeline(os.environ.get("LIGHTX2V_PIPELINE_CONFIG", "./configs/model_pipeline.json"))
     m = PostgresSQLTaskManager("postgresql://test:test@127.0.0.1:5432/lightx2v_test")
     await m.init()
 

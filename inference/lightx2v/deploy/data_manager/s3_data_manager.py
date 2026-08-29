@@ -55,7 +55,14 @@ class S3DataManager(BaseDataManager):
     async def init(self):
         for i in range(self.max_retries):
             try:
-                logger.info(f"S3DataManager init with config: {self.config} (attempt {i + 1}/{self.max_retries}) ...")
+                logger.info(
+                    "Initializing S3 data manager for bucket {} in region {} "
+                    "(attempt {}/{})",
+                    self.bucket_name,
+                    self.region or "default",
+                    i + 1,
+                    self.max_retries,
+                )
                 s3_config = {"payload_signing_enabled": True}
                 if self.addressing_style:
                     s3_config["addressing_style"] = self.addressing_style
@@ -79,14 +86,18 @@ class S3DataManager(BaseDataManager):
                     await self.s3_client.head_bucket(Bucket=self.bucket_name)
                     logger.info(f"check bucket {self.bucket_name} success")
                 except Exception as e:
-                    logger.info(f"check bucket {self.bucket_name} error: {e}, try to create it...")
+                    logger.info(
+                        "S3 bucket {} check failed with {}; attempting creation",
+                        self.bucket_name,
+                        type(e).__name__,
+                    )
                     await self.s3_client.create_bucket(Bucket=self.bucket_name)
 
                 await self.init_presign_client()
                 logger.info(f"Successfully init S3 bucket: {self.bucket_name} with timeouts - connect: {self.connect_timeout}s, read: {self.read_timeout}s, write: {self.write_timeout}s")
                 return
             except Exception as e:
-                logger.warning(f"Failed to connect to S3: {e}")
+                logger.warning("Failed to connect to S3: {}", type(e).__name__)
                 await asyncio.sleep(1)
 
     async def close(self):
@@ -118,7 +129,7 @@ class S3DataManager(BaseDataManager):
     async def delete_bytes(self, filename, abs_path=None):
         filename = self.fmt_path(self.base_path, filename, abs_path)
         await self.s3_client.delete_object(Bucket=self.bucket_name, Key=filename)
-        logger.info(f"deleted s3 file {filename}")
+        logger.info("Deleted one S3 object")
         return True
 
     @class_try_catch_async
@@ -191,7 +202,7 @@ class S3DataManager(BaseDataManager):
     async def clear_podcast_temp_session_dir(self, session_id):
         session_dir = os.path.join(self.podcast_temp_session_dir, session_id)
         fs = await self.list_files(base_dir=session_dir)
-        logger.info(f"clear podcast temp session dir {session_dir} with files: {fs}")
+        logger.info("Clearing podcast temporary session with {} objects", len(fs))
         for f in fs:
             await self.delete_bytes(f, abs_path=os.path.join(session_dir, f))
 

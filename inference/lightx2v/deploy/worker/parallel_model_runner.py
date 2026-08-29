@@ -36,7 +36,13 @@ class ParallelModelRunner:
 
     def create_clip_runner(self, name, args):
         config = set_config(args)
-        logger.info(f"clip {name} config:\n{json.dumps(config, ensure_ascii=False, indent=4)}")
+        logger.info(
+            "Initializing clip {} (class: {}, task: {}, config keys: {})",
+            name,
+            config.get("model_cls", "unknown"),
+            config.get("task", "unknown"),
+            sorted(str(key) for key in config),
+        )
 
         target_fps = config.get("target_fps", 16)
         max_num_frames = config.get("target_video_length", 81)
@@ -204,7 +210,11 @@ class ParallelModelRunner:
             va_controller = None
             self._run_input_encoder(input_info)
             va_controller = VAController(self)
-            logger.info(f"init va_recorder: {va_controller.recorder} and va_reader: {va_controller.reader}")
+            logger.info(
+                "VA streaming components initialized (recorder: {}, reader: {})",
+                va_controller.recorder is not None,
+                va_controller.reader is not None,
+            )
             assert va_controller.reader is not None, "va_reader is required for parallel model runner"
             va_controller.start()
 

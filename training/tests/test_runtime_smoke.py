@@ -21,7 +21,9 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from training.env_compat import EXPECTED_TRANSFORMERS_VERSION
 from training.model_catalog import resolve_model_metadata
-from training.trainer_args import TrainerArgs, parse_training_args
+from training.trainer_args import TrainerArgs, build_training_arg_parser, parse_training_args
+from training.train_distill import _bucket_sampler_drop_last
+from training.utils.model_output import extract_prediction_tensor
 
 _EXPERIMENT_TRACKING_PATH = PROJECT_ROOT / "training" / "utils" / "experiment_tracking.py"
 _spec = importlib.util.spec_from_file_location("worlddistill_experiment_tracking", _EXPERIMENT_TRACKING_PATH)
@@ -40,7 +42,12 @@ resolve_default_inference_config = _inference_model_catalog.resolve_default_conf
 
 if _TORCH_IMPORT_ERROR is None:
     from training.runtime import build_runtime
+    from training.runtime.distill_cache import MemoryDistillCache
     from training.runtime.fused_supervision import fused_masked_mse_loss
+    from training.trainers.context_forcing_trainer import ContextForcingTrainer
+    from training.trainers.consistency_distill_trainer import ConsistencyDistillTrainer
+    from training.trainers.progressive_distill_trainer import ProgressiveDistillTrainer
+    from training.trainers.step_distill_trainer import StepDistillTrainer
 
     class IdentityTeacher(nn.Module):
         def forward(self, latents: torch.Tensor) -> torch.Tensor:
@@ -139,6 +146,33 @@ class PresetSmokeTests(unittest.TestCase):
         self.assertTrue(args.use_bucket_sampler)
         self.assertEqual(args.required_transformers_version, EXPECTED_TRANSFORMERS_VERSION)
 
+    def test_loss_cli_exposes_only_implemented_objectives(self) -> None:
+        parser = build_training_arg_parser()
+        loss_action = next(action for action in parser._actions if action.dest == "loss_type")
+        consistency_action = next(
+            action for action in parser._actions if action.dest == "consistency_loss_type"
+        )
+
+        self.assertEqual(loss_action.choices, ["mse", "huber"])
+        self.assertEqual(consistency_action.choices, ["mse", "huber"])
+        with self.assertRaisesRegex(ValueError, "Unsupported supervision loss_type"):
+            TrainerArgs(loss_type="lpips")
+
+    def test_distributed_bucket_sampling_drops_incomplete_batches(self) -> None:
+        self.assertFalse(_bucket_sampler_drop_last(world_size=1))
+        self.assertTrue(_bucket_sampler_drop_last(world_size=2))
+
+    @unittest.skipIf(_TORCH_IMPORT_ERROR is not None, f"torch is unavailable: {_TORCH_IMPORT_ERROR}")
+    def test_diffusers_style_output_extracts_sample_tensor(self) -> None:
+        class DiffusersOutput:
+            def __init__(self, sample):
+                self.sample = sample
+
+        expected = torch.ones(2, 3)
+        self.assertIs(extract_prediction_tensor(DiffusersOutput(expected)), expected)
+        with self.assertRaisesRegex(TypeError, "unsupported output type"):
+            extract_prediction_tensor({"hidden_states": expected}, tag="student")
+
     def test_parse_training_args_accepts_cuda_compile_flags(self) -> None:
         argv = [
             "train_distill.py",
@@ -163,6 +197,24 @@ class PresetSmokeTests(unittest.TestCase):
         self.assertTrue(args.torch_compile_fullgraph)
         self.assertTrue(args.torch_compile_dynamic)
 
+    def test_explicit_cli_values_override_preset_defaults(self) -> None:
+        argv = [
+            "train_distill.py",
+            "--teacher_model_path", "/tmp/teacher",
+            "--data_json", "/tmp/train.json",
+            "--config", str(self.step_preset),
+            "--learning_rate", "0.123",
+            "--parallel_mode", "fsdp",
+            "--no-use_dual_model",
+        ]
+        with patch.object(sys, "argv", argv):
+            args = parse_training_args()
+
+        self.assertEqual(args.learning_rate, 0.123)
+        self.assertEqual(args.parallel_mode, "fsdp")
+        self.assertFalse(args.use_dual_model)
+        self.assertTrue(args.enable_runtime)
+
     def test_inference_catalog_resolves_distill_pair_and_image_defaults(self) -> None:
         metadata = resolve_inference_metadata("wan2.1_distill", task="t2v")
         default_config = resolve_default_inference_config("qwen-image-edit-2511", task="i2i")
@@ -183,7 +235,7 @@ class PresetSmokeTests(unittest.TestCase):
         self.assertTrue(ltx2_metadata["supports_task"])
         self.assertIn("audio", ltx2_metadata["output_modalities"])
         self.assertIn("video", ltx2_metadata["output_modalities"])
-        self.assertTrue(seko_config.endswith("seko_talk/shot/rs2v/rs2v.json"))
+        self.assertTrue(seko_config.endswith("seko_talk/shot/rs2v/main.json"))
 
 
 @unittest.skipIf(_TORCH_IMPORT_ERROR is not None, f"torch is unavailable: {_TORCH_IMPORT_ERROR}")
@@ -230,6 +282,248 @@ class RuntimeSmokeTests(unittest.TestCase):
 
         self.assertTrue(torch.allclose(fallback_loss, expected))
         self.assertTrue(torch.allclose(auto_loss, expected))
+
+    def test_masked_huber_supervision_matches_reference(self) -> None:
+        teacher = nn.Linear(2, 2)
+        student = nn.Linear(2, 2)
+        optimizer = torch.optim.AdamW(student.parameters(), lr=1e-3)
+        args = TrainerArgs(
+            distill_method="step_distill",
+            loss_type="huber",
+            huber_c=0.5,
+            mixed_precision="no",
+            report_to="none",
+        )
+        trainer = StepDistillTrainer(
+            args=args,
+            teacher_model=teacher,
+            student_model=student,
+            optimizer=optimizer,
+            lr_scheduler=None,
+            train_dataloader=[],
+            device=torch.device("cpu"),
+        )
+        prediction = torch.tensor([[1.0, 3.0], [2.0, 5.0]])
+        target = torch.tensor([[0.0, 1.0], [2.0, 1.0]])
+        mask = torch.tensor([[1.0, 0.0], [1.0, 1.0]])
+
+        per_element = torch.nn.functional.huber_loss(
+            prediction,
+            target,
+            reduction="none",
+            delta=0.5,
+        )
+        expected = (per_element * mask).sum() / mask.sum()
+
+        self.assertTrue(
+            torch.allclose(
+                trainer.compute_supervision_loss(prediction, target, mask=mask),
+                expected,
+            )
+        )
+
+    def test_hybrid_sparse_memory_uses_full_history_and_keeps_recent_tail(self) -> None:
+        args = TrainerArgs(
+            distill_method="context_forcing",
+            enable_runtime=True,
+            runtime_name="world_model",
+            runtime_memory_policy="hybrid_sparse",
+            runtime_memory_budget_frames=5,
+            runtime_memory_recent_ratio=0.4,
+        )
+        runtime = build_runtime(
+            args=args,
+            teacher_model=IdentityTeacher(),
+            student_model=IdentityStudent(),
+            device=torch.device("cpu"),
+        )
+        assert runtime is not None
+
+        indices = runtime.select_memory_indices(
+            total_frames=16,
+            current_chunk_idx=3,
+            chunk_size=4,
+            memory_frames=5,
+            device=torch.device("cpu"),
+        )
+
+        assert indices is not None
+        self.assertEqual(indices.tolist()[-2:], [10, 11])
+        self.assertEqual(indices.numel(), 5)
+        self.assertLess(indices.tolist()[0], 7)
+        self.assertEqual(indices.tolist(), sorted(set(indices.tolist())))
+
+    def test_cache_key_hashes_tensor_content_beyond_prefix(self) -> None:
+        args = TrainerArgs(distill_method="step_distill", enable_runtime=True)
+        runtime = build_runtime(
+            args=args,
+            teacher_model=IdentityTeacher(),
+            student_model=IdentityStudent(),
+            device=torch.device("cpu"),
+        )
+        assert runtime is not None
+
+        first = torch.zeros(32)
+        second = first.clone()
+        second[-1] = 1.0
+        first_key = runtime.build_cache_key(
+            namespace="teacher_output",
+            batch={"sample_id": ["sample-1"]},
+            input_kwargs={"latents": first},
+        )
+        second_key = runtime.build_cache_key(
+            namespace="teacher_output",
+            batch={"sample_id": ["sample-1"]},
+            input_kwargs={"latents": second},
+        )
+
+        self.assertNotEqual(first_key, second_key)
+
+    def test_cache_key_accepts_scalar_tensors(self) -> None:
+        args = TrainerArgs(distill_method="step_distill", enable_runtime=True)
+        runtime = build_runtime(
+            args=args,
+            teacher_model=IdentityTeacher(),
+            student_model=IdentityStudent(),
+            device=torch.device("cpu"),
+        )
+        assert runtime is not None
+
+        key = runtime.build_cache_key(
+            namespace="teacher_output",
+            batch={"sample_id": ["sample-1"]},
+            input_kwargs={"timestep": torch.tensor(0.5)},
+        )
+
+        self.assertIsInstance(key, str)
+        self.assertTrue(key)
+
+    def test_cache_identity_separates_teacher_revisions(self) -> None:
+        first = build_runtime(
+            args=TrainerArgs(
+                distill_method="step_distill",
+                enable_runtime=True,
+                runtime_cache_identity="teacher-revision-a",
+            ),
+            teacher_model=IdentityTeacher(),
+            student_model=IdentityStudent(),
+            device=torch.device("cpu"),
+        )
+        second = build_runtime(
+            args=TrainerArgs(
+                distill_method="step_distill",
+                enable_runtime=True,
+                runtime_cache_identity="teacher-revision-b",
+            ),
+            teacher_model=IdentityTeacher(),
+            student_model=IdentityStudent(),
+            device=torch.device("cpu"),
+        )
+        assert first is not None and second is not None
+
+        first_key = first.build_cache_key("teacher_output", {"sample_id": ["clip"]})
+        second_key = second.build_cache_key("teacher_output", {"sample_id": ["clip"]})
+
+        self.assertNotEqual(first_key, second_key)
+
+    def test_cache_rejects_entries_from_a_later_timeline(self) -> None:
+        cache = MemoryDistillCache(freshness_steps=0)
+        cache.put("key", torch.tensor([1.0]), current_step=10)
+
+        self.assertIsNone(cache.get("key", current_step=1))
+
+    def test_context_chunk_ranges_keep_non_divisible_tail(self) -> None:
+        self.assertEqual(
+            ContextForcingTrainer._chunk_ranges(num_frames=10, chunk_size=4),
+            [(0, 4), (4, 8), (8, 10)],
+        )
+
+    def test_context_temporal_conditions_follow_packed_frame_indices(self) -> None:
+        batch = {
+            "camera_poses": torch.arange(2 * 6 * 4 * 4).reshape(2, 6, 4, 4),
+            "actions": torch.arange(2 * 6 * 3).reshape(2, 6, 3),
+            "encoder_hidden_states": torch.ones(2, 4, 8),
+        }
+        indices = torch.tensor([0, 3, 4])
+
+        selected = ContextForcingTrainer._slice_temporal_conditions(batch, indices, 6)
+
+        self.assertTrue(torch.equal(selected["actions"], batch["actions"][:, indices]))
+        self.assertTrue(torch.equal(selected["camera_poses"], batch["camera_poses"][:, indices]))
+        self.assertIs(selected["encoder_hidden_states"], batch["encoder_hidden_states"])
+
+    def test_context_temporal_condition_rejects_ambiguous_layout(self) -> None:
+        with self.assertRaisesRegex(ValueError, "Cannot infer the temporal axis"):
+            ContextForcingTrainer._slice_temporal_conditions(
+                {"actions": torch.zeros(2, 6, 6)},
+                torch.tensor([1, 3]),
+                6,
+            )
+
+    def test_context_curriculum_activates_final_stage_before_training_ends(self) -> None:
+        student = nn.Linear(2, 2)
+        trainer = ContextForcingTrainer(
+            args=TrainerArgs(
+                distill_method="context_forcing",
+                curriculum_stages=[20, 40, 60, 80, 100],
+                max_train_steps=100,
+                mixed_precision="no",
+                report_to="none",
+            ),
+            teacher_model=nn.Linear(2, 2),
+            student_model=student,
+            optimizer=torch.optim.AdamW(student.parameters()),
+            lr_scheduler=None,
+            train_dataloader=[],
+            device=torch.device("cpu"),
+        )
+
+        trainer.global_step = 20
+        trainer.on_train_step_end({})
+        self.assertEqual((trainer.current_curriculum_stage, trainer.current_num_frames), (1, 40))
+        trainer.global_step = 80
+        trainer.on_train_step_end({})
+        self.assertEqual((trainer.current_curriculum_stage, trainer.current_num_frames), (4, 100))
+
+    def test_progressive_schedule_ends_at_declared_target(self) -> None:
+        student = nn.Linear(2, 2)
+        trainer = ProgressiveDistillTrainer(
+            args=TrainerArgs(
+                distill_method="progressive_distill",
+                progressive_stages=[64, 32, 16, 8, 4],
+                mixed_precision="no",
+                report_to="none",
+            ),
+            teacher_model=nn.Linear(2, 2),
+            student_model=student,
+            optimizer=torch.optim.AdamW(student.parameters()),
+            lr_scheduler=None,
+            train_dataloader=[],
+            device=torch.device("cpu"),
+        )
+
+        self.assertEqual(trainer._stage_pair(0), (64, 32))
+        self.assertEqual(trainer._stage_pair(3), (8, 4))
+        with self.assertRaises(IndexError):
+            trainer._stage_pair(4)
+
+    def test_velocity_only_methods_reject_other_prediction_types(self) -> None:
+        student = nn.Linear(2, 2)
+        with self.assertRaisesRegex(ValueError, "velocity-space"):
+            ConsistencyDistillTrainer(
+                args=TrainerArgs(
+                    distill_method="consistency_distill",
+                    prediction_type="x0",
+                    mixed_precision="no",
+                    report_to="none",
+                ),
+                teacher_model=nn.Linear(2, 2),
+                student_model=student,
+                optimizer=torch.optim.AdamW(student.parameters()),
+                lr_scheduler=None,
+                train_dataloader=[],
+                device=torch.device("cpu"),
+            )
 
 
 if __name__ == "__main__":

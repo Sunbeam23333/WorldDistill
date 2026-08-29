@@ -18,7 +18,7 @@ models:
   wan2.1:
     hf_repo: "Wan-AI/Wan2.1-T2V-14B"
     architecture: wan
-    tasks: [t2v, i2v]
+    tasks: [t2v, i2v, flf2v]
     runner_cls: "wan2.1"
     distill_methods: [step_distill, lora_distill, mean_flow_distill]
     status: supported
@@ -63,7 +63,7 @@ models:
   wan2.2_moe:
     hf_repo: "Wan-AI/Wan2.2-T2V-A14B"
     architecture: wan_moe
-    tasks: [t2v, i2v]
+    tasks: [t2v, i2v, flf2v, t2av, i2av]
     runner_cls: "wan2.2_moe"
     distill_methods: [step_distill, lora_distill, full_model_distill, fp8_distill]
     status: supported
@@ -71,7 +71,7 @@ models:
   wan2.2_moe_distill:
     hf_repo: "lightx2v/Wan2.2-Distill-Models"
     architecture: wan_moe
-    tasks: [t2v, i2v]
+    tasks: [t2v, i2v, flf2v]
     runner_cls: "wan2.2_moe_distill"
     distill_methods: [step_distill]
     teacher_model_cls: "wan2.2_moe"
@@ -91,7 +91,7 @@ models:
   wan2.2_audio:
     hf_repo: "lightx2v/Wan2.2-Audio"
     architecture: wan_dense
-    tasks: [s2v, rs2v]
+    tasks: [s2v]
     runner_cls: "wan2.2_audio"
     features: [audio_conditioning, streaming_generation]
     status: supported
@@ -123,7 +123,7 @@ models:
   hunyuan_video_1.5_distill:
     hf_repo: "tencent/HunyuanVideo"
     architecture: hunyuan_video
-    tasks: [t2v, i2v]
+    tasks: [t2v]
     runner_cls: "hunyuan_video_1.5_distill"
     distill_methods: [step_distill]
     teacher_model_cls: "hunyuan_video_1.5"
@@ -168,7 +168,7 @@ models:
     status: supported
 
   ltx2:
-    hf_repo: "Lightricks/LTX-Video"
+    hf_repo: "Lightricks/LTX-2"
     architecture: dit
     tasks: [t2v, i2v, t2av, i2av]
     runner_cls: "ltx2"
@@ -187,7 +187,7 @@ models:
   worldplay_distill:
     hf_repo: "tencent/HY-WorldPlay"
     architecture: hunyuan_video
-    tasks: [t2v, i2v, game]
+    tasks: [i2v, game]
     runner_cls: "worldplay_distill"
     distill_methods: [step_distill, context_forcing]
     distill_stage: student
@@ -228,7 +228,6 @@ models:
     runner_cls: "gamecraft"
     distill_methods: [step_distill, context_forcing]
     features: [action_conditioning, prope_camera]
-    paper: "https://arxiv.org/abs/2506.xxxxx"
     status: stub
 
   infinite_world:
@@ -237,7 +236,6 @@ models:
     tasks: [game, open_world]
     runner_cls: "infinite_world"
     features: [infinite_generation, spatial_memory]
-    paper: "https://arxiv.org/abs/2504.xxxxx"
     status: stub
 
   genie:

@@ -401,8 +401,6 @@ if __name__ == "__main__":
     height = 480
 
     recorder = VideoRecorder(
-        # livestream_url="rtmp://localhost/live/test",
-        # livestream_url="https://reverse.st-oc-01.chielo.org/10.5.64.49:8000/rtc/v1/whip/?app=live&stream=ll_test_video&eip=127.0.0.1:8000",
         livestream_url="/path/to/output_video.mp4",
         fps=fps,
     )

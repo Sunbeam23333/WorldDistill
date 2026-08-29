@@ -95,7 +95,7 @@ class TrainerArgs:
     # --- Consistency Distillation ---
     ema_decay: float = 0.9999
     ema_warmup_steps: int = 0
-    consistency_loss_type: str = "huber"  # huber | mse | lpips
+    consistency_loss_type: str = "huber"  # huber | mse
     huber_c: float = 0.00054
     consistency_delta_schedule: str = "fixed"  # fixed | linear_decay
     consistency_delta_min: int = 5  # Minimum delta (for linear_decay schedule)
@@ -105,13 +105,11 @@ class TrainerArgs:
     temporal_context_size: int = 12
     curriculum_training: bool = True
     curriculum_stages: List[int] = field(default_factory=lambda: [17, 33, 49, 65])
-    generator_update_interval: int = 5
     use_teacher_context: bool = True  # Use teacher-generated context (True) vs GT context (False)
 
     # --- Adversarial Distillation (ADD/LADD) ---
     adversarial_lambda_adv: float = 0.5  # Weight for adversarial (generator) loss
     adversarial_lambda_distill: float = 2.5  # Weight for score distillation loss
-    adversarial_lambda_feat: float = 0.0  # Weight for feature matching loss (0 = disabled)
     adversarial_r1_weight: float = 1e-5  # R1 gradient penalty weight
     adversarial_disc_update_freq: int = 1  # Discriminator update frequency (every N steps)
     adversarial_disc_start_step: int = 0  # Step at which to start adversarial training
@@ -147,13 +145,12 @@ class TrainerArgs:
     warmup_steps: int = 1000
     gradient_accumulation_steps: int = 1
     max_grad_norm: float = 1.0
-    grad_skip_threshold: float = 10.0  # Skip optimizer step if grad_norm exceeds this
+    grad_skip_threshold: float = float("inf")  # Native-only application-level step skip
     mixed_precision: str = "bf16"  # no | fp16 | bf16
     seed: int = 42
 
     # --- Loss ---
-    loss_type: str = "mse"  # mse | huber | lpips | mse+lpips
-    lpips_weight: float = 0.1  # Weight for LPIPS loss when using mse+lpips
+    loss_type: str = "mse"  # mse | huber
 
     # --- Optimizer ---
     optimizer: str = "adamw"  # adamw | muon
@@ -216,6 +213,7 @@ class TrainerArgs:
     runtime_cache_hot_entries: int = 64
     runtime_cache_pin_memory: bool = True
     runtime_freshness_steps: int = 0
+    runtime_cache_identity: str = ""
     runtime_teacher_cache_mode: str = "disabled"  # disabled | teacher_output | teacher_context | hybrid
     runtime_prefetch_policy: str = "none"  # none | next_chunk | next_batch
     runtime_memory_policy: str = "dense_recent"  # dense_recent | strided_history | hybrid_sparse
@@ -247,6 +245,35 @@ class TrainerArgs:
     def __post_init__(self):
         if self.distill_preset:
             self._load_preset(self.distill_preset)
+        self._validate_and_normalize()
+
+    def _validate_and_normalize(self) -> None:
+        if self.mixed_precision not in {"no", "fp16", "bf16"}:
+            raise ValueError(
+                f"mixed_precision must be 'no', 'fp16', or 'bf16', got {self.mixed_precision!r}"
+            )
+        if self.parallel_mode not in {"ddp", "fsdp", "deepspeed"}:
+            raise ValueError(
+                f"parallel_mode must be ddp, fsdp, or deepspeed, got {self.parallel_mode!r}"
+            )
+        if self.gradient_accumulation_steps < 1:
+            raise ValueError("gradient_accumulation_steps must be at least 1")
+        if self.max_grad_norm < 0:
+            raise ValueError("max_grad_norm must be non-negative")
+        if self.grad_skip_threshold <= 0:
+            raise ValueError("grad_skip_threshold must be positive or infinity")
+        if self.loss_type not in {"mse", "huber"}:
+            raise ValueError(
+                f"Unsupported supervision loss_type={self.loss_type!r}; "
+                "supported values are 'mse' and 'huber'."
+            )
+        if self.consistency_loss_type not in {"mse", "huber"}:
+            raise ValueError(
+                "Unsupported consistency_loss_type="
+                f"{self.consistency_loss_type!r}; supported values are 'mse' and 'huber'."
+            )
+        if self.huber_c <= 0:
+            raise ValueError(f"huber_c must be positive, got {self.huber_c}")
         # Legacy compat: if use_fsdp is True, set parallel_mode to fsdp
         if self.use_fsdp and self.parallel_mode == "ddp":
             self.parallel_mode = "fsdp"
@@ -307,11 +334,29 @@ class TrainerArgs:
                     setattr(self, normalized_key, normalized_value)
 
     @classmethod
-    def from_args(cls, args: argparse.Namespace) -> "TrainerArgs":
-        """Create TrainerArgs from parsed argparse namespace."""
+    def from_args(
+        cls,
+        args: argparse.Namespace,
+        *,
+        explicit_fields: Optional[set[str]] = None,
+    ) -> "TrainerArgs":
+        """Create ``TrainerArgs`` with explicit CLI values above presets.
+
+        ``argparse`` materializes defaults for every option, so callers may
+        provide ``explicit_fields`` to distinguish user-supplied values from
+        parser defaults. Presets override defaults; explicit CLI flags then
+        override presets.
+        """
         known_fields = {f.name for f in cls.__dataclass_fields__.values()}
         kwargs = {k: v for k, v in vars(args).items() if k in known_fields and v is not None}
-        return cls(**kwargs)
+        resolved = cls(**kwargs)
+        if explicit_fields:
+            for field_name in explicit_fields:
+                if field_name == "distill_preset" or field_name not in kwargs:
+                    continue
+                setattr(resolved, field_name, kwargs[field_name])
+            resolved._validate_and_normalize()
+        return resolved
 
 
 def build_training_arg_parser() -> argparse.ArgumentParser:
@@ -345,6 +390,8 @@ def build_training_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--distill_preset", "--config", type=str, default="")
     parser.add_argument("--prediction_type", type=str, default="velocity", choices=["velocity", "epsilon", "x0"])
+    parser.add_argument("--use_dual_model", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--student_low_model", type=str, default=None)
 
     # Training
     parser.add_argument("--learning_rate", type=float, default=1e-5)
@@ -352,16 +399,27 @@ def build_training_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--warmup_steps", type=int, default=1000)
     parser.add_argument("--gradient_accumulation_steps", type=int, default=1)
     parser.add_argument("--max_grad_norm", type=float, default=1.0)
-    parser.add_argument("--grad_skip_threshold", type=float, default=10.0)
-    parser.add_argument("--mixed_precision", type=str, default="bf16")
+    parser.add_argument("--grad_skip_threshold", type=float, default=float("inf"))
+    parser.add_argument("--mixed_precision", type=str, default="bf16", choices=["no", "fp16", "bf16"])
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--batch_size", type=int, default=1)
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--num_inference_steps", type=int, default=4)
 
     # Loss
-    parser.add_argument("--loss_type", type=str, default="mse", choices=["mse", "huber", "lpips", "mse+lpips"])
-    parser.add_argument("--lpips_weight", type=float, default=0.1)
+    parser.add_argument("--loss_type", type=str, default="mse", choices=["mse", "huber"])
+    parser.add_argument(
+        "--consistency_loss_type",
+        type=str,
+        default="huber",
+        choices=["mse", "huber"],
+    )
+    parser.add_argument(
+        "--huber_c",
+        type=float,
+        default=0.00054,
+        help="Positive Huber delta (and pseudo-Huber constant for consistency distillation)",
+    )
 
     # Optimizer
     parser.add_argument("--optimizer", type=str, default="adamw", choices=["adamw", "muon"])
@@ -430,6 +488,12 @@ def build_training_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--runtime_cache_hot_entries", type=int, default=64)
     parser.add_argument("--runtime_cache_pin_memory", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--runtime_freshness_steps", type=int, default=0)
+    parser.add_argument(
+        "--runtime_cache_identity",
+        type=str,
+        default="",
+        help="Immutable teacher/config revision used to namespace persistent cache entries",
+    )
     parser.add_argument("--runtime_teacher_cache_mode", type=str, default="disabled", choices=["disabled", "teacher_output", "teacher_context", "hybrid"])
     parser.add_argument("--runtime_prefetch_policy", type=str, default="none", choices=["none", "next_chunk", "next_batch"])
     parser.add_argument("--runtime_memory_policy", type=str, default="dense_recent", choices=["dense_recent", "strided_history", "hybrid_sparse"])
@@ -484,4 +548,9 @@ def parse_training_args() -> TrainerArgs:
     """Parse command-line arguments into TrainerArgs."""
     parser = build_training_arg_parser()
     args = parser.parse_args()
-    return TrainerArgs.from_args(args)
+    explicit_fields = {
+        parser._option_string_actions[token.split("=", 1)[0]].dest
+        for token in sys.argv[1:]
+        if token.split("=", 1)[0] in parser._option_string_actions
+    }
+    return TrainerArgs.from_args(args, explicit_fields=explicit_fields)

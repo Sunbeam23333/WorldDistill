@@ -32,37 +32,72 @@ class WorldModelTeacherStudentRuntime(TeacherStudentRuntime):
         chunk_size: int,
         memory_frames: int,
     ) -> Optional[torch.Tensor]:
-        recent_context = super().select_memory_frames(
-            all_frames=all_frames,
+        indices = self.select_memory_indices(
+            total_frames=all_frames.shape[2],
             current_chunk_idx=current_chunk_idx,
             chunk_size=chunk_size,
             memory_frames=memory_frames,
+            device=all_frames.device,
         )
-        if recent_context is None:
+        if indices is None:
+            return None
+        return all_frames.index_select(2, indices)
+
+    def select_memory_indices(
+        self,
+        total_frames: int,
+        current_chunk_idx: int,
+        chunk_size: int,
+        memory_frames: int,
+        device: Optional[torch.device] = None,
+    ) -> Optional[torch.Tensor]:
+        """Select memory from the complete prefix before the current chunk.
+
+        ``hybrid_sparse`` preserves a contiguous recent tail and spends the
+        remaining budget on chronological anchors from the older history.  This
+        keeps the implementation aligned with the paper mechanism instead of
+        sparsifying an already-truncated recent window.
+        """
+
+        history_end = min(max(0, current_chunk_idx * chunk_size), total_frames)
+        if history_end == 0:
             return None
 
         budget_frames = self.memory_budget_frames or memory_frames
-        budget_frames = max(1, min(int(budget_frames), recent_context.shape[2]))
+        if budget_frames <= 0:
+            return None
+        budget_frames = max(1, min(int(budget_frames), history_end))
 
         if self.memory_policy == "dense_recent":
-            return recent_context[:, :, -budget_frames:]
+            return torch.arange(
+                history_end - budget_frames,
+                history_end,
+                device=device,
+                dtype=torch.long,
+            )
 
         if self.memory_policy == "strided_history":
-            return self._compose_hybrid_context(
-                recent_context=recent_context,
-                budget_frames=budget_frames,
-                keep_recent=max(1, budget_frames // 2),
+            return self._uniform_history_indices(
+                history_end=history_end,
+                count=budget_frames,
+                device=device,
             )
 
         if self.memory_policy == "hybrid_sparse":
             keep_recent = max(1, int(round(budget_frames * self.memory_recent_ratio)))
-            return self._compose_hybrid_context(
-                recent_context=recent_context,
+            return self._compose_hybrid_indices(
+                history_end=history_end,
                 budget_frames=budget_frames,
                 keep_recent=keep_recent,
+                device=device,
             )
 
-        return recent_context[:, :, -budget_frames:]
+        return torch.arange(
+            history_end - budget_frames,
+            history_end,
+            device=device,
+            dtype=torch.long,
+        )
 
     def get_or_create_teacher_context(
         self,
@@ -70,9 +105,15 @@ class WorldModelTeacherStudentRuntime(TeacherStudentRuntime):
         global_step: int,
         chunk_start: int,
         chunk_end: int,
+        frame_indices: Optional[list[int]],
         producer: Callable[[], torch.Tensor],
     ) -> torch.Tensor:
         allow_cache = self.cache_mode in {"teacher_context", "hybrid"}
+        conditioning = {
+            key: batch[key]
+            for key in ("encoder_hidden_states", "image_cond", "camera_poses", "actions")
+            if key in batch and batch[key] is not None
+        }
         return self.get_or_create_cached_value(
             namespace="teacher_context",
             batch=batch,
@@ -81,9 +122,11 @@ class WorldModelTeacherStudentRuntime(TeacherStudentRuntime):
             extra={
                 "chunk_start": chunk_start,
                 "chunk_end": chunk_end,
+                "frame_indices": frame_indices or [],
                 "prefetch_policy": self.prefetch_policy,
                 "memory_policy": self.memory_policy,
                 "memory_budget_frames": self.memory_budget_frames,
+                "conditioning": conditioning,
             },
             allow_cache=allow_cache,
         )
@@ -104,33 +147,39 @@ class WorldModelTeacherStudentRuntime(TeacherStudentRuntime):
         return request
 
     @staticmethod
-    def _compose_hybrid_context(
-        recent_context: torch.Tensor,
+    def _compose_hybrid_indices(
+        history_end: int,
         budget_frames: int,
         keep_recent: int,
+        device: Optional[torch.device] = None,
     ) -> torch.Tensor:
-        total_context_frames = recent_context.shape[2]
-        if total_context_frames <= budget_frames:
-            return recent_context
+        if history_end <= budget_frames:
+            return torch.arange(history_end, device=device, dtype=torch.long)
 
-        keep_recent = max(1, min(keep_recent, budget_frames, total_context_frames))
-        recent_tail = recent_context[:, :, -keep_recent:]
-        history = recent_context[:, :, :-keep_recent]
-        if history.shape[2] == 0:
+        keep_recent = max(1, min(keep_recent, budget_frames, history_end))
+        recent_start = history_end - keep_recent
+        recent_tail = torch.arange(recent_start, history_end, device=device, dtype=torch.long)
+        if recent_start == 0:
             return recent_tail
 
         target_history = max(0, budget_frames - keep_recent)
         if target_history == 0:
             return recent_tail
 
-        if history.shape[2] <= target_history:
-            history_sparse = history
-        else:
-            indices = torch.linspace(
-                0,
-                history.shape[2] - 1,
-                target_history,
-                device=history.device,
-            ).long()
-            history_sparse = history.index_select(2, indices)
-        return torch.cat([history_sparse, recent_tail], dim=2)
+        history_sparse = WorldModelTeacherStudentRuntime._uniform_history_indices(
+            history_end=recent_start,
+            count=target_history,
+            device=device,
+        )
+        return torch.cat([history_sparse, recent_tail], dim=0)
+
+    @staticmethod
+    def _uniform_history_indices(
+        history_end: int,
+        count: int,
+        device: Optional[torch.device] = None,
+    ) -> torch.Tensor:
+        count = min(max(1, count), history_end)
+        if count == history_end:
+            return torch.arange(history_end, device=device, dtype=torch.long)
+        return torch.linspace(0, history_end - 1, count, device=device).round().long()

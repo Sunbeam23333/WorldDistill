@@ -2,7 +2,7 @@
 
 Implements Diffusion Forcing-based streaming distillation where each frame
 maintains an independent noise level. The student learns to denoise frames
-with non-decreasing noise levels, enabling infinite-length generation.
+with non-decreasing noise levels for finite-window long-video training.
 
 Key training dynamics:
 - Per-frame independent timestep sampling with monotonic non-decreasing constraint
@@ -21,7 +21,6 @@ from typing import Any, Dict
 
 import torch
 import torch.nn.functional as F
-from loguru import logger
 
 from training.trainers.base_distill_trainer import BaseDistillTrainer
 
@@ -47,6 +46,16 @@ class StreamDistillTrainer(BaseDistillTrainer):
         self.noise_schedule = self.args.noise_schedule
         self.denoising_steps = self.args.denoising_steps_per_frame
         self.causal_attention = getattr(self.args, "causal_attention", True)
+        if self.window_size < 2:
+            raise ValueError("window_size must be at least 2 frames")
+        if self.overlap_frames < 0 or self.overlap_frames >= self.window_size:
+            raise ValueError("overlap_frames must satisfy 0 <= overlap_frames < window_size")
+        if self.denoising_steps <= 0:
+            raise ValueError("denoising_steps_per_frame must be positive")
+        if self.noise_schedule not in {"monotonic_linear", "cosine", "sigmoid", "beta"}:
+            raise ValueError(
+                "noise_schedule must be one of monotonic_linear, cosine, sigmoid, or beta"
+            )
 
     def _sample_per_frame_timesteps(
         self, batch_size: int, num_frames: int
@@ -99,6 +108,8 @@ class StreamDistillTrainer(BaseDistillTrainer):
         self,
         latents_window: torch.Tensor,
         batch: Dict[str, Any],
+        frame_indices: torch.Tensor,
+        total_frames: int,
     ) -> torch.Tensor:
         """Compute loss for a single sliding window.
 
@@ -112,6 +123,8 @@ class StreamDistillTrainer(BaseDistillTrainer):
         bs = latents_window.shape[0]
         num_frames = latents_window.shape[2]
 
+        window_batch = self._slice_temporal_conditions(batch, frame_indices, total_frames)
+
         # Sample per-frame timesteps (non-decreasing)
         per_frame_timesteps = self._sample_per_frame_timesteps(bs, num_frames)
         per_frame_sigmas = per_frame_timesteps / self.num_train_timesteps
@@ -122,8 +135,8 @@ class StreamDistillTrainer(BaseDistillTrainer):
         noisy_latents = (1 - sigmas_expanded) * latents_window + sigmas_expanded * noise
 
         # Build input kwargs
-        teacher_input = self.prepare_teacher_input(batch, noisy_latents, per_frame_timesteps)
-        student_input = self.prepare_student_input(batch, noisy_latents, per_frame_timesteps)
+        teacher_input = self.prepare_teacher_input(window_batch, noisy_latents, per_frame_timesteps)
+        student_input = self.prepare_student_input(window_batch, noisy_latents, per_frame_timesteps)
 
         # Add causal mask if enabled
         if self.causal_attention:
@@ -134,12 +147,12 @@ class StreamDistillTrainer(BaseDistillTrainer):
         teacher_output, student_output = self._run_teacher_student_pair(
             teacher_input=teacher_input,
             student_input=student_input,
-            batch=batch,
+            batch=window_batch,
             cache_extra={"timesteps": per_frame_timesteps, "mode": "stream_window", "window_frames": num_frames},
         )
 
         loss = self.compute_distill_loss(
-            teacher_output, student_output, batch, per_frame_timesteps
+            teacher_output, student_output, window_batch, per_frame_timesteps
         )
         return loss
 
@@ -150,7 +163,8 @@ class StreamDistillTrainer(BaseDistillTrainer):
 
         # If video fits in a single window, process directly
         if num_frames <= self.window_size:
-            return self._compute_window_loss(latents, batch)
+            frame_indices = torch.arange(num_frames, device=latents.device)
+            return self._compute_window_loss(latents, batch, frame_indices, num_frames)
 
         # Sliding window processing
         total_loss = torch.tensor(0.0, device=self.device)
@@ -164,7 +178,13 @@ class StreamDistillTrainer(BaseDistillTrainer):
             if latents_window.shape[2] < 2:
                 continue
 
-            window_loss = self._compute_window_loss(latents_window, batch)
+            frame_indices = torch.arange(start, end, device=latents.device)
+            window_loss = self._compute_window_loss(
+                latents_window,
+                batch,
+                frame_indices,
+                num_frames,
+            )
             total_loss = total_loss + window_loss
             num_windows += 1
 
@@ -177,7 +197,7 @@ class StreamDistillTrainer(BaseDistillTrainer):
         batch: Dict[str, Any],
         timesteps: torch.Tensor,
     ) -> torch.Tensor:
-        """Per-frame weighted MSE loss.
+        """Per-frame weighted MSE or Huber supervision loss.
 
         Applies per-frame weighting based on noise level: frames with higher
         noise contribute more to the loss (harder to denoise).
@@ -186,9 +206,19 @@ class StreamDistillTrainer(BaseDistillTrainer):
         """
         if teacher_output.dim() == 5:
             # (B, C, T, H, W) -> compute per-frame loss
-            per_frame_loss = F.mse_loss(
-                student_output.float(), teacher_output.float(), reduction="none"
-            )
+            if self.args.loss_type == "huber":
+                per_frame_loss = F.huber_loss(
+                    student_output.float(),
+                    teacher_output.float(),
+                    reduction="none",
+                    delta=float(self.args.huber_c),
+                )
+            elif self.args.loss_type == "mse":
+                per_frame_loss = F.mse_loss(
+                    student_output.float(), teacher_output.float(), reduction="none"
+                )
+            else:
+                raise ValueError(f"Unsupported supervision loss_type={self.args.loss_type!r}")
             # Mean over C, H, W dimensions -> (B, T)
             per_frame_loss = per_frame_loss.mean(dim=(1, 3, 4))
 
@@ -202,7 +232,7 @@ class StreamDistillTrainer(BaseDistillTrainer):
             else:
                 loss = per_frame_loss.mean()
         else:
-            loss = F.mse_loss(student_output.float(), teacher_output.float())
+            loss = self.compute_supervision_loss(student_output, teacher_output)
 
         return loss
 

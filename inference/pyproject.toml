@@ -15,6 +15,8 @@ authors = [
 ]
 description = "LightX2V: Light Video Generation Inference Framework"
 readme = "README.md"
+# The shipped LightX2V code is Apache-2.0. Optional user-supplied providers may
+# have separate terms; the repository-level third-party notice is linked below.
 license = "Apache-2.0"
 requires-python = ">=3.10"
 classifiers = [
@@ -33,9 +35,9 @@ classifiers = [
 dependencies = [
     "numpy",
     "scipy",
-    "torch<=2.8.0",
-    "torchvision<=0.23.0",
-    "torchaudio<=2.8.0",
+    "torch>=2.5.1",
+    "torchvision>=0.20.1",
+    "torchaudio>=2.5.1",
     "diffusers",
     "transformers",
     "tokenizers",
@@ -49,23 +51,31 @@ dependencies = [
     "loguru",
     "qtorch",
     "ftfy",
-    "gradio",
-    "aiohttp",
     "pydantic",
     "prometheus-client",
     "gguf",
+    "requests",
+    "decord",
+    "av",
+]
+
+[project.optional-dependencies]
+app = [
+    "gradio",
+]
+server = [
+    "aiohttp",
     "fastapi",
     "uvicorn",
     "PyJWT",
-    "requests",
     "aio-pika",
     "asyncpg>=0.27.0",
     "aioboto3>=12.0.0",
     "alibabacloud_dypnsapi20170525==1.2.2",
     "redis==6.4.0",
     "tos",
-    "decord",
-    "av",
+]
+mthreads = [
     "torchada>=0.1.10",
 ]
 
@@ -73,6 +83,7 @@ dependencies = [
 Homepage = "https://github.com/ModelTC/LightX2V"
 Documentation = "https://lightx2v-en.readthedocs.io/en/latest/"
 Repository = "https://github.com/ModelTC/LightX2V"
+"WorldDistill third-party notices" = "https://github.com/Sunbeam23333/WorldDistill/blob/main/THIRD_PARTY_NOTICES"
 
 [tool.setuptools]
 include-package-data = true

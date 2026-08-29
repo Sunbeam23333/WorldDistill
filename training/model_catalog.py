@@ -180,7 +180,7 @@ _FALLBACK_MODEL_ZOO: dict[str, dict[str, Any]] = {
     ),
     "wan2.2": _spec(
         "wan_dense",
-        ["t2v", "i2v", "ti2v"],
+        ["t2v", "i2v"],
         "wan2.2",
         model_family="video",
         checkpoint_formats=["directory", "original", "diffusers", "state_dict"],
@@ -256,7 +256,7 @@ _FALLBACK_MODEL_ZOO: dict[str, dict[str, Any]] = {
         features=["audio_conditioning", "reference_speech"],
         default_configs={
             "s2v": "seko_talk/shot/stream/s2v.json",
-            "rs2v": "seko_talk/shot/rs2v/rs2v.json",
+            "rs2v": "seko_talk/shot/rs2v/main.json",
         },
     ),
     "hunyuan_video_1.5": _spec(

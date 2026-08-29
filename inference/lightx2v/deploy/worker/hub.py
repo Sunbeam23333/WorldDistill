@@ -23,6 +23,19 @@ from lightx2v.utils.set_config import set_config, set_parallel_config
 from lightx2v.utils.utils import seed_all
 
 
+def _mapping_keys(value):
+    return sorted(str(key) for key in value) if isinstance(value, dict) else []
+
+
+def _log_run_contract(params, inputs, outputs):
+    logger.info(
+        "Worker run contract: parameter keys={}, input keys={}, output keys={}",
+        _mapping_keys(params),
+        _mapping_keys(inputs),
+        _mapping_keys(outputs),
+    )
+
+
 def init_tools_preprocess():
     preprocess_path = os.path.abspath(os.path.join(lightx2v.__path__[0], "..", "tools", "preprocess"))
     assert os.path.exists(preprocess_path), f"lightx2v tools preprocess path not found: {preprocess_path}"
@@ -54,7 +67,12 @@ class BaseWorker:
 
     def init_single_model(self, args):
         config = set_config(args)
-        logger.info(f"config:\n{json.dumps(config, ensure_ascii=False, indent=4)}")
+        logger.info(
+            "Initializing model runner (class: {}, task: {}, config keys: {})",
+            config.get("model_cls", "unknown"),
+            config.get("task", "unknown"),
+            _mapping_keys(config),
+        )
         seed_all(args.seed)
         if config["parallel"]:
             set_parallel_config(config)
@@ -63,8 +81,8 @@ class BaseWorker:
         return runner, config["parallel"]
 
     def update_input_info(self, kwargs):
-        for k, v in kwargs.items():
-            setattr(self.input_info, k, v)
+        for key, value in kwargs.items():
+            setattr(self.input_info, key, value)
 
     def set_inputs(self, params):
         self.input_info.prompt = params["prompt"]
@@ -74,7 +92,7 @@ class BaseWorker:
         self.input_info.seed = params.get("seed", self.input_info.seed)
         self.input_info.audio_path = params.get("audio_path", "")
         for k, v in params.get("processed_video_paths", {}).items():
-            logger.info(f"set {k} to {v}")
+            logger.info("Set processed worker input field {}", k)
             setattr(self.input_info, k, v)
         self.input_info.last_frame_path = params.get("last_frame_path", "")
 
@@ -293,7 +311,7 @@ class BaseWorker:
             val = json.dumps(data, ensure_ascii=False).encode("utf-8")
             T = torch.frombuffer(bytearray(val), dtype=torch.uint8).to(device="cuda")
             S = torch.tensor([T.shape[0]], dtype=torch.int32).to(device="cuda")
-            logger.info(f"hub rank {self.rank} send data: {data}")
+            logger.info("Hub rank {} broadcasting data keys: {}", self.rank, _mapping_keys(data))
         else:
             S = torch.zeros(1, dtype=torch.int32, device="cuda")
 
@@ -305,7 +323,7 @@ class BaseWorker:
         if self.rank != src_rank:
             val = T.cpu().numpy().tobytes()
             data = json.loads(val.decode("utf-8"))
-            logger.info(f"hub rank {self.rank} recv data: {data}")
+            logger.info("Hub rank {} received broadcast data keys: {}", self.rank, _mapping_keys(data))
         return data
 
 
@@ -382,7 +400,7 @@ class PipelineWorker(BaseWorker):
                 tmp_image_path, output_image_path = self.prepare_output_image(params, outputs, tmp_dir, data_manager)
             else:
                 tmp_video_path, output_video_path = self.prepare_output_video(params, outputs, tmp_dir, data_manager)
-            logger.info(f"run params: {params}, {inputs}, {outputs}")
+            _log_run_contract(params, inputs, outputs)
 
             self.set_inputs(params)
             self.runner.stop_signal = False
@@ -407,7 +425,7 @@ class TextEncoderWorker(BaseWorker):
 
     @class_try_catch_async
     async def run(self, inputs, outputs, params, data_manager):
-        logger.info(f"run params: {params}, {inputs}, {outputs}")
+        _log_run_contract(params, inputs, outputs)
         input_image_path = inputs.get("input_image", "")
 
         self.set_inputs(params)
@@ -440,7 +458,7 @@ class ImageEncoderWorker(BaseWorker):
 
     @class_try_catch_async
     async def run(self, inputs, outputs, params, data_manager):
-        logger.info(f"run params: {params}, {inputs}, {outputs}")
+        _log_run_contract(params, inputs, outputs)
         self.set_inputs(params)
 
         img = await data_manager.load_image(inputs["input_image"])
@@ -465,7 +483,7 @@ class VaeEncoderWorker(BaseWorker):
 
     @class_try_catch_async
     async def run(self, inputs, outputs, params, data_manager):
-        logger.info(f"run params: {params}, {inputs}, {outputs}")
+        _log_run_contract(params, inputs, outputs)
         self.set_inputs(params)
         img = await data_manager.load_image(inputs["input_image"])
         # could change config.lat_h, lat_w, tgt_h, tgt_w
@@ -496,7 +514,7 @@ class DiTWorker(BaseWorker):
 
     @class_try_catch_async_with_thread
     async def run(self, inputs, outputs, params, data_manager):
-        logger.info(f"run params: {params}, {inputs}, {outputs}")
+        _log_run_contract(params, inputs, outputs)
         self.set_inputs(params)
 
         await self.prepare_dit_inputs(inputs, data_manager)
@@ -535,7 +553,7 @@ class VaeDecoderWorker(BaseWorker):
     async def run(self, inputs, outputs, params, data_manager):
         with tempfile.TemporaryDirectory() as tmp_dir:
             tmp_video_path, output_video_path = self.prepare_output_video(params, outputs, tmp_dir, data_manager)
-            logger.info(f"run params: {params}, {inputs}, {outputs}")
+            _log_run_contract(params, inputs, outputs)
             self.set_inputs(params)
 
             device = torch.device("cuda", self.rank)
@@ -567,7 +585,7 @@ class SegmentDiTWorker(BaseWorker):
         with tempfile.TemporaryDirectory() as tmp_dir:
             tmp_video_path, output_video_path = self.prepare_output_video(params, outputs, tmp_dir, data_manager)
             await self.prepare_input_audio(params, inputs, tmp_dir, data_manager)
-            logger.info(f"run params: {params}, {inputs}, {outputs}")
+            _log_run_contract(params, inputs, outputs)
             self.set_inputs(params)
 
             await self.prepare_dit_inputs(inputs, data_manager)

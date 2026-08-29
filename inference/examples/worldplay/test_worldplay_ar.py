@@ -1,12 +1,17 @@
 import json
 import os
+from pathlib import Path
 
 # Paths
-CONFIG_PATH = "/workspace/LightX2V/configs/worldplay/worldplay_ar_i2v_480p.json"
-MODEL_PATH = "/data/nvme1/models/hunyuan/HunyuanVideo-1.5"
-ACTION_CKPT = "/data/nvme1/models/hunyuan/HY-WorldPlay/ar_model/diffusion_pytorch_model.safetensors"
-IMAGE_PATH = "/workspace/HY-WorldPlay/assets/img/test.png"
-OUTPUT_PATH = "/workspace/LightX2V/save_results/HY-WorldPlay/"
+INFERENCE_ROOT = Path(__file__).resolve().parents[2]
+CONFIG_PATH = INFERENCE_ROOT / "configs/worldplay/worldplay_ar_i2v_480p.json"
+MODEL_PATH = os.environ["HUNYUANVIDEO15_MODEL"]
+ACTION_CKPT = os.environ["WORLDPLAY_AR_ACTION_CKPT"]
+IMAGE_PATH = os.environ["WORLDPLAY_INPUT_IMAGE"]
+OUTPUT_PATH = os.environ.get(
+    "LIGHTX2V_OUTPUT_DIR",
+    str(INFERENCE_ROOT / "save_results/HY-WorldPlay"),
+)
 
 # Input parameters
 PROMPT = "A paved pathway leads towards a stone arch bridge spanning a calm body of water. Lush green trees and foliage line the path and the far bank of the water. A traditional-style pavilion with a tiered, reddish-brown roof sits on the far shore. The water reflects the surrounding greenery and the sky. The scene is bathed in soft, natural light, creating a tranquil and serene atmosphere."

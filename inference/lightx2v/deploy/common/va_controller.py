@@ -38,7 +38,8 @@ class VAController:
     def init_base(self, config, input_info, has_vfi_model, has_vsr_model):
         if "stream_config" in input_info.__dataclass_fields__:
             self.stream_config = input_info.stream_config
-            logger.info(f"VAController init base with stream config: {self.stream_config}")
+            stream_keys = sorted(self.stream_config) if isinstance(self.stream_config, dict) else []
+            logger.info("VAController initialized with stream config keys: {}", stream_keys)
         self.audio_path = input_info.audio_path
         self.output_video_path = input_info.save_result_path
         if isinstance(self.output_video_path, dict):
@@ -84,7 +85,7 @@ class VAController:
     def init_recorder(self):
         if not self.output_video_path or self.rank != self.target_recorder_rank:
             return
-        logger.info(f"Rank {self.rank} init recorder with: {self.output_video_path}")
+        logger.info("Rank {} initializing the configured video recorder", self.rank)
         whip_shared_path = os.getenv("WHIP_SHARED_LIB", None)
         if whip_shared_path and self.output_video_path.startswith("http"):
             from lightx2v.deploy.common.va_recorder_x264 import X264VARecorder

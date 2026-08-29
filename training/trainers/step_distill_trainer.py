@@ -16,6 +16,8 @@ References:
 """
 
 import copy
+from contextlib import ExitStack
+import os
 from typing import Any, Dict, List
 
 import torch
@@ -25,6 +27,7 @@ import torch.nn.functional as F
 from loguru import logger
 
 from training.trainers.base_distill_trainer import BaseDistillTrainer
+from training.utils.checkpoint_io import load_model_state_file
 
 
 class StepDistillTrainer(BaseDistillTrainer):
@@ -47,21 +50,26 @@ class StepDistillTrainer(BaseDistillTrainer):
         self.student_low = None
         self._dual_optimizer = None
         if self.use_dual_model:
+            if self.parallel_mode != "ddp":
+                raise ValueError(
+                    "Dual high/low-noise students currently support serial/DDP training only; "
+                    "FSDP and DeepSpeed would shard only the high-noise model."
+                )
+            if self.args.gradient_accumulation_steps != 1:
+                raise ValueError(
+                    "Dual high/low-noise DDP currently requires gradient_accumulation_steps=1; "
+                    "a branch used only inside no_sync microbatches would otherwise update with "
+                    "unsynchronized gradients."
+                )
             self.student_high = self.student_model
             # Load or clone the low-noise student
             student_low_path = getattr(self.args, "student_low_model", None)
             if student_low_path and isinstance(student_low_path, str):
-                import os
-                if os.path.exists(student_low_path):
-                    self.student_low = copy.deepcopy(self._unwrap_model(self.student_model))
-                    state = torch.load(student_low_path, map_location=self.device, weights_only=True)
-                    self.student_low.load_state_dict(state, strict=False)
-                    self.student_low.to(self.device)
-                    logger.info(f"Loaded low-noise student from {student_low_path}")
-                else:
-                    self.student_low = copy.deepcopy(self._unwrap_model(self.student_model))
-                    self.student_low.to(self.device)
-                    logger.info("Cloned student as low-noise model (path not found)")
+                self.student_low = copy.deepcopy(self._unwrap_model(self.student_model))
+                state = load_model_state_file(student_low_path, map_location=self.device)
+                self.student_low.load_state_dict(state, strict=True)
+                self.student_low.to(self.device)
+                logger.info(f"Loaded low-noise student from {student_low_path}")
             else:
                 self.student_low = copy.deepcopy(self._unwrap_model(self.student_model))
                 self.student_low.to(self.device)
@@ -80,22 +88,31 @@ class StepDistillTrainer(BaseDistillTrainer):
     def _build_dual_optimizer(self):
         """Build optimizer that covers both high and low noise student params."""
         from training.utils.optimizers import build_optimizer
-        # Combine parameters from both models
-        high_params = list(self._unwrap_model(self.student_high).parameters())
-        low_params = list(self.student_low.parameters())
+        from training.utils.schedulers import build_lr_scheduler
 
-        # Replace the original optimizer with one that covers both
-        param_groups = [
-            {"params": [p for p in high_params if p.requires_grad], "lr": self.args.learning_rate, "name": "high"},
-            {"params": [p for p in low_params if p.requires_grad], "lr": self.args.learning_rate, "name": "low"},
-        ]
-        self.optimizer = torch.optim.AdamW(
-            param_groups,
+        high_model = self._unwrap_model(self.student_model)
+        combined_students = nn.ModuleList([high_model, self.student_low])
+        self.optimizer = build_optimizer(
+            combined_students,
+            optimizer_type=self.args.optimizer,
             lr=self.args.learning_rate,
-            betas=(self.args.adam_beta1, self.args.adam_beta2),
-            eps=self.args.adam_epsilon,
             weight_decay=self.args.weight_decay,
+            adam_beta1=self.args.adam_beta1,
+            adam_beta2=self.args.adam_beta2,
+            adam_epsilon=self.args.adam_epsilon,
+            muon_momentum=getattr(self.args, "muon_momentum", 0.95),
+            muon_nesterov=getattr(self.args, "muon_nesterov", True),
+            muon_ns_steps=getattr(self.args, "muon_ns_steps", 5),
         )
+        self.lr_scheduler = build_lr_scheduler(
+            self.optimizer,
+            scheduler_type=self.args.lr_scheduler,
+            warmup_steps=self.args.warmup_steps,
+            total_steps=self.args.max_train_steps,
+            min_lr_ratio=self.args.lr_min_ratio,
+        )
+        high_params = list(high_model.parameters())
+        low_params = list(self.student_low.parameters())
         logger.info(
             f"Dual-model optimizer: high={sum(p.numel() for p in high_params if p.requires_grad)/1e6:.1f}M, "
             f"low={sum(p.numel() for p in low_params if p.requires_grad)/1e6:.1f}M"
@@ -107,9 +124,32 @@ class StepDistillTrainer(BaseDistillTrainer):
         if self.use_dual_model and self.is_distributed:
             if not isinstance(self.student_low, nn.parallel.DistributedDataParallel):
                 self.student_low = nn.parallel.DistributedDataParallel(
-                    self.student_low, device_ids=[self.rank], find_unused_parameters=False,
+                    self.student_low,
+                    device_ids=[int(os.environ.get("LOCAL_RANK", 0))],
+                    find_unused_parameters=False,
                 )
         super().train()
+
+    def _get_no_sync_context(self):
+        """Disable gradient synchronization for both DDP students on accumulation steps."""
+
+        stack = ExitStack()
+        for model in (self.student_model, self.student_low):
+            if model is not None and hasattr(model, "no_sync"):
+                stack.enter_context(model.no_sync())
+        return stack
+
+    def _trainable_parameters(self):
+        """Include both high- and low-noise students in norm/clipping."""
+
+        seen = set()
+        for model in (self.student_model, self.student_low):
+            if model is None:
+                continue
+            for parameter in self._unwrap_model(model).parameters():
+                if id(parameter) not in seen:
+                    seen.add(id(parameter))
+                    yield parameter
 
     def _precompute_sigmas(self):
         """Pre-compute sigma schedule for the fixed distillation timesteps."""
@@ -125,12 +165,21 @@ class StepDistillTrainer(BaseDistillTrainer):
             idx = max(0, min(self.num_train_timesteps - 1, self.num_train_timesteps - s))
             step_indices.append(idx)
 
-        self.distill_sigmas = sigmas[step_indices]
+        self.distill_sigmas = sigmas[step_indices].to(self.device)
         self.distill_timesteps = self.distill_sigmas * self.num_train_timesteps
 
     def _sample_timesteps(self, batch_size: int) -> torch.Tensor:
         """Sample from the fixed distillation timesteps instead of uniform."""
-        indices = torch.randint(0, self.num_distill_steps, (batch_size,))
+        indices = torch.randint(
+            0,
+            self.num_distill_steps,
+            (batch_size,),
+            device=self.device,
+        )
+        if self.use_dual_model and dist.is_available() and dist.is_initialized():
+            # Conditional DDP branches must match across ranks. Otherwise one
+            # rank can enter the high-noise reducer while another skips it.
+            dist.broadcast(indices, src=0)
         timesteps = self.distill_timesteps[indices]
         return timesteps.to(self.device)
 
@@ -190,7 +239,7 @@ class StepDistillTrainer(BaseDistillTrainer):
                 noisy_latents[h_idx],
                 timesteps[h_idx],
             )
-            h_output = self.run_student(h_input, h_batch, model=self.student_high, tag="student_high")
+            h_output = self.run_student(h_input, h_batch, model=self.student_model, tag="student_high")
             h_mask = h_batch.get("loss_mask") if isinstance(h_batch, dict) else None
             h_loss = self.compute_supervision_loss(h_output, teacher_output[h_idx].detach(), mask=h_mask)
             total_loss = total_loss + h_loss * h_idx.shape[0]
@@ -257,12 +306,23 @@ class StepDistillTrainer(BaseDistillTrainer):
         super().save_checkpoint(step, output_dir)
         if self.use_dual_model and self.student_low is not None:
             import os
+
             ckpt_dir = os.path.join(output_dir, f"checkpoint-{step}")
-            low_state = (
-                self.student_low.module.state_dict()
-                if hasattr(self.student_low, "module") else self.student_low.state_dict()
+            low_path = os.path.join(ckpt_dir, "student_low.pt")
+
+            def _low_state():
+                raw_low = (
+                    self.student_low.module
+                    if hasattr(self.student_low, "module")
+                    else self.student_low
+                )
+                return raw_low.state_dict()
+
+            self._atomic_save_rank0(
+                low_path,
+                _low_state,
+                f"Write low-noise student checkpoint {low_path}",
             )
-            torch.save(low_state, os.path.join(ckpt_dir, "student_low.pt"))
 
     def load_checkpoint(self, path: str):
         """Load checkpoint including dual model."""
@@ -271,8 +331,19 @@ class StepDistillTrainer(BaseDistillTrainer):
             import os
             ckpt_dir = path if os.path.isdir(path) else os.path.dirname(path)
             low_path = os.path.join(ckpt_dir, "student_low.pt")
-            if os.path.exists(low_path):
-                state = torch.load(low_path, map_location=self.device, weights_only=True)
+
+            state = self._load_checkpoint_file_all_ranks(
+                low_path,
+                description=f"Load low-noise student checkpoint {low_path}",
+                weights_only=True,
+            )
+
+            def _restore_low_student():
                 raw_low = self.student_low.module if hasattr(self.student_low, "module") else self.student_low
-                raw_low.load_state_dict(state)
-                logger.info("Loaded student_low from checkpoint.")
+                raw_low.load_state_dict(state, strict=True)
+
+            self._run_all_ranks_or_raise(
+                _restore_low_student,
+                f"Restore low-noise student checkpoint {low_path}",
+            )
+            logger.info("Loaded student_low from checkpoint.")

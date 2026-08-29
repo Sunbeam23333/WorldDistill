@@ -250,8 +250,7 @@ if __name__ == "__main__":
     reader = VAReader(
         RANK,
         WORLD_SIZE,
-        # "rtmp://localhost/live/test_audio",
-        "https://reverse.st-oc-01.chielo.org/10.5.64.49:8000/rtc/v1/whep/?app=live&stream=ll_test_audio&eip=10.120.114.76:8000",
+        os.environ["LIGHTX2V_TEST_STREAM_URL"],
         segment_duration=1.0,
         sample_rate=16000,
         audio_channels=1,

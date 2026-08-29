@@ -10,6 +10,7 @@ CACHE_DIR="${CACHE_DIR:-${PROJECT_ROOT}/data/cache/fewstep}"
 TEACHER_MODEL="${TEACHER_MODEL:-${MODEL_ROOT:-${PROJECT_ROOT}/models}/Wan2.2-T2V-A14B}"
 STUDENT_MODEL="${STUDENT_MODEL:-}"
 NUM_GPUS="${NUM_GPUS:-8}"
+INFER_NUM_GPUS="${INFER_NUM_GPUS:-1}"
 MAX_TRAIN_STEPS="${MAX_TRAIN_STEPS:-50000}"
 OUTPUT_ROOT="${OUTPUT_ROOT:-${RESULT_ROOT:-${PROJECT_ROOT}/results}/paper/fewstep_t2v}"
 REPORT_TO="${REPORT_TO:-console,tensorboard}"
@@ -57,7 +58,7 @@ run_teacher_infer_phase() {
         --task t2v \
         --model_path "${TEACHER_MODEL}" \
         --prompt "${PROMPT}" \
-        --gpus "${NUM_GPUS}" \
+        --gpus "${INFER_NUM_GPUS}" \
         --save_path "${OUTPUT_ROOT}/teacher_samples/teacher.mp4"
 }
 
@@ -69,7 +70,7 @@ run_student_infer_phase() {
         --task t2v \
         --model_path "${MODEL_ROOT:-${PROJECT_ROOT}/models}" \
         --prompt "${PROMPT}" \
-        --gpus "${NUM_GPUS}" \
+        --gpus "${INFER_NUM_GPUS}" \
         --save_path "${OUTPUT_ROOT}/student_samples/student.mp4"
 }
 

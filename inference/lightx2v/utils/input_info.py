@@ -226,6 +226,24 @@ class I2AVInputInfo:
 
 
 @dataclass
+class GameInputInfo(I2VInputInfo):
+    """Inputs shared by interactive world-model and game rollouts.
+
+    Both the WorldPlay and Matrix-Game runners start from an image. WorldPlay
+    additionally consumes a pose/action description, while other game runners
+    may consume an action file. Keeping the superset here lets the public
+    ``game`` CLI task retain every validated/forwarded conditioning field.
+    """
+
+    model_type: str = field(default_factory=str)
+    chunk_latent_frames: int = field(default_factory=int)
+    # Computed WorldPlay conditioning tensors (populated during preprocessing).
+    viewmats: torch.Tensor = field(default_factory=lambda: None)
+    Ks: torch.Tensor = field(default_factory=lambda: None)
+    action: torch.Tensor = field(default_factory=lambda: None)
+
+
+@dataclass
 class WorldPlayI2VInputInfo:
     """Input info for WorldPlay model (image-to-video with action/pose conditioning)."""
 
@@ -299,6 +317,8 @@ def init_empty_input_info(task):
         return T2AVInputInfo()
     elif task == "i2av":
         return I2AVInputInfo()
+    elif task == "game":
+        return GameInputInfo()
     elif task == "worldplay_i2v":
         return WorldPlayI2VInputInfo()
     elif task == "worldplay_t2v":

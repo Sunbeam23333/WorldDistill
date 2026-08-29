@@ -27,7 +27,6 @@ import math
 from typing import Any, Dict, List, Optional
 
 import torch
-import torch.nn.functional as F
 from loguru import logger
 
 from training.trainers.base_distill_trainer import BaseDistillTrainer
@@ -50,7 +49,6 @@ class ContextForcingTrainer(BaseDistillTrainer):
         self.temporal_context_size = self.args.temporal_context_size
         self.curriculum_training = self.args.curriculum_training
         self.curriculum_stages = self.args.curriculum_stages
-        self.generator_update_interval = self.args.generator_update_interval
         self.use_teacher_context = getattr(self.args, "use_teacher_context", True)
 
         # Track curriculum stage
@@ -76,12 +74,26 @@ class ContextForcingTrainer(BaseDistillTrainer):
             memory_frames=self.memory_frames,
         )
 
+    def _select_memory_frame_indices(
+        self,
+        total_frames: int,
+        current_chunk_idx: int,
+        chunk_size: int,
+        device: torch.device,
+    ) -> Optional[torch.Tensor]:
+        return self.select_runtime_memory_indices(
+            total_frames=total_frames,
+            current_chunk_idx=current_chunk_idx,
+            chunk_size=chunk_size,
+            memory_frames=self.memory_frames,
+            device=device,
+        )
+
     def _generate_teacher_context(
         self,
         batch: Dict[str, Any],
         latents: torch.Tensor,
-        chunk_start: int,
-        chunk_end: int,
+        frame_indices: torch.Tensor,
     ) -> torch.Tensor:
         """Generate context frames using the teacher model.
 
@@ -92,17 +104,26 @@ class ContextForcingTrainer(BaseDistillTrainer):
         Args:
             batch: Full batch dict.
             latents: Ground truth latents (B, C, T, H, W).
-            chunk_start: Start frame index of context.
-            chunk_end: End frame index of context (exclusive).
+            frame_indices: Chronological context indices selected by the active
+                memory policy. They may be sparse.
 
         Returns:
             Teacher-denoised context frames (B, C, T_ctx, H, W).
         """
-        if chunk_start >= chunk_end:
+        if frame_indices is None or frame_indices.numel() == 0:
             return None
 
-        context_latents = latents[:, :, chunk_start:chunk_end]
+        frame_indices = frame_indices.to(device=latents.device, dtype=torch.long)
+        context_latents = latents.index_select(2, frame_indices)
+        context_batch = self._slice_temporal_conditions(
+            batch,
+            frame_indices=frame_indices,
+            total_frames=latents.shape[2],
+        )
         bs = context_latents.shape[0]
+        selected_indices = [int(index) for index in frame_indices.detach().cpu().tolist()]
+        chunk_start = selected_indices[0]
+        chunk_end = selected_indices[-1] + 1
 
         # Add moderate noise to context (not fully noisy)
         noise_level = 0.3  # 30% noise — enough to simulate imperfect generation
@@ -111,10 +132,10 @@ class ContextForcingTrainer(BaseDistillTrainer):
 
         def _produce_teacher_context() -> torch.Tensor:
             t_ctx = torch.full((bs,), noise_level * self.num_train_timesteps, device=self.device)
-            teacher_input = self.prepare_teacher_input(batch, noisy_context, t_ctx)
+            teacher_input = self.prepare_teacher_input(context_batch, noisy_context, t_ctx)
             teacher_v = self.run_teacher(
                 teacher_input,
-                batch,
+                context_batch,
                 cache_namespace="teacher_context_forward",
                 cache_extra={"chunk_start": chunk_start, "chunk_end": chunk_end, "timesteps": t_ctx},
                 allow_cache=False,
@@ -124,13 +145,25 @@ class ContextForcingTrainer(BaseDistillTrainer):
 
         if self.runtime is not None and hasattr(self.runtime, "get_or_create_teacher_context"):
             return self.runtime.get_or_create_teacher_context(
-                batch=batch,
+                batch=context_batch,
                 global_step=self.global_step,
                 chunk_start=chunk_start,
                 chunk_end=chunk_end,
+                frame_indices=selected_indices,
                 producer=_produce_teacher_context,
             )
         return _produce_teacher_context()
+
+    @staticmethod
+    def _chunk_ranges(num_frames: int, chunk_size: int) -> List[tuple[int, int]]:
+        """Return loss-bearing chunks without dropping a non-divisible tail."""
+
+        if num_frames <= 0 or chunk_size <= 0:
+            return []
+        return [
+            (start, min(start + chunk_size, num_frames))
+            for start in range(0, num_frames, chunk_size)
+        ]
 
     def _build_context_input(
         self,
@@ -199,25 +232,30 @@ class ContextForcingTrainer(BaseDistillTrainer):
         # Determine chunk size based on curriculum
         effective_frames = min(self.current_num_frames, total_frames) if self.curriculum_training else total_frames
         chunk_size = min(self.temporal_context_size, effective_frames)
-        num_chunks = max(1, effective_frames // chunk_size)
+        chunk_ranges = self._chunk_ranges(effective_frames, chunk_size)
 
         total_loss = torch.tensor(0.0, device=self.device)
         num_loss_chunks = 0
 
-        for chunk_idx in range(num_chunks):
-            start = chunk_idx * chunk_size
-            end = min(start + chunk_size, total_frames)
+        for chunk_idx, (start, end) in enumerate(chunk_ranges):
             num_target = end - start
             target_frames = latents[:, :, start:end]
 
             # Select memory context
-            if self.use_teacher_context and chunk_idx > 0:
+            memory_indices = self._select_memory_frame_indices(
+                total_frames=effective_frames,
+                current_chunk_idx=chunk_idx,
+                chunk_size=chunk_size,
+                device=latents.device,
+            )
+            if self.use_teacher_context and memory_indices is not None:
                 # Teacher generates context (bridges train-test gap)
-                mem_start = max(0, start - self.memory_frames)
-                memory_context = self._generate_teacher_context(batch, latents, mem_start, start)
+                memory_context = self._generate_teacher_context(batch, latents, memory_indices)
+            elif memory_indices is not None:
+                # GT context uses the exact same dense/sparse selection policy.
+                memory_context = latents.index_select(2, memory_indices)
             else:
-                # GT context (simpler, teacher forcing)
-                memory_context = self._select_memory_frames(latents, chunk_idx, chunk_size)
+                memory_context = None
 
             num_memory = memory_context.shape[2] if memory_context is not None else 0
 
@@ -235,12 +273,24 @@ class ContextForcingTrainer(BaseDistillTrainer):
             loss_mask = self._build_context_mask(num_memory, num_target, bs)
             frame_timesteps = self._build_context_timesteps(num_memory, timesteps, bs, num_target)
 
-            teacher_input = self.prepare_teacher_input(batch, model_input, frame_timesteps)
-            student_input = self.prepare_student_input(batch, model_input, frame_timesteps)
+            target_indices = torch.arange(start, end, device=latents.device, dtype=torch.long)
+            packed_indices = (
+                torch.cat([memory_indices, target_indices])
+                if memory_indices is not None
+                else target_indices
+            )
+            chunk_batch = self._slice_temporal_conditions(
+                batch,
+                frame_indices=packed_indices,
+                total_frames=total_frames,
+            )
+
+            teacher_input = self.prepare_teacher_input(chunk_batch, model_input, frame_timesteps)
+            student_input = self.prepare_student_input(chunk_batch, model_input, frame_timesteps)
             teacher_output, student_output = self._run_teacher_student_pair(
                 teacher_input=teacher_input,
                 student_input=student_input,
-                batch=batch,
+                batch=chunk_batch,
                 cache_extra={"mode": "context_chunk", "chunk_idx": chunk_idx, "timesteps": frame_timesteps},
             )
 
@@ -262,7 +312,7 @@ class ContextForcingTrainer(BaseDistillTrainer):
         timesteps: torch.Tensor,
     ) -> torch.Tensor:
         """Not used directly; _forward_and_loss handles full logic."""
-        return F.mse_loss(student_output.float(), teacher_output.float())
+        return self.compute_supervision_loss(student_output, teacher_output)
 
     def prepare_teacher_input(
         self,
@@ -281,8 +331,12 @@ class ContextForcingTrainer(BaseDistillTrainer):
         if not self.curriculum_training:
             return
 
-        for stage_idx, stage_frames in enumerate(self.curriculum_stages):
-            stage_boundary = (stage_idx + 1) * (self.args.max_train_steps // len(self.curriculum_stages))
+        num_stages = len(self.curriculum_stages)
+        for stage_idx, stage_frames in enumerate(self.curriculum_stages[1:], start=1):
+            stage_boundary = max(
+                1,
+                math.ceil(stage_idx * self.args.max_train_steps / num_stages),
+            )
             if (
                 self.global_step >= stage_boundary
                 and stage_idx > self.current_curriculum_stage
@@ -295,3 +349,77 @@ class ContextForcingTrainer(BaseDistillTrainer):
                     f"Curriculum advanced to stage {stage_idx}: "
                     f"num_frames={stage_frames}"
                 )
+
+    def save_checkpoint(self, step: int, output_dir: str):
+        """Save curriculum progress alongside the base trainer state."""
+        import os
+
+        super().save_checkpoint(step, output_dir)
+        ckpt_dir = os.path.join(output_dir, f"checkpoint-{step}")
+        context_path = os.path.join(ckpt_dir, "context_state.pt")
+        self._atomic_save_rank0(
+            context_path,
+            lambda: {
+                "current_curriculum_stage": self.current_curriculum_stage,
+                "current_num_frames": self.current_num_frames,
+                "curriculum_advanced": sorted(self._curriculum_advanced),
+            },
+            f"Write context-forcing checkpoint {context_path}",
+        )
+
+    def load_checkpoint(self, path: str):
+        """Restore curriculum progress strictly on every rank."""
+        import os
+
+        super().load_checkpoint(path)
+        ckpt_dir = path if os.path.isdir(path) else os.path.dirname(path)
+        context_path = os.path.join(ckpt_dir, "context_state.pt")
+        state = self._load_checkpoint_file_all_ranks(
+            context_path,
+            description=f"Load context-forcing checkpoint {context_path}",
+            weights_only=False,
+        )
+
+        def _restore_context_state():
+            if not isinstance(state, dict):
+                raise TypeError(
+                    f"Expected context-forcing checkpoint dict, got {type(state).__name__}"
+                )
+            required = {
+                "current_curriculum_stage",
+                "current_num_frames",
+                "curriculum_advanced",
+            }
+            missing = sorted(required.difference(state))
+            if missing:
+                raise KeyError(f"Context-forcing checkpoint is missing required keys: {missing}")
+
+            stage = int(state["current_curriculum_stage"])
+            if self.curriculum_training:
+                if stage < 0 or stage >= len(self.curriculum_stages):
+                    raise ValueError(
+                        f"Context checkpoint stage={stage} is outside the configured "
+                        f"range [0, {len(self.curriculum_stages) - 1}]"
+                    )
+                expected_frames = int(self.curriculum_stages[stage])
+            else:
+                if stage != 0:
+                    raise ValueError("A disabled curriculum must resume at stage 0")
+                expected_frames = int(self.args.num_frames)
+            if int(state["current_num_frames"]) != expected_frames:
+                raise ValueError("Context checkpoint frame curriculum does not match config")
+
+            advanced = {int(value) for value in state["curriculum_advanced"]}
+            if any(value < 0 or value >= len(self.curriculum_stages) for value in advanced):
+                raise ValueError("Context checkpoint contains an invalid advanced stage")
+            self.current_curriculum_stage = stage
+            self.current_num_frames = expected_frames
+            self._curriculum_advanced = advanced
+
+        self._run_all_ranks_or_raise(
+            _restore_context_state,
+            f"Restore context-forcing checkpoint {context_path}",
+        )
+        logger.info(
+            f"Context-forcing curriculum restored at stage {self.current_curriculum_stage}."
+        )

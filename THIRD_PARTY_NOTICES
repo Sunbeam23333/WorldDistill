@@ -1,0 +1,18 @@
+WorldDistill third-party notices
+================================
+
+Optional Tencent HY-WorldPlay integration
+-----------------------------------------
+
+WorldDistill does not bundle Tencent HY-WorldPlay source code or model weights.
+Its Apache-licensed provider interface can load a user-supplied HY-WorldPlay
+integration. Users who obtain or enable that optional integration must review
+and comply with the Tencent HY-WorldPlay Community License Agreement, including
+its Territory, distribution, use, and commercial terms. A verbatim copy is
+provided for reference at:
+
+    third_party/licenses/TENCENT_HY_WORLDPLAY_COMMUNITY_LICENSE.txt
+
+The Tencent HY-WorldPlay notice is also reproduced in the repository-root
+NOTICE file. This summary does not replace or modify the license agreement and
+does not grant any rights to Tencent HY-WorldPlay materials.

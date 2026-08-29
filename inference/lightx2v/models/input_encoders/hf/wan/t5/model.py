@@ -1,0 +1,894 @@
+# Copyright 2024-2025 The Alibaba Wan Team Authors. All rights reserved.
+import gc
+import math
+import os
+import sys
+from pathlib import Path
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from loguru import logger
+
+current_dir = Path(__file__).resolve().parent
+project_root = current_dir.parent.parent.parent.parent.parent.parent
+if str(project_root) not in sys.path:
+    sys.path.insert(0, str(project_root))
+
+from lightx2v.common.modules.weight_module import WeightModule, WeightModuleList  # noqa E402
+from lightx2v.common.offload.manager import WeightAsyncStreamManager  # noqa E402
+from lightx2v.common.ops import *  # noqa E402
+from lightx2v.models.input_encoders.hf.q_linear import (  # noqa E402
+    Q8FQuantLinearFp8,  # noqa E402
+    Q8FQuantLinearInt8,  # noqa E402
+    SglQuantLinearFp8,  # noqa E402
+    TorchaoQuantLinearInt8,  # noqa E402
+    TorchaoQuantLinearFp8,  # noqa E402
+    VllmQuantLinearInt8,  # noqa E402,
+    VllmQuantLinearFp8,  # noqa E402
+    TritonQuantLinearInt8,  # noqa E402,
+    TritonQuantLinearFp8,  # noqa E402
+)
+from lightx2v_platform.ops.mm.cambricon_mlu.q_linear import MluQuantLinearInt8  # noqa E402
+from lightx2v_platform.ops.mm.ascend_npu.npu_q_linear import NpuQuantLinearInt8  # noqa E402
+from lightx2v.models.input_encoders.hf.wan.t5.tokenizer import HuggingfaceTokenizer  # noqa E402
+from lightx2v.utils.envs import *  # noqa E402
+from lightx2v.utils.registry_factory import (  # noqa E402
+    EMBEDDING_WEIGHT_REGISTER,  # noqa E402
+    MM_WEIGHT_REGISTER,  # noqa E402
+    RMS_WEIGHT_REGISTER,  # noqa E402
+)
+from lightx2v.utils.utils import load_weights  # noqa E402
+from lightx2v_platform.base.global_var import AI_DEVICE  # noqa E402
+
+__all__ = [
+    "T5Model",
+    "T5Encoder",
+    "T5Decoder",
+    "T5EncoderModel",
+]
+
+
+class T5OffloadBlocksWeights(WeightModule):
+    def __init__(self, block_nums, mm_type, lazy_load=False, lazy_load_path=None):
+        super().__init__()
+        self.block_nums = block_nums
+        self.offload_block_buffers = WeightModuleList(
+            [T5OffloadSelfAttention(i, mm_type, create_cuda_buffer=True, create_cpu_buffer=False, lazy_load=lazy_load, lazy_load_path=lazy_load_path) for i in range(1)]
+        )
+        if lazy_load:
+            self.offload_block_cpu_buffers = WeightModuleList(
+                [T5OffloadSelfAttention(i, mm_type, create_cuda_buffer=False, create_cpu_buffer=True, lazy_load=lazy_load, lazy_load_path=lazy_load_path) for i in range(1)]
+            )
+            self.add_module("offload_block_cpu_buffers", self.offload_block_cpu_buffers)
+        self.blocks = WeightModuleList(
+            [T5OffloadSelfAttention(i, mm_type, create_cpu_buffer=False, create_cuda_buffer=False, lazy_load=lazy_load, lazy_load_path=lazy_load_path) for i in range(block_nums)]
+        )
+        self.add_module("offload_block_buffers", self.offload_block_buffers)
+        self.add_module("blocks", self.blocks)
+
+
+class T5OffloadSelfAttention(WeightModule):
+    def __init__(self, block_index, mm_type, block_prefix="blocks", create_cuda_buffer=False, create_cpu_buffer=False, lazy_load=False, lazy_load_path=None):
+        super().__init__()
+        self.block_index = block_index
+        if mm_type is None:
+            mm_type = "Default"
+        self.mm_type = mm_type
+        self.add_module(
+            "norm1",
+            RMS_WEIGHT_REGISTER["sgl-kernel"](f"{block_prefix}.{self.block_index}.norm1.weight", create_cuda_buffer, create_cpu_buffer, lazy_load, lazy_load_path),
+        )
+        self.add_module(
+            "norm2",
+            RMS_WEIGHT_REGISTER["sgl-kernel"](f"{block_prefix}.{self.block_index}.norm2.weight", create_cuda_buffer, create_cpu_buffer, lazy_load, lazy_load_path),
+        )
+        self.add_module(
+            "pos_embedding",
+            EMBEDDING_WEIGHT_REGISTER["Default"](f"{block_prefix}.{self.block_index}.pos_embedding.embedding.weight", create_cuda_buffer, create_cpu_buffer, lazy_load, lazy_load_path),
+        )
+
+        self.compute_phases = WeightModuleList(
+            [
+                T5OffloadAttention(block_index, block_prefix, mm_type, create_cuda_buffer, create_cpu_buffer, lazy_load, lazy_load_path),
+                T5OffloadFeedForward(block_index, block_prefix, mm_type, create_cuda_buffer, create_cpu_buffer, lazy_load, lazy_load_path),
+            ]
+        )
+        self.add_module("compute_phases", self.compute_phases)
+
+
+class T5OffloadAttention(WeightModule):
+    def __init__(self, block_index, block_prefix, mm_type, create_cuda_buffer=False, create_cpu_buffer=False, lazy_load=False, lazy_load_path=None):
+        super().__init__()
+        self.block_index = block_index
+        self.mm_type = mm_type
+        self.add_module(
+            "attn_q",
+            MM_WEIGHT_REGISTER[self.mm_type](f"{block_prefix}.{self.block_index}.attn.q.weight", None, create_cuda_buffer, create_cpu_buffer, lazy_load, lazy_load_path),
+        )
+        self.add_module(
+            "attn_k",
+            MM_WEIGHT_REGISTER[self.mm_type](f"{block_prefix}.{self.block_index}.attn.k.weight", None, create_cuda_buffer, create_cpu_buffer, lazy_load, lazy_load_path),
+        )
+        self.add_module(
+            "attn_v",
+            MM_WEIGHT_REGISTER[self.mm_type](f"{block_prefix}.{self.block_index}.attn.v.weight", None, create_cuda_buffer, create_cpu_buffer, lazy_load, lazy_load_path),
+        )
+        self.add_module(
+            "attn_o",
+            MM_WEIGHT_REGISTER[self.mm_type](f"{block_prefix}.{self.block_index}.attn.o.weight", None, create_cuda_buffer, create_cpu_buffer, lazy_load, lazy_load_path),
+        )
+
+
+class T5OffloadFeedForward(WeightModule):
+    def __init__(self, block_index, block_prefix, mm_type, create_cuda_buffer=False, create_cpu_buffer=False, lazy_load=False, lazy_load_path=None):
+        super().__init__()
+        self.block_index = block_index
+        self.mm_type = mm_type
+
+        self.add_module(
+            "ffn_fc1",
+            MM_WEIGHT_REGISTER[self.mm_type](f"{block_prefix}.{self.block_index}.ffn.fc1.weight", None, create_cuda_buffer, create_cpu_buffer, lazy_load, lazy_load_path),
+        )
+        self.add_module(
+            "ffn_fc2",
+            MM_WEIGHT_REGISTER[self.mm_type](f"{block_prefix}.{self.block_index}.ffn.fc2.weight", None, create_cuda_buffer, create_cpu_buffer, lazy_load, lazy_load_path),
+        )
+        self.add_module(
+            "ffn_gate_0",
+            MM_WEIGHT_REGISTER[self.mm_type](f"{block_prefix}.{self.block_index}.ffn.gate.0.weight", None, create_cuda_buffer, create_cpu_buffer, lazy_load, lazy_load_path),
+        )
+        self.gelu = GELU()
+
+
+def fp16_clamp(x):
+    if x.dtype == torch.float16 and torch.isinf(x).any():
+        clamp = torch.finfo(x.dtype).max - 1000
+        x = torch.clamp(x, min=-clamp, max=clamp)
+    return x
+
+
+def init_weights(m):
+    if isinstance(m, T5LayerNorm):
+        nn.init.ones_(m.weight)
+    elif isinstance(m, T5Model):
+        nn.init.normal_(m.token_embedding.weight, std=1.0)
+    elif isinstance(m, T5FeedForward):
+        nn.init.normal_(m.gate[0].weight, std=m.dim**-0.5)
+        nn.init.normal_(m.fc1.weight, std=m.dim**-0.5)
+        nn.init.normal_(m.fc2.weight, std=m.dim_ffn**-0.5)
+    elif isinstance(m, T5Attention):
+        nn.init.normal_(m.q.weight, std=(m.dim * m.dim_attn) ** -0.5)
+        nn.init.normal_(m.k.weight, std=m.dim**-0.5)
+        nn.init.normal_(m.v.weight, std=m.dim**-0.5)
+        nn.init.normal_(m.o.weight, std=(m.num_heads * m.dim_attn) ** -0.5)
+    elif isinstance(m, T5RelativeEmbedding):
+        nn.init.normal_(m.embedding.weight, std=(2 * m.num_buckets * m.num_heads) ** -0.5)
+
+
+class GELU(nn.Module):
+    def forward(self, x):
+        return 0.5 * x * (1.0 + torch.tanh(math.sqrt(2.0 / math.pi) * (x + 0.044715 * torch.pow(x, 3.0))))
+
+
+class T5LayerNorm(nn.Module):
+    def __init__(self, dim, eps=1e-6, dtype=torch.float16):
+        super(T5LayerNorm, self).__init__()
+        self.dim = dim
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(dim, dtype=dtype))
+
+    def forward(self, x):
+        x = x * torch.rsqrt(x.float().pow(2).mean(dim=-1, keepdim=True) + self.eps)
+        if self.weight.dtype in [torch.float16, torch.bfloat16]:
+            x = x.type_as(self.weight)
+        return self.weight * x
+
+
+class T5Attention(nn.Module):
+    def __init__(
+        self,
+        dim,
+        dim_attn,
+        num_heads,
+        dropout=0.1,
+        quantized=False,
+        quant_scheme=None,
+        dtype=torch.bfloat16,
+    ):
+        assert dim_attn % num_heads == 0
+        super(T5Attention, self).__init__()
+        self.dim = dim
+        self.dim_attn = dim_attn
+        self.num_heads = num_heads
+        self.head_dim = dim_attn // num_heads
+
+        if quantized:
+            if quant_scheme in ["int8", "int8-vllm"]:
+                linear_cls = VllmQuantLinearInt8
+            elif quant_scheme in ["fp8", "fp8-sgl"]:
+                linear_cls = SglQuantLinearFp8
+            elif quant_scheme == "fp8-vllm":
+                linear_cls = VllmQuantLinearFp8
+            elif quant_scheme == "int8-torchao":
+                linear_cls = TorchaoQuantLinearInt8
+            elif quant_scheme == "fp8-torchao":
+                linear_cls = TorchaoQuantLinearFp8
+            elif quant_scheme == "int8-q8f":
+                linear_cls = Q8FQuantLinearInt8
+            elif quant_scheme == "fp8-q8f":
+                linear_cls = Q8FQuantLinearFp8
+            elif quant_scheme == "int8-triton":
+                linear_cls = TritonQuantLinearInt8
+            elif quant_scheme == "fp8-triton":
+                linear_cls = TritonQuantLinearFp8
+            elif quant_scheme == "int8-tmo":
+                linear_cls = MluQuantLinearInt8
+            elif quant_scheme == "int8-npu":
+                linear_cls = NpuQuantLinearInt8
+            else:
+                NotImplementedError(f"Unsupported T5 quant scheme: {quant_scheme}")
+        else:
+            linear_cls = nn.Linear
+
+        # layers
+        self.q = linear_cls(dim, dim_attn, bias=False, dtype=dtype)
+        self.k = linear_cls(dim, dim_attn, bias=False, dtype=dtype)
+        self.v = linear_cls(dim, dim_attn, bias=False, dtype=dtype)
+        self.o = linear_cls(dim_attn, dim, bias=False, dtype=dtype)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x, context=None, mask=None, pos_bias=None):
+        """
+        x:          [B, L1, C].
+        context:    [B, L2, C] or None.
+        mask:       [B, L2] or [B, L1, L2] or None.
+        """
+        # check inputs
+        context = x if context is None else context
+        b, n, c = x.size(0), self.num_heads, self.head_dim
+
+        # compute query, key, value
+        q = self.q(x).view(b, -1, n, c)
+        k = self.k(context).view(b, -1, n, c)
+        v = self.v(context).view(b, -1, n, c)
+
+        # attention bias
+        attn_bias = x.new_zeros(b, n, q.size(1), k.size(1))
+        if pos_bias is not None:
+            attn_bias += pos_bias
+        if mask is not None:
+            assert mask.ndim in [2, 3]
+            mask = mask.view(b, 1, 1, -1) if mask.ndim == 2 else mask.unsqueeze(1)
+            attn_bias.masked_fill_(mask == 0, torch.finfo(x.dtype).min)
+
+        # compute attention (T5 does not use scaling)
+        attn = torch.einsum("binc,bjnc->bnij", q, k) + attn_bias
+        attn = F.softmax(attn.float(), dim=-1).type_as(attn)
+        x = torch.einsum("bnij,bjnc->binc", attn, v)
+        x = x.reshape(b, -1, n * c)
+        x = self.o(x)
+
+        return x
+
+
+class T5FeedForward(nn.Module):
+    def __init__(
+        self,
+        dim,
+        dim_ffn,
+        dropout=0.1,
+        quantized=False,
+        quant_scheme=None,
+        dtype=torch.bfloat16,
+    ):
+        super(T5FeedForward, self).__init__()
+        self.dim = dim
+        self.dim_ffn = dim_ffn
+
+        if quantized:
+            if quant_scheme in ["int8", "int8-vllm"]:
+                linear_cls = VllmQuantLinearInt8
+            elif quant_scheme in ["fp8", "fp8-sgl"]:
+                linear_cls = SglQuantLinearFp8
+            elif quant_scheme == "fp8-vllm":
+                linear_cls = VllmQuantLinearFp8
+            elif quant_scheme == "int8-torchao":
+                linear_cls = TorchaoQuantLinearInt8
+            elif quant_scheme == "fp8-torchao":
+                linear_cls = TorchaoQuantLinearFp8
+            elif quant_scheme == "int8-q8f":
+                linear_cls = Q8FQuantLinearInt8
+            elif quant_scheme == "fp8-q8f":
+                linear_cls = Q8FQuantLinearFp8
+            elif quant_scheme == "int8-triton":
+                linear_cls = TritonQuantLinearInt8
+            elif quant_scheme == "fp8-triton":
+                linear_cls = TritonQuantLinearFp8
+            elif quant_scheme == "int8-tmo":
+                linear_cls = MluQuantLinearInt8
+            elif quant_scheme == "int8-npu":
+                linear_cls = NpuQuantLinearInt8
+            else:
+                NotImplementedError(f"Unsupported T5 quant scheme: {quant_scheme}")
+        else:
+            linear_cls = nn.Linear
+        # layers
+        self.gate = nn.Sequential(linear_cls(dim, dim_ffn, bias=False, dtype=dtype), GELU())
+
+        self.fc1 = linear_cls(dim, dim_ffn, bias=False, dtype=dtype)
+        self.fc2 = linear_cls(dim_ffn, dim, bias=False, dtype=dtype)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x):
+        x = self.fc1(x) * self.gate(x)
+        x = self.dropout(x)
+        x = self.fc2(x)
+        x = self.dropout(x)
+        return x
+
+
+class T5SelfAttention(nn.Module):
+    def __init__(
+        self,
+        dim,
+        dim_attn,
+        dim_ffn,
+        num_heads,
+        num_buckets,
+        shared_pos=True,
+        dropout=0.1,
+        quantized=False,
+        quant_scheme=None,
+        dtype=torch.bfloat16,
+    ):
+        super(T5SelfAttention, self).__init__()
+        self.dim = dim
+        self.dim_attn = dim_attn
+        self.dim_ffn = dim_ffn
+        self.num_heads = num_heads
+        self.num_buckets = num_buckets
+        self.shared_pos = shared_pos
+
+        # layers
+        self.norm1 = T5LayerNorm(dim, dtype=dtype)
+        self.attn = T5Attention(dim, dim_attn, num_heads, dropout, quantized, quant_scheme, dtype)
+        self.norm2 = T5LayerNorm(dim, dtype=dtype)
+        self.ffn = T5FeedForward(dim, dim_ffn, dropout, quantized, quant_scheme, dtype=dtype)
+        self.pos_embedding = None if shared_pos else T5RelativeEmbedding(num_buckets, num_heads, bidirectional=True, dtype=dtype)
+
+    def forward(self, x, mask=None, pos_bias=None):
+        e = pos_bias if self.shared_pos else self.pos_embedding(x.size(1), x.size(1))
+        x = fp16_clamp(x + self.attn(self.norm1(x), mask=mask, pos_bias=e))
+        x = fp16_clamp(x + self.ffn(self.norm2(x)))
+
+        return x
+
+
+class T5CrossAttention(nn.Module):
+    def __init__(
+        self,
+        dim,
+        dim_attn,
+        dim_ffn,
+        num_heads,
+        num_buckets,
+        shared_pos=True,
+        dropout=0.1,
+    ):
+        super(T5CrossAttention, self).__init__()
+        self.dim = dim
+        self.dim_attn = dim_attn
+        self.dim_ffn = dim_ffn
+        self.num_heads = num_heads
+        self.num_buckets = num_buckets
+        self.shared_pos = shared_pos
+
+        # layers
+        self.norm1 = T5LayerNorm(dim)
+        self.self_attn = T5Attention(dim, dim_attn, num_heads, dropout)
+        self.norm2 = T5LayerNorm(dim)
+        self.cross_attn = T5Attention(dim, dim_attn, num_heads, dropout)
+        self.norm3 = T5LayerNorm(dim)
+        self.ffn = T5FeedForward(dim, dim_ffn, dropout)
+        self.pos_embedding = None if shared_pos else T5RelativeEmbedding(num_buckets, num_heads, bidirectional=False)
+
+    def forward(self, x, mask=None, encoder_states=None, encoder_mask=None, pos_bias=None):
+        e = pos_bias if self.shared_pos else self.pos_embedding(x.size(1), x.size(1))
+        x = fp16_clamp(x + self.self_attn(self.norm1(x), mask=mask, pos_bias=e))
+        x = fp16_clamp(x + self.cross_attn(self.norm2(x), context=encoder_states, mask=encoder_mask))
+        x = fp16_clamp(x + self.ffn(self.norm3(x)))
+        return x
+
+
+class T5RelativeEmbedding(nn.Module):
+    def __init__(self, num_buckets, num_heads, bidirectional, dtype=torch.bfloat16, max_dist=128):
+        super(T5RelativeEmbedding, self).__init__()
+        self.num_buckets = num_buckets
+        self.num_heads = num_heads
+        self.bidirectional = bidirectional
+        self.max_dist = max_dist
+
+        # layers
+        self.embedding = nn.Embedding(num_buckets, num_heads, dtype=dtype)
+
+    def forward(self, lq, lk):
+        device = self.embedding.weight.device
+        # rel_pos = torch.arange(lk).unsqueeze(0).to(device) - \
+        #     torch.arange(lq).unsqueeze(1).to(device)
+        rel_pos = torch.arange(lk, device=device).unsqueeze(0) - torch.arange(lq, device=device).unsqueeze(1)
+        rel_pos = self._relative_position_bucket(rel_pos)
+
+        rel_pos_embeds = self.embedding(rel_pos)
+
+        rel_pos_embeds = rel_pos_embeds.permute(2, 0, 1).unsqueeze(0)  # [1, N, Lq, Lk]
+        return rel_pos_embeds.contiguous()
+
+    def _relative_position_bucket(self, rel_pos):
+        # preprocess
+        if self.bidirectional:
+            num_buckets = self.num_buckets // 2
+            rel_buckets = (rel_pos > 0).long() * num_buckets
+            rel_pos = torch.abs(rel_pos)
+        else:
+            num_buckets = self.num_buckets
+            rel_buckets = 0
+            rel_pos = -torch.min(rel_pos, torch.zeros_like(rel_pos))
+
+        # embeddings for small and large positions
+        max_exact = num_buckets // 2
+        rel_pos_large = max_exact + (torch.log(rel_pos.float() / max_exact) / math.log(self.max_dist / max_exact) * (num_buckets - max_exact)).long()
+        rel_pos_large = torch.min(rel_pos_large, torch.full_like(rel_pos_large, num_buckets - 1))
+        rel_buckets += torch.where(rel_pos < max_exact, rel_pos, rel_pos_large)
+        return rel_buckets
+
+
+class T5Encoder(nn.Module):
+    def __init__(
+        self,
+        dtype,
+        vocab,
+        dim,
+        dim_attn,
+        dim_ffn,
+        num_heads,
+        num_layers,
+        num_buckets,
+        shared_pos=True,
+        dropout=0.1,
+        cpu_offload=False,
+        quantized=False,
+        quant_scheme=None,
+        lazy_load=False,
+        lazy_load_path=None,
+    ):
+        super(T5Encoder, self).__init__()
+        self.cpu_offload = cpu_offload
+        self.dim = dim
+        self.dim_attn = dim_attn
+        self.dim_ffn = dim_ffn
+        self.num_heads = num_heads
+        self.num_layers = num_layers
+        self.num_buckets = num_buckets
+        self.shared_pos = shared_pos
+        self.quant_scheme = quant_scheme
+
+        # layers
+        self.token_embedding = vocab.to(dtype) if isinstance(vocab, nn.Embedding) else nn.Embedding(vocab, dim, dtype=dtype)
+        self.pos_embedding = T5RelativeEmbedding(num_buckets, num_heads, bidirectional=True, dtype=dtype) if shared_pos else None
+        self.dropout = nn.Dropout(dropout)
+
+        if cpu_offload:
+            self.offload_manager = WeightAsyncStreamManager(offload_granularity="block")
+            self.blocks_weights = T5OffloadBlocksWeights(num_layers, quant_scheme, lazy_load, lazy_load_path)
+            self.offload_manager.init_cuda_buffer(self.blocks_weights.offload_block_buffers, None)
+            if lazy_load:
+                self.offload_manager.init_cpu_buffer(self.blocks_weights.offload_block_cpu_buffers)
+            self.blocks = self.blocks_weights.blocks
+        else:
+            self.blocks = nn.ModuleList(
+                [
+                    T5SelfAttention(
+                        dim,
+                        dim_attn,
+                        dim_ffn,
+                        num_heads,
+                        num_buckets,
+                        shared_pos,
+                        dropout,
+                        quantized,
+                        quant_scheme,
+                        dtype,
+                    )
+                    for _ in range(num_layers)
+                ]
+            )
+
+        self.norm = T5LayerNorm(dim, dtype=dtype)
+
+    def forward_without_offload(self, ids, mask=None):
+        x = self.token_embedding(ids)
+        x = self.dropout(x)
+        e = self.pos_embedding(x.size(1), x.size(1)) if self.shared_pos else None
+
+        for i, block in enumerate(self.blocks):
+            x = block(x, mask, pos_bias=e)
+        x = self.norm(x)
+        x = self.dropout(x)
+        return x.to(GET_DTYPE())
+
+    def forword_attn_with_offload(self, x, attn_phase, context=None, mask=None, pos_bias=None):
+        context = x if context is None else context
+        b, n, c = x.size(0), self.num_heads, self.dim_attn // self.num_heads
+        # compute query, key, value
+        q = attn_phase.attn_q.apply(x.squeeze(0)).view(b, -1, n, c)
+        k = attn_phase.attn_k.apply(context.squeeze(0)).view(b, -1, n, c)
+        v = attn_phase.attn_v.apply(context.squeeze(0)).view(b, -1, n, c)
+        # attention bias
+        attn_bias = x.new_zeros(b, n, q.size(1), k.size(1))
+        if pos_bias is not None:
+            attn_bias += pos_bias
+        if mask is not None:
+            assert mask.ndim in [2, 3]
+            mask = mask.view(b, 1, 1, -1) if mask.ndim == 2 else mask.unsqueeze(1)
+            attn_bias.masked_fill_(mask == 0, torch.finfo(x.dtype).min)
+
+        # compute attention (T5 does not use scaling)
+        attn = torch.einsum("binc,bjnc->bnij", q, k) + attn_bias
+        attn = F.softmax(attn.float(), dim=-1).type_as(attn)
+        x = torch.einsum("bnij,bjnc->binc", attn, v)
+        x = x.reshape(b, -1, n * c)
+        x = attn_phase.attn_o.apply(x.squeeze(0)).unsqueeze(0)
+        return x
+
+    def forward_ffn_with_offload(self, x, ffn_phase):
+        x = x.squeeze(0)
+        x = ffn_phase.ffn_fc1.apply(x) * ffn_phase.gelu(ffn_phase.ffn_gate_0.apply(x))
+        x = ffn_phase.ffn_fc2.apply(x)
+        return x.unsqueeze(0)
+
+    def forward_block_with_offload(self, block, x, mask=None, pos_bias=None):
+        if self.shared_pos:
+            e = pos_bias
+        else:
+            lq, lk = x.size(1), x.size(1)
+            rel_pos = torch.arange(lk, device=AI_DEVICE).unsqueeze(0) - torch.arange(lq, device=AI_DEVICE).unsqueeze(1)
+            num_buckets = block.pos_embedding.weight.shape[0] // 2
+            rel_buckets = (rel_pos > 0).long() * num_buckets
+            rel_pos = torch.abs(rel_pos)
+            max_exact = num_buckets // 2
+            rel_pos_large = max_exact + (torch.log(rel_pos.float() / max_exact) / math.log(128 / max_exact) * (num_buckets - max_exact)).long()
+            rel_pos_large = torch.min(rel_pos_large, torch.full_like(rel_pos_large, num_buckets - 1))
+            rel_buckets += torch.where(rel_pos < max_exact, rel_pos, rel_pos_large)
+            e = block.pos_embedding.apply(rel_buckets).permute(2, 0, 1).unsqueeze(0).contiguous()
+
+        norm1_out = block.norm1.apply(x)
+        x = fp16_clamp(x + self.forword_attn_with_offload(norm1_out, block.compute_phases[0], mask=mask, pos_bias=e))
+        norm2_out = block.norm2.apply(x)
+        x = fp16_clamp(x + self.forward_ffn_with_offload(norm2_out, block.compute_phases[1]))
+        return x
+
+    def forward_with_offload(self, ids, mask=None):
+        self.token_embedding = self.token_embedding.to(AI_DEVICE)
+        self.pos_embedding = self.pos_embedding.to(AI_DEVICE) if self.pos_embedding is not None else None
+
+        x = self.token_embedding(ids)
+        x = self.dropout(x)
+        e = self.pos_embedding(x.size(1), x.size(1)) if self.shared_pos else None
+        self.norm = self.norm.to(AI_DEVICE)
+
+        for block_idx in range(len(self.blocks)):
+            self.block_idx = block_idx
+            if hasattr(self.offload_manager, "cpu_buffers"):
+                self.offload_manager.cpu_buffers[0].load_state_dict_from_disk(block_idx)
+                self.offload_manager.cuda_buffers[0].load_state_dict(
+                    self.offload_manager.cpu_buffers[0].state_dict(),
+                    block_idx,
+                )
+            else:
+                self.offload_manager.cuda_buffers[0].load_state_dict(
+                    self.blocks[block_idx].state_dict(),
+                    block_idx,
+                )
+            x = self.forward_block_with_offload(self.offload_manager.cuda_buffers[0], x, mask, pos_bias=e)
+
+        x = self.norm(x)
+        x = self.dropout(x)
+        return x.to(GET_DTYPE())
+
+    def forward(self, ids, mask=None):
+        if self.cpu_offload:
+            return self.forward_with_offload(ids, mask)
+        else:
+            return self.forward_without_offload(ids, mask)
+
+
+class T5Decoder(nn.Module):
+    def __init__(
+        self,
+        vocab,
+        dim,
+        dim_attn,
+        dim_ffn,
+        num_heads,
+        num_layers,
+        num_buckets,
+        shared_pos=True,
+        dropout=0.1,
+    ):
+        super(T5Decoder, self).__init__()
+        self.dim = dim
+        self.dim_attn = dim_attn
+        self.dim_ffn = dim_ffn
+        self.num_heads = num_heads
+        self.num_layers = num_layers
+        self.num_buckets = num_buckets
+        self.shared_pos = shared_pos
+
+        # layers
+        self.token_embedding = vocab if isinstance(vocab, nn.Embedding) else nn.Embedding(vocab, dim)
+        self.pos_embedding = T5RelativeEmbedding(num_buckets, num_heads, bidirectional=False) if shared_pos else None
+        self.dropout = nn.Dropout(dropout)
+        self.blocks = nn.ModuleList([T5CrossAttention(dim, dim_attn, dim_ffn, num_heads, num_buckets, shared_pos, dropout) for _ in range(num_layers)])
+        self.norm = T5LayerNorm(dim)
+
+        # initialize weights
+        self.apply(init_weights)
+
+    def forward(self, ids, mask=None, encoder_states=None, encoder_mask=None):
+        b, s = ids.size()
+
+        # causal mask
+        if mask is None:
+            mask = torch.tril(torch.ones(1, s, s).to(ids.device))
+        elif mask.ndim == 2:
+            mask = torch.tril(mask.unsqueeze(1).expand(-1, s, -1))
+
+        # layers
+        x = self.token_embedding(ids)
+        x = self.dropout(x)
+        e = self.pos_embedding(x.size(1), x.size(1)) if self.shared_pos else None
+        for block in self.blocks:
+            x = block(x, mask, encoder_states, encoder_mask, pos_bias=e)
+        x = self.norm(x)
+        x = self.dropout(x)
+        return x
+
+
+class T5Model(nn.Module):
+    def __init__(
+        self,
+        vocab_size,
+        dim,
+        dim_attn,
+        dim_ffn,
+        num_heads,
+        encoder_layers,
+        decoder_layers,
+        num_buckets,
+        shared_pos=True,
+        dropout=0.1,
+    ):
+        super(T5Model, self).__init__()
+        self.vocab_size = vocab_size
+        self.dim = dim
+        self.dim_attn = dim_attn
+        self.dim_ffn = dim_ffn
+        self.num_heads = num_heads
+        self.encoder_layers = encoder_layers
+        self.decoder_layers = decoder_layers
+        self.num_buckets = num_buckets
+
+        # layers
+        self.token_embedding = nn.Embedding(vocab_size, dim)
+        self.encoder = T5Encoder(
+            self.token_embedding,
+            dim,
+            dim_attn,
+            dim_ffn,
+            num_heads,
+            encoder_layers,
+            num_buckets,
+            shared_pos,
+            dropout,
+        )
+        self.decoder = T5Decoder(
+            self.token_embedding,
+            dim,
+            dim_attn,
+            dim_ffn,
+            num_heads,
+            decoder_layers,
+            num_buckets,
+            shared_pos,
+            dropout,
+        )
+        self.head = nn.Linear(dim, vocab_size, bias=False)
+
+        # initialize weights
+        self.apply(init_weights)
+
+    def forward(self, encoder_ids, encoder_mask, decoder_ids, decoder_mask):
+        x = self.encoder(encoder_ids, encoder_mask)
+        x = self.decoder(decoder_ids, decoder_mask, x, encoder_mask)
+        x = self.head(x)
+        return x
+
+
+def _t5(
+    name,
+    encoder_only=False,
+    decoder_only=False,
+    return_tokenizer=False,
+    tokenizer_kwargs={},
+    dtype=torch.float32,
+    device="cpu",
+    **kwargs,
+):
+    # sanity check
+    assert not (encoder_only and decoder_only)
+
+    # params
+    if encoder_only:
+        model_cls = T5Encoder
+        kwargs["vocab"] = kwargs.pop("vocab_size")
+        kwargs["num_layers"] = kwargs.pop("encoder_layers")
+        _ = kwargs.pop("decoder_layers")
+    elif decoder_only:
+        model_cls = T5Decoder
+        kwargs["vocab"] = kwargs.pop("vocab_size")
+        kwargs["num_layers"] = kwargs.pop("decoder_layers")
+        _ = kwargs.pop("encoder_layers")
+    else:
+        model_cls = T5Model
+
+    # init model
+    with torch.device(device):
+        model = model_cls(dtype=dtype, **kwargs)
+
+    # set device
+    model = model.to(device=device)
+    return model
+
+
+def split_block_weights(weights):
+    block_weights = {}
+    all_keys = list(weights.keys())
+    for key in all_keys:
+        if key.startswith(("blocks.")):
+            block_weights[key] = weights.pop(key)
+    return block_weights
+
+
+def umt5_xxl(**kwargs):
+    cfg = dict(
+        vocab_size=256384,
+        dim=4096,
+        dim_attn=4096,
+        dim_ffn=10240,
+        num_heads=64,
+        encoder_layers=24,
+        decoder_layers=24,
+        num_buckets=32,
+        shared_pos=False,
+        dropout=0.1,
+    )
+    cfg.update(**kwargs)
+    return _t5("umt5-xxl", **cfg)
+
+
+class T5EncoderModel:
+    def __init__(
+        self,
+        text_len,
+        dtype=torch.bfloat16,
+        device=torch.device("cuda"),
+        checkpoint_path=None,
+        tokenizer_path=None,
+        shard_fn=None,
+        cpu_offload=False,
+        t5_quantized=False,
+        t5_quantized_ckpt=None,
+        quant_scheme=None,
+        lazy_load=False,
+        load_from_rank0=False,
+    ):
+        self.text_len = text_len
+        self.dtype = dtype
+        self.device = device
+        if t5_quantized_ckpt is not None and t5_quantized:
+            self.checkpoint_path = t5_quantized_ckpt
+        else:
+            self.checkpoint_path = checkpoint_path
+        self.tokenizer_path = tokenizer_path
+
+        # sync cpu offload
+        self.cpu_offload = cpu_offload
+
+        model = (
+            umt5_xxl(
+                encoder_only=True,
+                return_tokenizer=False,
+                dtype=dtype,
+                device=device,
+                cpu_offload=cpu_offload,
+                quantized=t5_quantized,
+                quant_scheme=quant_scheme,
+                lazy_load=lazy_load,
+                lazy_load_path=self.checkpoint_path,
+            )
+            .eval()
+            .requires_grad_(False)
+        )
+
+        weights_dict = load_weights(
+            self.checkpoint_path,
+            cpu_offload=cpu_offload,
+            load_from_rank0=load_from_rank0,
+        )
+
+        if cpu_offload:
+            block_weights_dict = split_block_weights(weights_dict)
+            if lazy_load:
+                model.blocks_weights.load({})
+            else:
+                model.blocks_weights.load(block_weights_dict)
+            del block_weights_dict
+            gc.collect()
+
+        model.load_state_dict(weights_dict)
+        del weights_dict
+        gc.collect()
+        self.model = model
+        if shard_fn is not None:
+            self.model = shard_fn(self.model, sync_module_states=False)
+        else:
+            self.model.to(self.device)
+        # init tokenizer
+        self.tokenizer = HuggingfaceTokenizer(name=tokenizer_path, seq_len=text_len, clean="whitespace")
+
+    def infer(self, texts):
+        ids, mask = self.tokenizer(texts, return_mask=True, add_special_tokens=True)
+        ids = ids.to(AI_DEVICE)
+        mask = mask.to(AI_DEVICE)
+        seq_lens = mask.gt(0).sum(dim=1).long()
+
+        with torch.no_grad():
+            context = self.model(ids, mask)
+
+        return [u[:v] for u, v in zip(context, seq_lens)]
+
+
+if __name__ == "__main__":
+    import time
+
+    checkpoint_dir = ""
+    t5_checkpoint = "models_t5_umt5-xxl-enc-bf16.pth"
+    t5_tokenizer = "google/umt5-xxl"
+
+    cpu_offload = False
+    if cpu_offload:
+        device = torch.device("cpu")
+    else:
+        device = torch.device("cuda")
+
+    model = T5EncoderModel(
+        text_len=512,
+        dtype=torch.bfloat16,
+        device=device,
+        checkpoint_path=os.path.join(checkpoint_dir, t5_checkpoint),
+        tokenizer_path=os.path.join(checkpoint_dir, t5_tokenizer),
+        shard_fn=None,
+        cpu_offload=cpu_offload,
+    )
+    text = "Two anthropomorphic cats in comfy boxing gear and bright gloves fight intensely on a spotlighted stage."
+
+    torch.cuda.synchronize()
+    s_t = time.time()
+    outputs = model.infer(text)
+
+    torch.cuda.synchronize()
+    e_t = time.time()
+
+    logger.info(e_t - s_t)
+    logger.info(outputs)

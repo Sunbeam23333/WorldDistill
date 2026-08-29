@@ -64,7 +64,13 @@ class DistillCache:
         }
 
     def _is_stale(self, entry: CacheEntry, current_step: Optional[int]) -> bool:
-        if current_step is None or self.freshness_steps <= 0:
+        if current_step is None:
+            return False
+        # A lower step indicates a fresh run or a rewind. Never reinterpret an
+        # entry from a later training timeline as current, even when TTL is 0.
+        if current_step < entry.created_step:
+            return True
+        if self.freshness_steps <= 0:
             return False
         return (current_step - entry.created_step) > self.freshness_steps
 

@@ -17,7 +17,7 @@ Usage:
         --teacher_model_path ./models/wan2.2-a14b \
         --data_json data/train.json
 
-    # Multi-GPU with FSDP (for large models)
+    # Multi-GPU with post-load FSDP sharding (construction must fit first)
     torchrun --nproc_per_node=8 -m training.train_distill \
         --distill_method step_distill \
         --parallel_mode fsdp \
@@ -33,18 +33,14 @@ Usage:
         --teacher_model_path ./models/wan2.2-a14b \
         --data_json data/train.json
 
-    # With Sequence Parallelism (sp_size=2 means 2 GPUs per SP group)
-    torchrun --nproc_per_node=8 -m training.train_distill \
-        --distill_method stream_distill \
-        --parallel_mode ddp \
-        --sp_size 2 \
-        --teacher_model_path ./models/wan2.2-a14b \
-        --data_json data/train.json
+Model loading contract:
+1. Compatible Diffusers directory with a transformer/unet (supported path)
+2. Architecture-specific directory construction when its config is recognized
+3. Bare state dicts and inference Runner objects require a dedicated adapter
 
-Model loading strategies (in priority order):
-1. diffusers DiffusionPipeline.from_pretrained (directory with safetensors/bin)
-2. Direct state_dict (.pt / .safetensors file) with auto model construction
-3. Runner mechanism from inference engine (advanced)
+Sequence parallelism is intentionally not shown as a generic CLI recipe:
+``--sp_size > 1`` requires teacher and student implementations with explicit
+WorldDistill model-layer sequence-parallel adapters.
 """
 
 import copy
@@ -215,14 +211,23 @@ def _build_dataset(
     raise ValueError(f"Unsupported data_mode: {data_mode}")
 
 
+def _bucket_sampler_drop_last(world_size: int) -> bool:
+    """Distributed collectives require equal local batch shapes."""
+
+    return world_size > 1
+
+
 def main():
     args = parse_training_args()
     validate_runtime_dependency_versions(strict=getattr(args, "strict_env_check", True))
     rank, world_size = setup_distributed()
-    device = torch.device(f"cuda:{rank % torch.cuda.device_count()}" if torch.cuda.is_available() else "cpu")
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    device = torch.device(f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu")
 
-    # Set seed for reproducibility
-    set_seed(args.seed + rank)  # Different seed per rank for data diversity
+    # Model/adaptor initialization must be identical before DDP/FSDP/ZeRO
+    # synchronization. Per-rank stochastic training seeds are installed only
+    # after every model and EMA target has been constructed.
+    set_seed(args.seed)
     _configure_cuda_backend(args)
 
     if is_main_process():
@@ -256,6 +261,7 @@ def main():
     if args.use_bucket_sampler:
         sampler = BucketSampler(
             dataset, batch_size=args.batch_size, shuffle=True,
+            drop_last=_bucket_sampler_drop_last(world_size),
             seed=args.seed, rank=rank, world_size=world_size,
         )
         dataloader = torch.utils.data.DataLoader(
@@ -309,12 +315,18 @@ def main():
         )
 
     # --- Build Models ---
+    teacher_dtype = {
+        "no": torch.float32,
+        "fp16": torch.float16,
+        "bf16": torch.bfloat16,
+    }[args.mixed_precision]
     teacher_model, student_model = _load_models(
         args.teacher_model_path,
         args.student_model_path,
         args.model_cls,
         args.config_json,
         device,
+        teacher_dtype,
     )
 
     # Apply LoRA if requested
@@ -370,6 +382,7 @@ def main():
     )
 
     # --- Train ---
+    set_seed(args.seed + rank)
     trainer.train()
     cleanup_distributed()
 
@@ -467,6 +480,7 @@ def _load_models(
     model_cls: str,
     config_json: str,
     device: torch.device,
+    teacher_dtype: torch.dtype,
 ):
     """Load teacher and student models.
 
@@ -501,7 +515,7 @@ def _load_models(
             continue
         try:
             from diffusers import DiffusionPipeline
-            pipe = DiffusionPipeline.from_pretrained(candidate_dir, torch_dtype=torch.bfloat16)
+            pipe = DiffusionPipeline.from_pretrained(candidate_dir, torch_dtype=teacher_dtype)
             if hasattr(pipe, "transformer") and pipe.transformer is not None:
                 teacher_model = pipe.transformer.to(device)
             elif hasattr(pipe, "unet") and pipe.unet is not None:
@@ -525,13 +539,23 @@ def _load_models(
                 if not weight_files:
                     continue
                 logger.info(f"Found {len(weight_files)} weight files in {candidate_dir}")
-                teacher_model = _construct_model_from_weights(candidate_dir, weight_files, model_cls, device)
+                teacher_model = _construct_model_from_weights(
+                    candidate_dir,
+                    weight_files,
+                    model_cls,
+                    device,
+                    teacher_dtype,
+                )
                 if teacher_model is not None:
                     break
         else:
             logger.info(f"Loading single weight file: {teacher_path}")
             teacher_model = _construct_model_from_weights(
-                os.path.dirname(teacher_path), [teacher_path], model_cls, device
+                os.path.dirname(teacher_path),
+                [teacher_path],
+                model_cls,
+                device,
+                teacher_dtype,
             )
 
     # --- Strategy 3: Runner mechanism (fallback) ---
@@ -554,25 +578,26 @@ def _load_models(
             "Supported formats:\n"
             "  1. diffusers directory (with model_index.json or config.json)\n"
             "  2. Directory with .safetensors / .bin / .pt files\n"
-            "  3. Single .pt checkpoint file\n"
             "Hint: For diffusers models, use `huggingface-cli download <repo> --local-dir <path>`"
         )
 
     # --- Build student model ---
-    if student_path and os.path.exists(student_path):
+    if student_path:
+        from training.utils.checkpoint_io import load_model_state_file
+
         logger.info(f"Loading separate student model from {student_path}")
         student_model = copy.deepcopy(teacher_model)
-        student_state = torch.load(student_path, map_location=device, weights_only=True)
-        if isinstance(student_state, dict) and "model" in student_state:
-            student_state = student_state["model"]
-        missing, unexpected = student_model.load_state_dict(student_state, strict=False)
-        if missing:
-            logger.warning(f"Student model missing keys: {len(missing)} (e.g., {missing[:3]})")
-        if unexpected:
-            logger.warning(f"Student model unexpected keys: {len(unexpected)} (e.g., {unexpected[:3]})")
+        student_state = load_model_state_file(student_path, map_location=device)
+        student_model.load_state_dict(student_state, strict=True)
     else:
-        logger.info("Cloning teacher as student model.")
+        logger.info("No student_model_path supplied; cloning teacher as the student model.")
         student_model = copy.deepcopy(teacher_model)
+
+    # Native AdamW/FSDP/ZeRO expect FP32 master parameters. Autocast or the
+    # distributed mixed-precision policy controls compute dtype; cloning the
+    # reduced-precision teacher directly would otherwise update BF16/FP16
+    # parameters in place.
+    student_model = student_model.to(device=device, dtype=torch.float32)
 
     # Ensure student requires grad, teacher does not
     for p in teacher_model.parameters():
@@ -588,7 +613,11 @@ def _load_models(
 
 
 def _construct_model_from_weights(
-    model_dir: str, weight_files: list[str], model_cls: str, device: torch.device
+    model_dir: str,
+    weight_files: list[str],
+    model_cls: str,
+    device: torch.device,
+    teacher_dtype: torch.dtype,
 ):
     """Construct a model from weight files.
 
@@ -608,7 +637,7 @@ def _construct_model_from_weights(
             model_type = config.get("_class_name", "")
             if "Transformer" in model_type or "DiT" in model_type:
                 from diffusers.models import Transformer2DModel
-                model = Transformer2DModel.from_pretrained(model_dir, torch_dtype=torch.bfloat16)
+                model = Transformer2DModel.from_pretrained(model_dir, torch_dtype=teacher_dtype)
                 return model.to(device)
         except Exception as e:
             logger.warning(f"Config-based model construction failed: {e}")
@@ -628,7 +657,7 @@ def _construct_model_from_weights(
             try:
                 from diffusers import DiffusionPipeline
                 pipe = DiffusionPipeline.from_pretrained(
-                    model_dir, torch_dtype=torch.bfloat16, use_safetensors=True
+                    model_dir, torch_dtype=teacher_dtype, use_safetensors=True
                 )
                 if hasattr(pipe, "transformer") and pipe.transformer is not None:
                     return pipe.transformer.to(device)
@@ -682,9 +711,11 @@ def _apply_lora(model, args):
         total = sum(p.numel() for p in model.parameters())
         logger.info(f"LoRA applied | Trainable: {trainable / 1e6:.1f}M / {total / 1e6:.1f}M ({trainable / total * 100:.2f}%)")
         return model
-    except ImportError:
-        logger.warning("peft not installed. Install with: pip install peft. Skipping LoRA.")
-        return model
+    except ImportError as exc:
+        raise RuntimeError(
+            "--use_lora requires PEFT. Install the training dependencies with "
+            "`pip install -e '.[train]'` before starting LoRA training."
+        ) from exc
 
 
 if __name__ == "__main__":
