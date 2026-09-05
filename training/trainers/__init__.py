@@ -10,6 +10,8 @@ Each trainer implements a specific distillation method:
 - DMDDistillTrainer: Distribution Matching Distillation (DMD/DMD2)
 """
 
+from distill_capabilities import REGISTRY_BACKED_DISTILL_METHODS
+
 from training.trainers.base_distill_trainer import BaseDistillTrainer
 from training.trainers.step_distill_trainer import StepDistillTrainer
 from training.trainers.stream_distill_trainer import StreamDistillTrainer
@@ -28,6 +30,14 @@ TRAINER_REGISTRY = {
     "adversarial_distill": AdversarialDistillTrainer,
     "dmd_distill": DMDDistillTrainer,
 }
+
+_missing_registry_methods = [method for method in REGISTRY_BACKED_DISTILL_METHODS if method not in TRAINER_REGISTRY]
+_extra_registry_methods = [method for method in TRAINER_REGISTRY if method not in REGISTRY_BACKED_DISTILL_METHODS]
+if _missing_registry_methods or _extra_registry_methods:  # pragma: no cover - import-time contract check
+    raise RuntimeError(
+        "TRAINER_REGISTRY drifted from REGISTRY_BACKED_DISTILL_METHODS: "
+        f"missing={_missing_registry_methods}, extra={_extra_registry_methods}"
+    )
 
 
 def build_trainer(method: str, **kwargs) -> BaseDistillTrainer:

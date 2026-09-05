@@ -1,0 +1,71 @@
+\documentclass[tikz,border=3mm]{standalone}
+\input{emerald_style.tex}
+\begin{document}
+\begin{tikzpicture}[x=1cm,y=1cm]
+  \fill[ivory] (-.10,-.12) rectangle (16.10,6.02);
+  \node[ctitle,text=nvdark] at (8,5.68) {Hybrid-Sparse Memory under a Fixed Frame Budget};
+  \node[csub,text=nvgraphite] at (8,5.27)
+    {Emerald pins preserve long-range coverage; the teal band keeps a contiguous recent tail for local motion.};
+
+  % Unboxed history timeline.
+  \draw[-Stealth,draw=nvgraphite,line width=.75pt] (.78,3.96) -- (15.20,3.96);
+  \node[ctiny,text=nvgraphite,anchor=east] at (15.20,4.62) {history $h_{1:n}$};
+  \foreach \i in {1,...,18} {
+    \pgfmathsetmacro{\xx}{1.10+.78*(\i-1)}
+    \draw[draw=nvline,line width=.55pt] (\xx,3.82) -- (\xx,4.10);
+  }
+  \foreach \i in {1,...,14} {
+    \pgfmathsetmacro{\xx}{1.10+.78*(\i-1)}
+    \node[cmicro,text=nvgraphite] at (\xx,3.57) {$h_{\i}$};
+  }
+
+  % Sparse long-range anchor pins.
+  \foreach \i in {1,5,9,13} {
+    \pgfmathsetmacro{\xx}{1.10+.78*(\i-1)}
+    \draw[draw=emerald,line width=1.15pt] (\xx,3.96) -- (\xx,4.53);
+    \node[diamond,fill=emerald,draw=emerald,inner sep=2.1pt] at (\xx,4.54) {};
+  }
+  \draw[decorate,decoration={brace,mirror,amplitude=4pt},draw=emerald]
+    (1.10,3.38) -- (10.46,3.38);
+  \node[ctiny,text=emerald] at (5.78,3.08)
+    {$q=B-r$ approximately uniform long-range anchors};
+
+  % Dense recent tail appears as a continuous band.
+  \fill[teal,opacity=.15,rounded corners=.7mm] (11.90,3.68) rectangle (14.55,4.24);
+  \foreach \i in {15,16,17,18} {
+    \pgfmathsetmacro{\xx}{1.10+.78*(\i-1)}
+    \draw[draw=teal,line width=1.05pt] (\xx,3.70) rectangle ++(.54,.52);
+    \node[cmicro,text=teal] at (\xx+.27,3.96) {$h_{\i}$};
+  }
+  \draw[decorate,decoration={brace,mirror,amplitude=4pt},draw=teal]
+    (12.02,3.38) -- (14.55,3.38);
+  \node[ctiny,text=teal] at (13.29,3.08)
+    {$r=\max(1,\mathrm{round}(\rho B))$ recent frames};
+
+  % Memory construction uses varied glyphs rather than repeated cards.
+  \node[signal,signal from=west,signal to=east,fill=mint,draw=emerald,
+        line width=1pt,clabel,minimum width=3.25cm,minimum height=.82cm] (anchors) at (2.75,1.72)
+    {long-range anchors\\$[h_{i_1},\ldots,h_{i_q}]$};
+  \node[clabel,text=amber] at (4.73,1.72) {$+$};
+  \node[signal,signal from=west,signal to=east,fill=white,draw=teal,
+        line width=1pt,clabel,minimum width=3.25cm,minimum height=.82cm] (recent) at (6.78,1.72)
+    {dense recent tail\\$[h_{n-r+1},\ldots,h_n]$};
+  \node[diamond,aspect=1.35,fill=amber,draw=nvdark,line width=.7pt,
+        ctiny,inner sep=2.2pt] (concat) at (9.15,1.72) {concat};
+  \node[signal,signal from=west,signal to=east,fill=emerald,draw=emerald,
+        text=white,clabel,minimum width=2.70cm,minimum height=.84cm] (hybrid) at (11.45,1.72)
+    {hybrid memory\\$m_{\mathrm{hyb}}^{(k)}$};
+  \node[circle,fill=amber,draw=nvdark,line width=.7pt,ctiny,
+        minimum size=1.02cm] (chunk) at (14.42,1.72) {target\\chunk};
+
+  \draw[-Stealth,draw=amber,line width=1.05pt] (recent) -- (concat);
+  \draw[-Stealth,draw=emerald,line width=1.05pt] (concat) -- (hybrid);
+  \draw[-Stealth,draw=emerald,line width=1.05pt] (hybrid) -- (chunk);
+
+  \draw[draw=emerald,line width=.8pt] (1.20,.52) -- (14.90,.52);
+  \node[clabel,text=nvdark,fill=ivory,inner xsep=7pt] at (8.05,.52)
+    {$\displaystyle m_{\mathrm{hyb}}^{(k)}
+      =[\,h_{i_1},\ldots,h_{i_q},h_{n-r+1},\ldots,h_n\,],
+      \qquad q+r=B$};
+\end{tikzpicture}
+\end{document}

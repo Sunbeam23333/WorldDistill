@@ -6,6 +6,8 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
+from distill_capabilities import ONLINE_RUNTIME_DISTILL_METHODS, resolve_distill_capability_fields
+
 try:
     import yaml
 except ModuleNotFoundError:  # pragma: no cover - optional dependency fallback
@@ -155,6 +157,7 @@ _FALLBACK_MODEL_ZOO: dict[str, dict[str, Any]] = {
         teacher_model_cls="wan2.1",
         distill_stage="student",
         distill_methods=["mean_flow_distill"],
+        catalog_only_distill_methods=["mean_flow_distill"],
         default_configs={"t2v": "meanflow/wan_t2v_meanflow_distill_2step.json"},
     ),
     "wan2.1_vace": _spec(
@@ -177,7 +180,7 @@ _FALLBACK_MODEL_ZOO: dict[str, dict[str, Any]] = {
     ),
     "wan2.2": _spec(
         "wan_dense",
-        ["t2v", "i2v", "ti2v"],
+        ["t2v", "i2v"],
         "wan2.2",
         model_family="video",
         checkpoint_formats=["directory", "original", "diffusers", "state_dict"],
@@ -253,7 +256,7 @@ _FALLBACK_MODEL_ZOO: dict[str, dict[str, Any]] = {
         features=["audio_conditioning", "reference_speech"],
         default_configs={
             "s2v": "seko_talk/shot/stream/s2v.json",
-            "rs2v": "seko_talk/shot/rs2v/rs2v.json",
+            "rs2v": "seko_talk/shot/rs2v/main.json",
         },
     ),
     "hunyuan_video_1.5": _spec(
@@ -697,7 +700,8 @@ def resolve_model_metadata(
     distill_stage = _infer_distill_stage(canonical, spec, zoo)
     teacher_model_cls = _derive_teacher_model_cls(canonical, spec, zoo)
     related_distill_models = _collect_related_distill_models(canonical, zoo)
-    distill_methods = list(spec.get("distill_methods") or [])
+    capability_fields = resolve_distill_capability_fields({**spec, "distill_stage": distill_stage})
+    registry_backed_distill_methods = capability_fields["registry_backed_distill_methods"]
     default_config_candidates = resolve_default_config_candidates(canonical, task=task)
     default_config_path = resolve_default_config_path(canonical, task=task)
     distill_runtime_hints: list[str] = []
@@ -707,13 +711,14 @@ def resolve_model_metadata(
         distill_runtime_hints.append("teacher_student_pair")
     if "dual_model" in checkpoint_formats:
         distill_runtime_hints.append("dual_student_checkpoint")
-    if any(method in {"progressive_distill", "stream_distill", "context_forcing"} for method in distill_methods):
+    if any(method in ONLINE_RUNTIME_DISTILL_METHODS for method in registry_backed_distill_methods):
         distill_runtime_hints.append("online_distill_candidate")
     if any(feature in features for feature in ("action_conditioning", "context_memory", "plucker_camera_control")):
         distill_runtime_hints.append("world_model_runtime")
 
     metadata = {
         **spec,
+        **capability_fields,
         "input_model_cls": model_cls,
         "canonical_model_cls": canonical,
         "runner_cls": spec.get("runner_cls", canonical),
@@ -733,7 +738,6 @@ def resolve_model_metadata(
         "distill_stage": distill_stage,
         "teacher_model_cls": teacher_model_cls,
         "related_distill_models": related_distill_models,
-        "distill_methods": distill_methods,
         "distill_runtime_hints": distill_runtime_hints,
         "default_config_candidates": default_config_candidates,
         "default_config_path": default_config_path,
@@ -750,9 +754,6 @@ def resolve_model_metadata(
         "supports_audio_generation": "audio" in output_modalities,
         "supports_video_generation": "video" in output_modalities,
         "supports_image_generation": "image" in output_modalities,
-        "supports_opd_like_runtime": any(
-            method in {"progressive_distill", "stream_distill", "context_forcing"} for method in distill_methods
-        ),
     }
     return metadata
 
@@ -776,5 +777,9 @@ def apply_model_metadata(args: Any) -> dict[str, Any]:
     setattr(args, "teacher_model_cls", metadata["teacher_model_cls"])
     setattr(args, "related_distill_models", metadata["related_distill_models"])
     setattr(args, "distill_methods", metadata["distill_methods"])
+    setattr(args, "registry_backed_distill_methods", metadata["registry_backed_distill_methods"])
+    setattr(args, "non_registry_distill_methods", metadata["non_registry_distill_methods"])
+    setattr(args, "catalog_only_distill_methods", metadata["catalog_only_distill_methods"])
     setattr(args, "distill_runtime_hints", metadata["distill_runtime_hints"])
+    setattr(args, "supports_registry_training_entry", metadata["supports_registry_training_entry"])
     return metadata

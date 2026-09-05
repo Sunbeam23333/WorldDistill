@@ -9,7 +9,7 @@ from loguru import logger
 from lightx2v.shot_runner.shot_base import ShotConfig, ShotPipeline, load_clip_configs
 from lightx2v.shot_runner.utils import RS2V_SlidingWindowReader, save_audio, save_to_video
 from lightx2v.utils.profiler import *
-from lightx2v.utils.utils import is_main_process, seed_all, vae_to_comfyui_image
+from lightx2v.utils.utils import check_path_exists, is_main_process, seed_all, vae_to_comfyui_image
 
 
 def get_reference_state_sequence(frames_per_clip=17, target_fps=16):
@@ -120,18 +120,24 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--seed", type=int, default=42, help="The seed for random generator")
     parser.add_argument("--config_json", type=str, required=True)
+    parser.add_argument("--model_path", type=str, required=True, help="Path to SekoTalk model weights")
     parser.add_argument("--prompt", type=str, default="", help="The input prompt for text-to-video generation")
     parser.add_argument("--negative_prompt", type=str, default="")
-    parser.add_argument("--image_path", type=str, default="", help="The path to input image file for image-to-video (i2v) task")
-    parser.add_argument("--audio_path", type=str, default="", help="The path to input audio file or directory for audio-to-video (s2v) task")
+    parser.add_argument("--image_path", type=str, required=True, help="The reference image for stateful RS2V")
+    parser.add_argument("--audio_path", type=str, required=True, help="The speech audio for stateful RS2V")
     parser.add_argument("--save_result_path", type=str, default=None, help="The path to save video path/file")
     parser.add_argument("--return_result_tensor", action="store_true", help="Whether to return result tensor. (Useful for comfyui)")
     parser.add_argument("--target_shape", nargs="+", default=[], help="Set return video or image shape")
     args = parser.parse_args()
 
+    for required_path in (args.model_path, args.image_path, args.audio_path):
+        check_path_exists(required_path)
+
     seed_all(args.seed)
 
     clip_configs = load_clip_configs(args.config_json)
+    for clip_config in clip_configs:
+        clip_config.config_json["model_path"] = args.model_path
 
     shot_cfg = ShotConfig(
         seed=args.seed,

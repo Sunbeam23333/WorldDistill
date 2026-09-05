@@ -1,0 +1,47 @@
+name: CPU contract tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11", "3.12"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: Install CPU test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
+          python -m pip install pytest loguru PyYAML packaging numpy
+
+      - name: Verify required source is tracked
+        run: |
+          git ls-files --error-unmatch training/data/video_dataset.py
+          git ls-files --error-unmatch inference/lightx2v/models/runners/default_runner.py
+
+      - name: Run contract and training-loop tests
+        run: python -m pytest -q training/tests
+
+      - name: Static checks
+        run: |
+          python -m compileall -q cuda_compat.py distill_capabilities.py training tools inference/lightx2v
+          find scripts -type f -name '*.sh' -print0 | xargs -0 -n1 bash -n
+          python setup.py --name --version
+          git diff --check

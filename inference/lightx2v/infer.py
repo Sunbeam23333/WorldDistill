@@ -43,14 +43,15 @@ from lightx2v.utils.input_info import init_empty_input_info, update_input_info_f
 from lightx2v.utils.model_catalog import get_supported_model_inputs, resolve_model_metadata
 from lightx2v.utils.profiler import *
 from lightx2v.utils.registry_factory import RUNNER_REGISTER
-from lightx2v.utils.set_config import print_config, set_config, set_parallel_config
+from lightx2v.utils.set_config import print_config, set_config, set_parallel_config, validate_launcher_world_size
 from lightx2v.utils.utils import seed_all, validate_config_paths, validate_task_arguments
 from lightx2v_platform.registry_factory import PLATFORM_DEVICE_REGISTER
 
 
 def init_runner(config):
     torch.set_grad_enabled(False)
-    runner = RUNNER_REGISTER[config["model_cls"]](config)
+    runner_key = config.get("resolved_runner_cls", config["model_cls"])
+    runner = RUNNER_REGISTER[runner_key](config)
     runner.init_modules()
     return runner
 
@@ -153,6 +154,11 @@ def main():
     parser.add_argument("--aspect_ratio", type=str, default="")
 
     args = parser.parse_args()
+    if args.task == "rs2v":
+        raise ValueError(
+            "RS2V uses the stateful shot pipeline. Run scripts/run_infer.sh "
+            "with --model_cls seko_talk --task rs2v instead of lightx2v.infer directly."
+        )
     validate_runtime_dependency_versions()
     validate_task_arguments(args)
 
@@ -179,6 +185,7 @@ def main():
 
     # set config
     config = set_config(args)
+    validate_launcher_world_size(config)
     # init input_info
     input_info = init_empty_input_info(args.task)
 

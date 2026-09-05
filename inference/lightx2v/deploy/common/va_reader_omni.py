@@ -570,7 +570,7 @@ if __name__ == "__main__":
     reader = OmniVAReader(
         RANK,
         WORLD_SIZE,
-        "https://reverse.st-oc-01.chielo.org/10.5.64.49:8000/rtc/v1/whep/?app=publish&stream=test_stream_ll&eip=10.120.114.82:8000",
+        os.environ["LIGHTX2V_TEST_STREAM_URL"],
         segment_duration=17 / 16,
         sample_rate=16000,
         audio_channels=1,

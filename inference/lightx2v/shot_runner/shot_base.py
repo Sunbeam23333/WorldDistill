@@ -1,4 +1,5 @@
 import json
+import os
 from argparse import Namespace
 from dataclasses import dataclass
 from pathlib import Path
@@ -10,7 +11,7 @@ from loguru import logger
 from lightx2v.utils.input_info import init_empty_input_info, update_input_info_from_dict
 from lightx2v.utils.profiler import *
 from lightx2v.utils.registry_factory import RUNNER_REGISTER
-from lightx2v.utils.set_config import auto_calc_config, get_default_config, print_config, set_parallel_config
+from lightx2v.utils.set_config import auto_calc_config, get_default_config, print_config, set_parallel_config, validate_launcher_world_size
 from lightx2v_platform.registry_factory import PLATFORM_DEVICE_REGISTER
 
 
@@ -48,10 +49,6 @@ def load_clip_configs(main_json_path: str):
     with open(main_json_path, "r", encoding="utf-8") as f:
         cfg = json.load(f)
 
-    if "parallel" in cfg:
-        platform_device = PLATFORM_DEVICE_REGISTER.get(os.getenv("PLATFORM", "cuda"), None)
-        platform_device.init_parallel_env()
-
     lightx2v_path = cfg["lightx2v_path"]
     clip_configs_raw = cfg["clip_configs"]
 
@@ -68,6 +65,14 @@ def load_clip_configs(main_json_path: str):
 
         if "parallel" in cfg:  # Add parallel config to clip json
             config["parallel"] = cfg["parallel"]
+
+        validate_launcher_world_size(config)
+        if config["parallel"]:
+            platform_device = PLATFORM_DEVICE_REGISTER.get(os.getenv("PLATFORM", "cuda"), None)
+            if platform_device is None:
+                raise RuntimeError(f"No platform device is registered for PLATFORM={os.getenv('PLATFORM', 'cuda')}")
+            if not torch.distributed.is_initialized():
+                platform_device.init_parallel_env()
             set_parallel_config(config)
 
         clip_configs.append(ClipConfig(name=item["name"], config_json=config))

@@ -6,6 +6,8 @@ import torch.distributed as dist
 from loguru import logger
 from safetensors import safe_open
 
+from cuda_compat import validate_lightx2v_quant_backend
+
 from lightx2v.common.ops.mm.triton_kernels import (
     fp8_gemm_bias_triton,
     fp8_gemm_triton,
@@ -34,11 +36,24 @@ try:
         scaled_mxfp8_quant,
         scaled_nvfp4_quant,
     )
-except ImportError:
+except (ImportError, OSError, RuntimeError):
     scaled_nvfp4_quant, cutlass_scaled_nvfp4_mm = None, None
     scaled_mxfp4_quant, cutlass_scaled_mxfp4_mm = None, None
     scaled_mxfp6_quant, cutlass_scaled_mxfp6_mxfp8_mm = None, None
     scaled_mxfp8_quant, cutlass_scaled_mxfp8_mm = None, None
+
+
+def _require_sm120_quant_backend(scheme, *operators):
+    capability = (
+        tuple(torch.cuda.get_device_capability(torch.cuda.current_device()))
+        if torch.cuda.is_available()
+        else (0, 0)
+    )
+    validate_lightx2v_quant_backend(
+        scheme,
+        capability,
+        callables_available=all(callable(operator) for operator in operators),
+    )
 
 try:
     from vllm import _custom_ops as ops
@@ -726,6 +741,9 @@ class MMWeightWmxfp4Amxfp4dynamic(MMWeightQuantTemplate):
         lora_prefix="diffusion_model.blocks",
         lora_path="",
     ):
+        _require_sm120_quant_backend(
+            "mxfp4", scaled_mxfp4_quant, cutlass_scaled_mxfp4_mm
+        )
         super().__init__(
             weight_name,
             bias_name,
@@ -783,6 +801,9 @@ class MMWeightWmxfp6Amxfp8dynamic(MMWeightQuantTemplate):
         lora_prefix="diffusion_model.blocks",
         lora_path="",
     ):
+        _require_sm120_quant_backend(
+            "mxfp6-mxfp8", scaled_mxfp6_quant, cutlass_scaled_mxfp6_mxfp8_mm
+        )
         super().__init__(
             weight_name,
             bias_name,
@@ -840,6 +861,9 @@ class MMWeightWmxfp8Amxfp8dynamic(MMWeightQuantTemplate):
         lora_prefix="diffusion_model.blocks",
         lora_path="",
     ):
+        _require_sm120_quant_backend(
+            "mxfp8", scaled_mxfp8_quant, cutlass_scaled_mxfp8_mm
+        )
         super().__init__(
             weight_name,
             bias_name,
@@ -897,6 +921,9 @@ class MMWeightWnvfp4Anvfp4dynamic(MMWeightQuantTemplate):
         lora_prefix="diffusion_model.blocks",
         lora_path="",
     ):
+        _require_sm120_quant_backend(
+            "nvfp4", scaled_nvfp4_quant, cutlass_scaled_nvfp4_mm
+        )
         super().__init__(
             weight_name,
             bias_name,

@@ -20,7 +20,6 @@ import { currentUser,
 import { useI18n } from 'vue-i18n'
 import Loading from './components/Loading.vue'
 const { t, locale } = useI18n()
-let source = null
 
 // 页面加载时应用移动端样式
 onMounted(() => {
@@ -50,12 +49,13 @@ onMounted(async () => {
     // 检查是否有登录回调参数
     const urlParams = new URLSearchParams(window.location.search)
     const code = urlParams.get('code')
+    const state = urlParams.get('state')
+    const oauthError = urlParams.get('error')
 
-    if (code) {
+    if (code || oauthError) {
       // 处理登录回调
       isLoading.value = true
-      source = localStorage.getItem('loginSource')
-      await handleLoginCallback(code, source)
+      await handleLoginCallback(code, state, oauthError)
       return
     }
 

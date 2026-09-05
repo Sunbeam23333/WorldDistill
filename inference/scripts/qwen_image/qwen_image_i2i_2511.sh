@@ -1,8 +1,10 @@
 #!/bin/bash
 
-# set path firstly
-export lightx2v_path=
-export model_path=
+# Configure public paths through the environment.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+export lightx2v_path="${LIGHTX2V_PATH:-$(cd "${SCRIPT_DIR}/../.." && pwd)}"
+export model_path="${MODEL_PATH:?Set MODEL_PATH to the Qwen-Image-Edit-2511 checkpoint}"
+input_image="${INPUT_IMAGE:?Set INPUT_IMAGE to the source image}"
 
 export CUDA_VISIBLE_DEVICES=0
 
@@ -16,6 +18,6 @@ python -m lightx2v.infer \
     --config_json ${lightx2v_path}/configs/qwen_image/qwen_image_i2i_2511.json \
     --prompt "Change the person to a standing position, bending over to hold the dog's front paws." \
     --negative_prompt " " \
-    --image_path "/data/nvme1/yongyang/ddc/lightx2v_examples/i2i/1/img1.png" \
+    --image_path "${input_image}" \
     --save_result_path ${lightx2v_path}/save_results/qwen_image_i2i_2511.png \
     --seed 0

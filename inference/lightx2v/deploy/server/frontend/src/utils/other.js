@@ -869,7 +869,6 @@ export const locale = i18n.global.locale
                     throw new Error(`HTTP error! status: ${response.status}`);
                 }
                 const data = await response.json();
-                localStorage.setItem('loginSource', 'github');
                 // 添加短暂延迟，让用户看到加载状态
                 await new Promise(resolve => setTimeout(resolve, 300));
                 window.location.href = data.auth_url;
@@ -890,7 +889,6 @@ export const locale = i18n.global.locale
                     throw new Error(`HTTP error! status: ${response.status}`);
                 }
                 const data = await response.json();
-                localStorage.setItem('loginSource', 'google');
                 // 添加短暂延迟，让用户看到加载状态
                 await new Promise(resolve => setTimeout(resolve, 300));
                 window.location.href = data.auth_url;
@@ -1039,12 +1037,17 @@ export const locale = i18n.global.locale
             }
         };
 
-        const handleLoginCallback = async (code, source) => {
+        const handleLoginCallback = async (code, state, oauthError = null) => {
+            const callbackParams = new URLSearchParams();
+            if (code) callbackParams.set('code', code);
+            if (state) callbackParams.set('state', state);
+            if (oauthError) callbackParams.set('error', oauthError);
             try {
-                const response = await fetch(`/auth/callback/${source}?code=${code}`);
+                const response = await fetch(`/auth/callback/oauth?${callbackParams.toString()}`, {
+                    credentials: 'same-origin'
+                });
                 if (response.ok) {
                     const data = await response.json();
-                    console.log(data);
                     localStorage.setItem('accessToken', data.access_token);
                     if (data.refresh_token) {
                         localStorage.setItem('refreshToken', data.refresh_token);
@@ -1082,15 +1085,17 @@ export const locale = i18n.global.locale
                     router.push('/generate');
                     console.log('login with callback success');
 
-                    // 清除URL中的code参数
-                    window.history.replaceState({}, document.title, window.location.pathname);
                 } else {
                     const error = await response.json();
-                    showAlert(`${t('loginFailedRetry')}: ${error.detail}`, 'danger');
+                    showAlert(`${t('loginFailedRetry')}: ${error.message || t('loginError')}`, 'danger');
                 }
             } catch (error) {
                 showAlert(t('loginError'), 'danger');
                 console.error(error);
+            } finally {
+                // Authorization codes, state and provider errors must not remain
+                // in browser history or later referrer headers.
+                window.history.replaceState({}, document.title, window.location.pathname);
             }
         };
 
@@ -3074,7 +3079,10 @@ export const locale = i18n.global.locale
             try {
                 const files = {};
                 for (const [cacheKey, fileData] of templateFileCache.value.entries()) {
-                    files[cacheKey] = fileData;
+                    // Blob URLs are session-local and cannot be restored after reload.
+                    if (!fileData.url || !fileData.url.startsWith('blob:')) {
+                        files[cacheKey] = fileData;
+                    }
                 }
                 const data = {
                     files: files,
@@ -3102,6 +3110,14 @@ export const locale = i18n.global.locale
             }, 100);
         };
 
+        const fetchProtectedAssetUrl = async (assetUrl) => {
+            const assetResponse = await apiRequest(assetUrl);
+            if (!assetResponse || !assetResponse.ok) {
+                return null;
+            }
+            return URL.createObjectURL(await assetResponse.blob());
+        };
+
         const getTemplateFileUrlFromApi = async (fileKey, fileType) => {
             const apiUrl = `/api/v1/template/asset_url/${fileType}/${fileKey}`;
             const response = await apiRequest(apiUrl);
@@ -3109,10 +3125,8 @@ export const locale = i18n.global.locale
                 const data = await response.json();
                 let assertUrl = data.url;
                 if (assertUrl.startsWith('./assets/')) {
-                    const token = localStorage.getItem('accessToken');
-                    if (token) {
-                        assertUrl = `${assertUrl}&token=${encodeURIComponent(token)}`;
-                    }
+                    assertUrl = await fetchProtectedAssetUrl(assertUrl);
+                    if (!assertUrl) return null;
                 }
                 setTemplateFileToCache(fileKey, {
                     url: assertUrl,
@@ -3300,7 +3314,10 @@ export const locale = i18n.global.locale
             try {
                 const files = {};
                 for (const [cacheKey, fileData] of taskFileCache.value.entries()) {
-                    files[cacheKey] = fileData;
+                    // Blob URLs are session-local and cannot be restored after reload.
+                    if (!fileData.url || !fileData.url.startsWith('blob:')) {
+                        files[cacheKey] = fileData;
+                    }
                 }
                 const data = {
                     files,
@@ -3346,10 +3363,8 @@ export const locale = i18n.global.locale
                 const data = await response.json();
                 let assertUrl = data.url;
                 if (assertUrl.startsWith('./assets/')) {
-                    const token = localStorage.getItem('accessToken');
-                    if (token) {
-                        assertUrl = `${assertUrl}&token=${encodeURIComponent(token)}`;
-                    }
+                    assertUrl = await fetchProtectedAssetUrl(assertUrl);
+                    if (!assertUrl) return null;
                 }
                 const cacheKey = filename ? `${fileKey}_${filename}` : fileKey;
                 setTaskFileToCache(taskId, cacheKey, {
@@ -6397,7 +6412,6 @@ export const locale = i18n.global.locale
             const token = localStorage.getItem('accessToken');
             if (token) {
                 headers['Authorization'] = `Bearer ${token}`;
-                console.log('使用Token进行认证:', token.substring(0, 20) + '...');
             } else {
                 console.warn('没有找到accessToken');
             }

@@ -666,11 +666,15 @@ def validate_task_arguments(args: "argparse.Namespace") -> None:
         "s2v": {"required_paths": ["image_path", "audio_path"], "description": "Speech-to-Video task requires --image_path and --audio_path"},
         "rs2v": {"required_paths": ["image_path", "audio_path"], "description": "Ref-speech-to-Video task requires --image_path and --audio_path"},
         "vace": {"required_paths": ["src_ref_images"], "description": "Video Appearance Change Editing task requires --src_ref_images"},
-        "animate": {"required_paths": ["image_path"], "description": "Animate task requires --image_path"},
+        "animate": {
+            "required_paths": ["src_pose_path", "src_face_path", "src_ref_images"],
+            "description": "Animate task requires --src_pose_path, --src_face_path, and --src_ref_images",
+        },
         "t2v": {"required_paths": [], "description": "Text-to-Video task"},
         "t2i": {"required_paths": [], "description": "Text-to-Image task"},
+        "t2av": {"required_paths": [], "description": "Text-to-Audio-Video task"},
         "i2av": {"required_paths": ["image_path"], "description": "Image-to-Audio-Video task requires --image_path"},
-        "game": {"required_paths": [], "description": "Game/world-model task"},
+        "game": {"required_paths": ["image_path"], "description": "Game/world-model task requires --image_path"},
     }
 
     if task not in task_requirements:

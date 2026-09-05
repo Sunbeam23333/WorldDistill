@@ -32,6 +32,7 @@ import torch.nn.functional as F
 from loguru import logger
 
 from training.trainers.base_distill_trainer import BaseDistillTrainer, EMAModel
+from training.utils.model_output import extract_prediction_tensor
 
 
 class ConsistencyDistillTrainer(BaseDistillTrainer):
@@ -54,6 +55,7 @@ class ConsistencyDistillTrainer(BaseDistillTrainer):
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
+        self._require_velocity_prediction("Consistency distillation")
         self.loss_type = self.args.consistency_loss_type
         self.huber_c = self.args.huber_c
         self.delta_schedule = getattr(self.args, "consistency_delta_schedule", "fixed")
@@ -159,8 +161,7 @@ class ConsistencyDistillTrainer(BaseDistillTrainer):
         ema_input = self.prepare_teacher_input(batch, noisy_latents_n1, t_n1)
         with torch.no_grad():
             ema_output = self.ema_model(**ema_input)
-            if isinstance(ema_output, (tuple, list)):
-                ema_output = ema_output[0]
+            ema_output = extract_prediction_tensor(ema_output, tag="consistency EMA")
 
         sigma_n1_expanded = sigma_n1.view(bs, *([1] * (latents.dim() - 1)))
         ema_x0 = self._consistency_function(ema_output, noisy_latents_n1.float(), sigma_n1_expanded)
@@ -177,10 +178,12 @@ class ConsistencyDistillTrainer(BaseDistillTrainer):
             diff = prediction - target
             loss = torch.sqrt(diff ** 2 + self.huber_c ** 2) - self.huber_c
             return loss.mean()
-        elif self.loss_type == "mse":
+        if self.loss_type == "mse":
             return F.mse_loss(prediction, target)
-        else:
-            return F.mse_loss(prediction, target)
+        raise ValueError(
+            f"Unsupported consistency_loss_type={self.loss_type!r}; "
+            "supported values are 'mse' and 'huber'."
+        )
 
     def compute_distill_loss(
         self,
@@ -213,12 +216,14 @@ class ConsistencyDistillTrainer(BaseDistillTrainer):
         """Save checkpoint including EMA model."""
         super().save_checkpoint(step, output_dir)
         ckpt_dir = os.path.join(output_dir, f"checkpoint-{step}")
-        torch.save(
-            {
+        ema_path = os.path.join(ckpt_dir, "ema_state.pt")
+        self._atomic_save_rank0(
+            ema_path,
+            lambda: {
                 "ema_model": self.ema_model.state_dict(),
                 "consistency_ema": self.consistency_ema.state_dict(),
             },
-            os.path.join(ckpt_dir, "ema_state.pt"),
+            f"Write consistency EMA checkpoint {ema_path}",
         )
 
     def load_checkpoint(self, path: str):
@@ -226,8 +231,25 @@ class ConsistencyDistillTrainer(BaseDistillTrainer):
         super().load_checkpoint(path)
         ckpt_dir = path if os.path.isdir(path) else os.path.dirname(path)
         ema_path = os.path.join(ckpt_dir, "ema_state.pt")
-        if os.path.exists(ema_path):
-            ema_state = torch.load(ema_path, map_location=self.device, weights_only=False)
-            self.ema_model.load_state_dict(ema_state["ema_model"])
+        ema_state = self._load_checkpoint_file_all_ranks(
+            ema_path,
+            description=f"Load consistency EMA checkpoint {ema_path}",
+            weights_only=False,
+        )
+
+        def _restore_consistency_ema():
+            if not isinstance(ema_state, dict):
+                raise TypeError(
+                    f"Expected consistency EMA checkpoint dict, got {type(ema_state).__name__}"
+                )
+            missing = sorted({"ema_model", "consistency_ema"}.difference(ema_state))
+            if missing:
+                raise KeyError(f"Consistency EMA checkpoint is missing required keys: {missing}")
+            self.ema_model.load_state_dict(ema_state["ema_model"], strict=True)
             self.consistency_ema.load_state_dict(ema_state["consistency_ema"])
-            logger.info("Consistency EMA restored from checkpoint.")
+
+        self._run_all_ranks_or_raise(
+            _restore_consistency_ema,
+            f"Restore consistency EMA checkpoint {ema_path}",
+        )
+        logger.info("Consistency EMA restored from checkpoint.")

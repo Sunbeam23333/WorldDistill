@@ -1,4 +1,5 @@
 import ctypes
+import os
 import queue
 import threading
 import time
@@ -273,15 +274,15 @@ if __name__ == "__main__":
     height = 352
 
     recorder = X264VARecorder(
-        whip_shared_path="/data/nvme0/liuliang1/lightx2v/test_deploy/test_whip_so/0.1.1/go_whxp.so",
-        livestream_url="https://reverse.st-oc-01.chielo.org/10.5.64.49:8000/rtc/v1/whip/?app=subscribe&stream=ll2&eip=10.120.114.82:8000",
+        whip_shared_path=os.environ["LIGHTX2V_WHIP_SHARED_LIBRARY"],
+        livestream_url=os.environ["LIGHTX2V_WHIP_URL"],
         fps=fps,
         sample_rate=sample_rate,
     )
     recorder.start(width, height)
 
     # time.sleep(5)
-    audio_path = "/data/nvme0/liuliang1/lightx2v/test_deploy/media_test/mangzhong.wav"
+    audio_path = os.environ["LIGHTX2V_TEST_AUDIO"]
     audio_array, ori_sr = ta.load(audio_path)
     audio_array = ta.functional.resample(audio_array.mean(0), orig_freq=ori_sr, new_freq=16000)
     audio_array = audio_array.numpy().reshape(-1)

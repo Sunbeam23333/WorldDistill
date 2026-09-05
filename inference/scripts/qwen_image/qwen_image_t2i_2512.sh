@@ -1,8 +1,9 @@
 #!/bin/bash
 
-# set path firstly
-lightx2v_path=/data/nvme1/yongyang/ddc/yong/LightX2V
-model_path=/data/nvme1/models/Qwen/Qwen-Image-2512
+# Configure public paths through the environment.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+lightx2v_path="${LIGHTX2V_PATH:-$(cd "${SCRIPT_DIR}/../.." && pwd)}"
+model_path="${MODEL_PATH:?Set MODEL_PATH to the Qwen-Image-2512 checkpoint}"
 
 export CUDA_VISIBLE_DEVICES=0
 

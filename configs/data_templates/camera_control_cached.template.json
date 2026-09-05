@@ -1,0 +1,22 @@
+[
+  {
+    "sample_id": "cam_ctrl_0001",
+    "latent_path": "/path/to/cache/latents/camera/video_0001.pt",
+    "text_embed_path": "/path/to/cache/text_embeds/camera/video_0001.pt",
+    "image_cond_path": "/path/to/cache/image_conds/camera/video_0001.pt",
+    "camera_path": "/path/to/cache/camera_poses/orbit_0001.pt",
+    "num_frames": 81,
+    "resolution": [90, 160],
+    "text": "A marble statue in a courtyard while the camera performs a smooth orbit shot."
+  },
+  {
+    "sample_id": "cam_ctrl_0002",
+    "latent_path": "/path/to/cache/latents/camera/video_0002.pt",
+    "text_embed_path": "/path/to/cache/text_embeds/camera/video_0002.pt",
+    "image_cond_path": "/path/to/cache/image_conds/camera/video_0002.pt",
+    "camera_path": "/path/to/cache/camera_poses/pan_left_0002.pt",
+    "num_frames": 81,
+    "resolution": [90, 160],
+    "text": "A museum hallway with camera-guided left pan and stable scene geometry."
+  }
+]

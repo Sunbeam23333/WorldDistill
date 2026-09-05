@@ -21,9 +21,9 @@ env/
 .DS_Store
 Thumbs.db
 
-# Models & data (too large for git)
-models/
-data/
+# Models & project-level datasets (too large for git)
+/models/
+/data/
 results/
 *.pt
 *.pth
@@ -34,6 +34,13 @@ results/
 # Logs
 *.log
 wandb/
+
+# LaTeX build intermediates (keep PDF deliverables and TeX sources)
+*.aux
+*.fdb_latexmk
+*.fls
+*.synctex.gz
+*.xdv
 
 # Environment
 .env

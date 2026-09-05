@@ -13,7 +13,6 @@ EXPECTED_TRANSFORMERS_VERSION = "4.57.1"
 _COMPATIBLE_RANGES: dict[str, tuple[str | None, str | None]] = {
     "diffusers": ("0.33.0", None),
     "accelerate": ("0.34.2", None),
-    "peft": ("0.17.0", None),
     "huggingface_hub": ("0.25.0", None),
 }
 
@@ -62,7 +61,7 @@ def validate_runtime_dependency_versions(strict: bool = True) -> dict[str, Any]:
         install_hint = (
             "pip install "
             f"'transformers=={EXPECTED_TRANSFORMERS_VERSION}' "
-            "'diffusers>=0.33.0,<1' 'accelerate>=0.34.2,<2' 'peft>=0.17.0,<1'"
+            "'diffusers>=0.33.0,<1' 'accelerate>=0.34.2,<2'"
         )
         raise RuntimeError("\n".join([*issues, f"建议执行: {install_hint}"]))
     return result

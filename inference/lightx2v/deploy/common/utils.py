@@ -13,6 +13,8 @@ import torchaudio
 from PIL import Image
 from loguru import logger
 
+from lightx2v.deploy.common.security import safe_url_host
+
 FMT = "%Y-%m-%d %H:%M:%S"
 
 
@@ -81,7 +83,8 @@ def data_name(x, task_id):
 
 
 async def fetch_resource(url, timeout):
-    logger.info(f"Begin to download resource from url: {url}")
+    resource_host = safe_url_host(url)
+    logger.info("Beginning resource download from host {}", resource_host)
     t0 = time.time()
     async with httpx.AsyncClient() as client:
         async with client.stream("GET", url, timeout=timeout) as response:
@@ -90,9 +93,9 @@ async def fetch_resource(url, timeout):
             async for chunk in response.aiter_bytes(chunk_size=1024 * 1024):
                 ans_bytes.append(chunk)
                 if len(ans_bytes) > 128:
-                    raise Exception(f"url {url} recv data is too big")
+                    raise ValueError("Downloaded resource exceeds the 128 MiB limit")
             content = b"".join(ans_bytes)
-    logger.info(f"Download url {url} resource cost time: {time.time() - t0} seconds")
+    logger.info("Resource download from host {} took {:.3f} seconds", resource_host, time.time() - t0)
     return content
 
 
@@ -103,7 +106,7 @@ def format_image_data(data, max_size=1280):
     changed = False
     w, h = image.size
     assert w > 0 and h > 0, "image is empty"
-    logger.info(f"load image: {w}x{h}, exif: {exif}")
+    logger.info("Loaded image {}x{} (EXIF field count: {})", w, h, len(exif))
 
     if w > max_size or h > max_size:
         ratio = max_size / max(w, h)
@@ -151,7 +154,7 @@ def media_to_audio(data, max_duration=None, sample_rate=44100, channels=2, outpu
         ds = ["-t", str(max_duration)] if max_duration is not None else []
         fmts = ["mp3", "libmp3lame"] if output_format == "mp3" else ["wav", "pcm_s16le"]
         cmd = ["ffmpeg", "-i", fin.name, *ds, "-f", fmts[0], "-acodec", fmts[1], "-ar", str(sample_rate), "-ac", str(channels), "pipe:1"]
-        logger.info(f"media_to_audio cmd: {cmd}")
+        logger.info("Extracting audio from media (format: {}, sample rate: {}, channels: {})", output_format, sample_rate, channels)
         p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         assert p.returncode == 0, f"media to {output_format} failed: {p.stderr.decode()}"
         return p.stdout
@@ -260,8 +263,8 @@ def check_params(params, raw_inputs, raw_outputs, types):
 
 if __name__ == "__main__":
     # https://github.com/recurser/exif-orientation-examples
-    exif_dir = "/data/nvme0/liuliang1/exif-orientation-examples"
-    out_dir = "/data/nvme0/liuliang1/exif-orientation-examples/outs"
+    exif_dir = os.environ.get("EXIF_ORIENTATION_EXAMPLES_DIR", "./exif-orientation-examples")
+    out_dir = os.environ.get("EXIF_ORIENTATION_OUTPUT_DIR", os.path.join(exif_dir, "outs"))
     os.makedirs(out_dir, exist_ok=True)
 
     for base_name in ["Landscape", "Portrait"]:

@@ -19,7 +19,6 @@ which is more efficient for high-resolution video generation.
 Training dynamics:
 - Student and discriminator are trained alternately.
 - Discriminator uses R1 gradient penalty for stability.
-- Feature matching loss is optional for additional stability.
 - The discriminator operates on features from a pretrained encoder (e.g., DINOv2)
   or directly on latent representations.
 
@@ -29,12 +28,10 @@ References:
 - SDXL-Turbo: Real-time text-to-image via ADD
 """
 
-import copy
-import math
-from typing import Any, Dict, List, Optional
+import os
+from typing import Any, Dict
 
 import torch
-import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 from loguru import logger
@@ -141,19 +138,36 @@ class AdversarialDistillTrainer(BaseDistillTrainer):
 
     Loss formulation:
     - L_D = L_D_real + L_D_fake + lambda_r1 * R1_penalty
-    - L_G = lambda_adv * L_adv + lambda_distill * L_distill + lambda_feat * L_feat
+    - L_G = lambda_adv * L_adv + lambda_distill * L_distill
     """
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
+        self._require_velocity_prediction("Adversarial distillation")
+        if self.parallel_mode != "ddp":
+            raise ValueError(
+                "Adversarial distillation currently supports serial/DDP training only; "
+                "auxiliary discriminator state is not integrated with FSDP/DeepSpeed."
+            )
+        if self.args.gradient_accumulation_steps != 1:
+            raise ValueError(
+                "Adversarial distillation currently requires gradient_accumulation_steps=1 "
+                "so discriminator update frequency is defined per optimizer step."
+            )
+        if self.args.mixed_precision == "fp16":
+            raise ValueError(
+                "Adversarial distillation fp16 is disabled until its auxiliary "
+                "discriminator optimizer is integrated with GradScaler; use bf16 or no."
+            )
 
         # Hyperparameters
         self.lambda_adv = getattr(self.args, "adversarial_lambda_adv", 0.5)
         self.lambda_distill = getattr(self.args, "adversarial_lambda_distill", 2.5)
-        self.lambda_feat = getattr(self.args, "adversarial_lambda_feat", 0.0)
         self.r1_penalty_weight = getattr(self.args, "adversarial_r1_weight", 1e-5)
         self.disc_update_freq = getattr(self.args, "adversarial_disc_update_freq", 1)
         self.disc_start_step = getattr(self.args, "adversarial_disc_start_step", 0)
+        if self.disc_update_freq <= 0:
+            raise ValueError("adversarial_disc_update_freq must be positive")
 
         # Build discriminator
         is_video = True  # Assume video DiT
@@ -184,7 +198,7 @@ class AdversarialDistillTrainer(BaseDistillTrainer):
         ):
             self.discriminator = nn.parallel.DistributedDataParallel(
                 self.discriminator,
-                device_ids=[self.rank],
+                device_ids=[int(os.environ.get("LOCAL_RANK", 0))],
                 find_unused_parameters=False,
             )
         super().train()
@@ -323,7 +337,7 @@ class AdversarialDistillTrainer(BaseDistillTrainer):
         timesteps: torch.Tensor,
     ) -> torch.Tensor:
         """Not used directly; _forward_and_loss handles full logic."""
-        return F.mse_loss(student_output.float(), teacher_output.float())
+        return self.compute_supervision_loss(student_output, teacher_output)
 
     def prepare_teacher_input(
         self,
@@ -348,17 +362,23 @@ class AdversarialDistillTrainer(BaseDistillTrainer):
 
         super().save_checkpoint(step, output_dir)
         ckpt_dir = os.path.join(output_dir, f"checkpoint-{step}")
-        disc_state = (
-            self.discriminator.module.state_dict()
-            if hasattr(self.discriminator, "module")
-            else self.discriminator.state_dict()
-        )
-        torch.save(
-            {
-                "discriminator": disc_state,
+        disc_path = os.path.join(ckpt_dir, "discriminator_state.pt")
+
+        def _discriminator_state():
+            raw_disc = (
+                self.discriminator.module
+                if hasattr(self.discriminator, "module")
+                else self.discriminator
+            )
+            return {
+                "discriminator": raw_disc.state_dict(),
                 "disc_optimizer": self.disc_optimizer.state_dict(),
-            },
-            os.path.join(ckpt_dir, "discriminator_state.pt"),
+            }
+
+        self._atomic_save_rank0(
+            disc_path,
+            _discriminator_state,
+            f"Write discriminator checkpoint {disc_path}",
         )
 
     def load_checkpoint(self, path: str):
@@ -368,13 +388,30 @@ class AdversarialDistillTrainer(BaseDistillTrainer):
         super().load_checkpoint(path)
         ckpt_dir = path if os.path.isdir(path) else os.path.dirname(path)
         disc_path = os.path.join(ckpt_dir, "discriminator_state.pt")
-        if os.path.exists(disc_path):
-            state = torch.load(disc_path, map_location=self.device, weights_only=False)
+        state = self._load_checkpoint_file_all_ranks(
+            disc_path,
+            description=f"Load discriminator checkpoint {disc_path}",
+            weights_only=False,
+        )
+
+        def _restore_discriminator():
+            if not isinstance(state, dict):
+                raise TypeError(
+                    f"Expected discriminator checkpoint dict, got {type(state).__name__}"
+                )
+            missing = sorted({"discriminator", "disc_optimizer"}.difference(state))
+            if missing:
+                raise KeyError(f"Discriminator checkpoint is missing required keys: {missing}")
             raw_disc = (
                 self.discriminator.module
                 if hasattr(self.discriminator, "module")
                 else self.discriminator
             )
-            raw_disc.load_state_dict(state["discriminator"])
+            raw_disc.load_state_dict(state["discriminator"], strict=True)
             self.disc_optimizer.load_state_dict(state["disc_optimizer"])
-            logger.info("Discriminator state restored from checkpoint.")
+
+        self._run_all_ranks_or_raise(
+            _restore_discriminator,
+            f"Restore discriminator checkpoint {disc_path}",
+        )
+        logger.info("Discriminator state restored from checkpoint.")

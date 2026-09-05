@@ -1,6 +1,6 @@
 {
     "distill_method": "stream_distill",
-    "description": "Diffusion Forcing based stream distillation. Per-frame independent noise levels with monotonic schedule. Supports infinite-length generation.",
+    "description": "Diffusion Forcing based finite-window stream distillation with per-frame independent noise levels and a monotonic schedule.",
     "window_size": 16,
     "overlap_frames": 4,
     "noise_schedule": "monotonic_linear",

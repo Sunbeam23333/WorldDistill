@@ -1,7 +1,8 @@
 #!/bin/bash
 
-export lightx2v_path=/workspace
-export model_path=/data/nvme1/models/meituan-longcat/LongCat-Image
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+export lightx2v_path="${LIGHTX2V_PATH:-$(cd "${SCRIPT_DIR}/../.." && pwd)}"
+export model_path="${MODEL_PATH:?Set MODEL_PATH to the LongCat-Image checkpoint}"
 
 export CUDA_VISIBLE_DEVICES=2,3
 

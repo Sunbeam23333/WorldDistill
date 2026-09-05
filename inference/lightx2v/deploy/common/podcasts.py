@@ -285,7 +285,7 @@ async def receive_message(websocket: websockets.WebSocketClientProtocol) -> Mess
         else:
             raise ValueError(f"Unexpected message type: {type(data)}")
     except Exception as e:
-        logger.error(f"Failed to receive message: {e}")
+        logger.error("Failed to receive podcast message: {}", type(e).__name__)
         raise
 
 
@@ -294,7 +294,7 @@ async def wait_for_event(websocket: websockets.WebSocketClientProtocol, msg_type
     while True:
         msg = await receive_message(websocket)
         if msg.type != msg_type or msg.event != event_type:
-            raise ValueError(f"Unexpected message: {msg}")
+            raise ValueError(f"Unexpected podcast message type/event: {msg.type}/{msg.event}")
         if msg.type == msg_type and msg.event == event_type:
             return msg
 
@@ -304,7 +304,7 @@ async def start_connection(websocket: websockets.WebSocketClientProtocol) -> Non
     msg = Message(type=MsgType.FullClientRequest, flag=MsgTypeFlagBits.WithEvent)
     msg.event = EventType.StartConnection
     msg.payload = b"{}"
-    logger.debug(f"Sending: {msg}")
+    logger.debug("Sending podcast protocol event {}", msg.event)
     await websocket.send(msg.marshal())
 
 
@@ -313,7 +313,7 @@ async def finish_connection(websocket: websockets.WebSocketClientProtocol) -> No
     msg = Message(type=MsgType.FullClientRequest, flag=MsgTypeFlagBits.WithEvent)
     msg.event = EventType.FinishConnection
     msg.payload = b"{}"
-    logger.debug(f"Sending: {msg}")
+    logger.debug("Sending podcast protocol event {}", msg.event)
     await websocket.send(msg.marshal())
 
 
@@ -323,7 +323,7 @@ async def start_session(websocket: websockets.WebSocketClientProtocol, payload: 
     msg.event = EventType.StartSession
     msg.session_id = session_id
     msg.payload = payload
-    logger.debug(f"Sending: {msg}")
+    logger.debug("Sending podcast protocol event {} (payload bytes: {})", msg.event, len(payload))
     await websocket.send(msg.marshal())
 
 
@@ -333,7 +333,7 @@ async def finish_session(websocket: websockets.WebSocketClientProtocol, session_
     msg.event = EventType.FinishSession
     msg.session_id = session_id
     msg.payload = b"{}"
-    logger.debug(f"Sending: {msg}")
+    logger.debug("Sending podcast protocol event {}", msg.event)
     await websocket.send(msg.marshal())
 
 
@@ -357,7 +357,7 @@ class PodcastRoundPostProcessor:
         text = ""
         if podcast_texts:
             text = podcast_texts[-1].get("text", "")
-        logger.debug(f"Processing round: {current_round}, voice: {voice}, text: {text}, audio: {len(audio)} bytes")
+        logger.debug("Processing podcast round {} (audio bytes: {}, text length: {})", current_round, len(audio), len(text))
 
         new_segment = AudioSegment.from_mp3(io.BytesIO(bytes(audio)))
         round_duration = len(new_segment) / 1000.0
@@ -427,7 +427,7 @@ class VolcEnginePodcastClient:
         self.app_key = "aGjiRDfUWi"
         self.proxy = os.getenv("HTTPS_PROXY", None)
         if self.proxy:
-            logger.info(f"volcengine podcast use proxy: {self.proxy}")
+            logger.info("VolcEngine podcast proxy is configured")
 
     async def podcast_request(
         self,
@@ -500,7 +500,7 @@ class VolcEnginePodcastClient:
             while retry_num > 0:
                 # 建立WebSocket连接
                 websocket = await websockets.connect(self.endpoint, additional_headers=headers)
-                logger.debug(f"WebSocket connected: {websocket.response.headers}")
+                logger.debug("VolcEngine podcast WebSocket connected")
 
                 # 构建请求参数
                 if input_url:
@@ -537,7 +537,12 @@ class VolcEnginePodcastClient:
                         "audio_config": {"format": encoding, "sample_rate": 24000, "speech_rate": 0},
                     }
 
-                logger.debug(f"Request params: {json.dumps(req_params, indent=2, ensure_ascii=False)}")
+                logger.debug(
+                    "Podcast request prepared (action: {}, input kind: {}, parameter keys: {})",
+                    action,
+                    "url" if input_url else "text",
+                    sorted(req_params),
+                )
 
                 if not is_podcast_round_end:
                     req_params["retry_info"] = {"retry_task_id": task_id, "last_finished_round_id": last_round_id}
@@ -568,7 +573,7 @@ class VolcEnginePodcastClient:
 
                     # 错误信息
                     elif msg.type == MsgType.Error:
-                        raise RuntimeError(f"Server error: {msg.payload.decode()}")
+                        raise RuntimeError(f"Podcast provider error (payload bytes: {len(msg.payload)})")
 
                     elif msg.type == MsgType.FullServerResponse:
                         # 播客 round 开始
@@ -584,12 +589,12 @@ class VolcEnginePodcastClient:
                             if current_round == 9999:
                                 voice = "tail_music"
                             is_podcast_round_end = False
-                            logger.debug(f"New round started: {data}")
+                            logger.debug("Podcast round {} started", current_round)
 
                         # 播客 round 结束
                         if msg.event == EventType.PodcastRoundEnd:
                             data = json.loads(msg.payload.decode())
-                            logger.debug(f"Podcast round end: {data}")
+                            logger.debug("Podcast round {} ended (error: {})", current_round, bool(data.get("is_error")))
                             if data.get("is_error"):
                                 break
                             is_podcast_round_end = True
@@ -603,7 +608,7 @@ class VolcEnginePodcastClient:
                         # 播客结束
                         if msg.event == EventType.PodcastEnd:
                             data = json.loads(msg.payload.decode())
-                            logger.info(f"Podcast end: {data}")
+                            logger.info("Podcast generation provider session ended")
 
                     # 会话结束
                     if msg.event == EventType.SessionFinished:

@@ -1,8 +1,9 @@
 #!/bin/bash
 
-# set path firstly
-lightx2v_path="/data/lightx2v-dev"
-model_path="/data/lightx2v-dev/Wan2.1-T2V-14B"
+# Configure public paths through the environment.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+lightx2v_path="${LIGHTX2V_PATH:-$(cd "${SCRIPT_DIR}/../.." && pwd)}"
+model_path="${MODEL_PATH:?Set MODEL_PATH to the Wan2.1-T2V-14B checkpoint}"
 
 export CUDA_VISIBLE_DEVICES=0
 

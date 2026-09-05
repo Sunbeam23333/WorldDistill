@@ -1,0 +1,16 @@
+[
+  {
+    "path": "clips/streaming_scene_0001.mp4",
+    "text": "A continuous first-person walk through a crowded night market with rain, smoke, and changing light sources.",
+    "resolution": [480, 832],
+    "num_frames": 129,
+    "fps": 24
+  },
+  {
+    "path": "clips/streaming_scene_0002.mp4",
+    "text": "A long tracking shot along a forest trail, moving from daylight into dusk without visible temporal discontinuity.",
+    "resolution": [480, 832],
+    "num_frames": 129,
+    "fps": 24
+  }
+]

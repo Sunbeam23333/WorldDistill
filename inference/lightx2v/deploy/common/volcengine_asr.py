@@ -2,7 +2,6 @@
 
 import asyncio
 import base64
-import json
 import os
 import sys
 import time
@@ -35,7 +34,7 @@ class VolcEngineASRClient:
         self.access_token = os.getenv("VOLCENGINE_ASR_ACCESS_TOKEN")
         self.proxy = os.getenv("HTTPS_PROXY", None)
         if self.proxy:
-            logger.info(f"volcengine asr use proxy: {self.proxy}")
+            logger.info("VolcEngine ASR proxy is configured")
 
     def _file_to_base64(self, file_path):
         """Convert local file to Base64"""
@@ -108,7 +107,7 @@ class VolcEngineASRClient:
         elif file_path:
             if not os.path.exists(file_path):
                 error_msg = f"File not found: {file_path}"
-                logger.error(error_msg)
+                logger.error("ASR input file was not found")
                 return False, error_msg
             base64_data = await asyncio.to_thread(self._file_to_base64, file_path)
             audio_data = {"data": base64_data}
@@ -135,10 +134,9 @@ class VolcEngineASRClient:
                 async with session.post(self.url, json=request_payload, headers=headers, proxy=self.proxy) as response:
                     # Check status code in response headers
                     status_code = response.headers.get("X-Api-Status-Code", "")
-                    message = response.headers.get("X-Api-Message", "")
                     logid = response.headers.get("X-Tt-Logid", "")
 
-                    logger.info(f"ASR request status code: {status_code}, message: {message}, logid: {logid}")
+                    logger.info("ASR request completed with status code {} (log id: {})", status_code, logid)
 
                     if status_code == "20000000":  # Success
                         result_data = await response.json()
@@ -146,28 +144,23 @@ class VolcEngineASRClient:
                         logger.info(f"VolcEngineASRClient recognize request success, elapsed time: {elapsed_time:.3f} seconds")
                         return True, result_data
                     elif status_code in ["20000001", "20000002"]:  # Task in progress or waiting
-                        error_msg = f"Task in progress, status: {status_code}, message: {message}"
+                        error_msg = f"Task in progress, status: {status_code}"
                         logger.warning(error_msg)
                         return False, error_msg
                     else:  # Task failed
-                        result_data = await response.json() if response.content_type == "application/json" else {}
-
                         # Get detailed error code description
                         error_description = self.ERROR_CODES.get(status_code, "")
                         if error_description:
-                            error_msg = f"ASR request failed, code: {status_code} ({error_description}), message: {message}"
+                            error_msg = f"ASR request failed, code: {status_code} ({error_description})"
                         elif status_code.startswith("550"):
-                            error_msg = f"ASR request failed, code: {status_code} (Internal service processing error), message: {message}"
+                            error_msg = f"ASR request failed, code: {status_code} (Internal service processing error)"
                         else:
-                            error_msg = f"ASR request failed, code: {status_code}, message: {message}"
-
-                        if result_data:
-                            error_msg += f", response: {result_data}"
+                            error_msg = f"ASR request failed, code: {status_code}"
                         logger.error(error_msg)
                         return False, error_msg
 
         except Exception as e:
-            error_msg = f"VolcEngineASRClient recognize request failed: {str(e)}"
+            error_msg = f"VolcEngineASRClient recognize request failed: {type(e).__name__}"
             logger.warning(error_msg)
             return False, error_msg
 
@@ -193,7 +186,7 @@ async def test(args):
     client = VolcEngineASRClient()
     # Set default parameters
     params = {
-        "file_path": "/mtc/gongruihao/qinxinyi/lightx2v/lightx2v/deploy/common/sample.wav",
+        "file_path": os.getenv("LIGHTX2V_ASR_TEST_FILE", "/path/to/sample.wav"),
         "file_url": None,
         "model_name": "bigmodel",
         "resource_id": "volc.bigasr.auc_turbo",
@@ -225,10 +218,9 @@ async def test(args):
     )
 
     if success:
-        logger.info(f"ASR recognition successful!")
-        logger.info(f"Result: {json.dumps(result, indent=2, ensure_ascii=False)}")
+        logger.info("ASR recognition succeeded")
     else:
-        logger.warning(f"ASR recognition failed: {result}")
+        logger.warning("ASR recognition failed")
 
 
 if __name__ == "__main__":

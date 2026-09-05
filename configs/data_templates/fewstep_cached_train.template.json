@@ -1,0 +1,19 @@
+[
+  {
+    "sample_id": "wan22_train_0001",
+    "latent_path": "/path/to/cache/latents/train/video_0001.pt",
+    "text_embed_path": "/path/to/cache/text_embeds/train/video_0001.pt",
+    "num_frames": 81,
+    "resolution": [90, 160],
+    "text": "A realistic drone shot over a coastal town at sunrise with subtle cloud motion."
+  },
+  {
+    "sample_id": "wan22_train_0002",
+    "latent_path": "/path/to/cache/latents/train/video_0002.pt",
+    "text_embed_path": "/path/to/cache/text_embeds/train/video_0002.pt",
+    "image_cond_path": "/path/to/cache/image_conds/train/video_0002.pt",
+    "num_frames": 81,
+    "resolution": [90, 160],
+    "text": "A person riding a bicycle through a rainy neon street, cinematic depth of field."
+  }
+]

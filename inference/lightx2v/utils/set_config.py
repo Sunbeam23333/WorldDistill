@@ -3,6 +3,7 @@ import os
 
 import torch
 import torch.distributed as dist
+from cuda_compat import resolve_attention_config
 from loguru import logger
 from torch.distributed.tensor.device_mesh import init_device_mesh
 
@@ -54,6 +55,10 @@ def _load_json_if_exists(config, candidate_paths):
 
 
 def auto_calc_config(config):
+    # A required CLI --model_path is the public execution contract. Some
+    # upstream example JSON files carry workstation-local defaults, so preserve
+    # the caller's path across every config overlay.
+    requested_model_path = config.get("model_path")
     apply_model_metadata(config)
 
     if config.get("config_json"):
@@ -61,12 +66,16 @@ def auto_calc_config(config):
         with open(config["config_json"], "r") as f:
             config_json = json.load(f)
         config.update(config_json)
+        if requested_model_path:
+            config["model_path"] = requested_model_path
         apply_model_metadata(config)
     else:
         default_config_path = resolve_default_config_path(config.get("model_cls", ""), task=config.get("task"))
         if default_config_path:
             logger.info(f"Auto-loading default config from {default_config_path}")
             _load_json_if_exists(config, [default_config_path])
+            if requested_model_path:
+                config["model_path"] = requested_model_path
             apply_model_metadata(config)
 
     loaded_config_path = None
@@ -135,6 +144,9 @@ def auto_calc_config(config):
 
     apply_model_metadata(config)
 
+    if requested_model_path:
+        config["model_path"] = requested_model_path
+
     if config["task"] in ["i2v", "s2v", "rs2v"]:
         if config["target_video_length"] % config["vae_stride"][0] != 1:
             logger.warning(f"`num_frames - 1` has to be divisible by {config['vae_stride'][0]}. Rounding to the nearest number.")
@@ -148,6 +160,13 @@ def auto_calc_config(config):
             elif "block_out_channels" in vae_config:
                 config["vae_scale_factor"] = 2 ** (len(vae_config["block_out_channels"]) - 1)
 
+    attention_changes = resolve_attention_config(config, torch_module=torch)
+    for field, (requested, resolved) in attention_changes.items():
+        logger.warning(
+            f"Attention backend fallback for {field}: {requested} -> {resolved}. "
+            "Set strict_cuda_backend=true to fail instead of falling back."
+        )
+
     return config
 
 
@@ -155,6 +174,34 @@ def set_config(args):
     config = set_args2config(args)
     config = auto_calc_config(config)
     return config
+
+
+def expected_world_size(config):
+    """Return the launcher size required by the configured device mesh."""
+    parallel = config.get("parallel")
+    if not parallel:
+        return 1
+    tensor_p_size = int(parallel.get("tensor_p_size", 1))
+    cfg_p_size = int(parallel.get("cfg_p_size", 1))
+    seq_p_size = int(parallel.get("seq_p_size", 1))
+    if min(tensor_p_size, cfg_p_size, seq_p_size) < 1:
+        raise ValueError("Parallel sizes must be positive integers")
+    if tensor_p_size > 1:
+        if cfg_p_size > 1 or seq_p_size > 1:
+            raise ValueError("tensor_p_size cannot be combined with cfg_p_size or seq_p_size")
+        return tensor_p_size
+    return cfg_p_size * seq_p_size
+
+
+def validate_launcher_world_size(config):
+    """Prevent torchrun from launching independent replicas for a serial config."""
+    launcher_world_size = int(os.getenv("WORLD_SIZE", "1"))
+    required_world_size = expected_world_size(config)
+    if launcher_world_size != required_world_size:
+        raise ValueError(
+            f"Launcher WORLD_SIZE={launcher_world_size} does not match the config's "
+            f"parallel world size {required_world_size}."
+        )
 
 
 def set_parallel_config(config):

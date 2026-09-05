@@ -1,0 +1,4 @@
+# Optional optimized CUDA kernels. Install only after selecting a PyTorch/CUDA
+# build compatible with the target GPU, then run tools/check_cuda_compat.py.
+flash-attn>=2.5.0
+sgl-kernel

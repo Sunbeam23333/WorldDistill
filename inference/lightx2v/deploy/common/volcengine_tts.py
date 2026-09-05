@@ -28,7 +28,7 @@ class VolcEngineTTSClient:
             raise ValueError("VOLCENGINE_TTS_APPID and VOLCENGINE_TTS_ACCESS_TOKEN must be set")
         self.proxy = os.getenv("HTTPS_PROXY", None)
         if self.proxy:
-            logger.info(f"volcengine tts use proxy: {self.proxy}")
+            logger.info("VolcEngine TTS proxy is configured")
         if voices_list_file is not None:
             with open(voices_list_file, "r", encoding="utf-8") as f:
                 self.voices_list = json.load(f)
@@ -41,7 +41,11 @@ class VolcEngineTTSClient:
     async def tts_http_stream(self, headers, params, audio_save_path):
         """执行TTS流式请求"""
         try:
-            logger.info(f"volcengine tts params: {params}")
+            req_params = params.get("req_params", {})
+            logger.info(
+                "VolcEngine TTS request started (text length: {})",
+                len(req_params.get("text", "")),
+            )
             audio_data = bytearray()
             total_audio_size = 0
 
@@ -64,16 +68,16 @@ class VolcEngineTTSClient:
                             if data.get("code", 0) == 20000000:
                                 break
                             if data.get("code", 0) > 0:
-                                logger.warning(f"volcengine tts error response: {data}")
+                                logger.warning("VolcEngine TTS failed with provider code {}", data.get("code"))
                                 break
                         except Exception as e:
-                            logger.warning(f"Failed to parse volcengine tts chunk: {e}")
+                            logger.warning("Failed to parse VolcEngine TTS chunk: {}", type(e).__name__)
 
             # save audio file
             if audio_data:
                 with open(audio_save_path, "wb") as f:
                     f.write(audio_data)
-                logger.info(f"audio saved to {audio_save_path}, audio size: {len(audio_data) / 1024:.2f} KB")
+                logger.info("TTS audio saved (size: {:.2f} KB)", len(audio_data) / 1024)
                 # set correct permissions
                 os.chmod(audio_save_path, 0o644)
                 return True
@@ -82,7 +86,7 @@ class VolcEngineTTSClient:
                 return False
 
         except Exception as e:
-            logger.warning(f"VolcEngineTTSClient tts request failed: {e}")
+            logger.warning("VolcEngine TTS request failed: {}", type(e).__name__)
             return False
 
     async def tts_request(
@@ -169,9 +173,9 @@ class VolcEngineTTSClient:
         }
         success = await self.tts_http_stream(headers=headers, params=payload, audio_save_path=output)
         if success:
-            logger.info(f"VolcEngineTTSClient tts request for '{text}': success")
+            logger.info("VolcEngine TTS request succeeded")
         else:
-            logger.warning(f"VolcEngineTTSClient tts request for '{text}': failed")
+            logger.warning("VolcEngine TTS request failed")
         return success
 
 
