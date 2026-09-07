@@ -3,12 +3,12 @@ from loguru import logger
 
 try:
     from magi_attention.functional import flex_flash_attn_func as magi_ffa_func
-except ImportError:
+except (ImportError, OSError, RuntimeError):
     magi_ffa_func = None
 
 try:
     import flashinfer
-except ImportError:
+except (ImportError, OSError, RuntimeError):
     flashinfer = None
 
 from lightx2v.utils.registry_factory import ATTN_WEIGHT_REGISTER

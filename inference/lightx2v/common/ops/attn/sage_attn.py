@@ -5,7 +5,7 @@ from lightx2v.utils.registry_factory import ATTN_WEIGHT_REGISTER
 
 from .template import AttnWeightTemplate
 
-capability = torch.cuda.get_device_capability(0) if torch.cuda.is_available() else None
+capability = torch.cuda.get_device_capability(torch.cuda.current_device()) if torch.cuda.is_available() else None
 if capability == (8, 9):
     try:
         from sageattention import sageattn_qk_int8_pv_fp16_triton as sageattn
@@ -17,6 +17,17 @@ else:
         from sageattention import sageattn
     except (ImportError, OSError, RuntimeError):
         logger.info("sageattn not found, please install sageattention first")
+        sageattn = None
+
+if sageattn is None:
+    # Availability probing accepts either public callable; honor that same
+    # contract when an installation exposes only its Triton implementation.
+    try:
+        import sageattention as _sage_module
+        sageattn = next((getattr(_sage_module, name) for name in
+            ("sageattn", "sageattn_qk_int8_pv_fp16_triton")
+            if callable(getattr(_sage_module, name, None))), None)
+    except (ImportError, OSError, RuntimeError):
         sageattn = None
 
 try:
@@ -231,6 +242,14 @@ class _SageAttnWeightBase(AttnWeightTemplate):
         max_seqlen_kv=None,
         **kwargs,
     ):
+        if "dropout_p" in kwargs:
+            if drop_rate and float(kwargs["dropout_p"]) != float(drop_rate):
+                raise ValueError("drop_rate and dropout_p specify conflicting values")
+            drop_rate = kwargs["dropout_p"]
+        if kwargs.get("softmax_scale") is not None or kwargs.get("scale") is not None:
+            raise ValueError("This SageAttention adapter does not support a custom softmax scale; select torch_sdpa")
+        if kwargs.get("alibi_slopes") is not None or kwargs.get("softcap", 0) or kwargs.get("window_size", (-1, -1)) != (-1, -1):
+            raise ValueError("This SageAttention adapter does not support ALiBi, softcap, or local windows")
         if drop_rate not in (0, 0.0):
             raise ValueError(
                 "SageAttention inference kernels do not support attention dropout"
@@ -273,6 +292,9 @@ class SageAttn2Weight(_SageAttnWeightBase):
 
     @staticmethod
     def _call_kernel(kernel, q, k, v, *, causal):
+        if q.shape[2] != k.shape[2]:
+            repeats = q.shape[2] // k.shape[2]
+            k, v = (x.repeat_interleave(repeats, dim=2) for x in (k, v))
         return kernel(
             q,
             k,
@@ -292,6 +314,9 @@ class SageAttn3Weight(_SageAttnWeightBase):
 
     @staticmethod
     def _call_kernel(kernel, q, k, v, *, causal):
+        if q.shape[2] != k.shape[2]:
+            repeats = q.shape[2] // k.shape[2]
+            k, v = (x.repeat_interleave(repeats, dim=2) for x in (k, v))
         return kernel(
             q.transpose(1, 2),
             k.transpose(1, 2),

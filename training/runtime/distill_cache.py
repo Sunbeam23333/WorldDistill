@@ -10,13 +10,24 @@ from __future__ import annotations
 
 import hashlib
 import os
+import tempfile
+import threading
 import time
 from collections import OrderedDict
 from dataclasses import dataclass, field
 from typing import Any, Optional
+from functools import wraps
 
 import torch
 from loguru import logger
+
+
+def _synchronized(method):
+    @wraps(method)
+    def call(self, *args, **kwargs):
+        with self._lock:
+            return method(self, *args, **kwargs)
+    return call
 
 
 @dataclass
@@ -39,6 +50,7 @@ class DistillCache:
         self._misses = 0
         self._puts = 0
         self._evictions = 0
+        self._lock = threading.RLock()
 
     def get(self, key: str, current_step: Optional[int] = None) -> Any:
         raise NotImplementedError
@@ -107,7 +119,13 @@ class MemoryDistillCache(DistillCache):
         self.pin_memory = pin_memory
         self._storage: OrderedDict[str, CacheEntry] = OrderedDict()
 
+    @_synchronized
     def get(self, key: str, current_step: Optional[int] = None) -> Any:
+        entry = self.get_entry(key, current_step)
+        return entry.payload if entry is not None else None
+
+    @_synchronized
+    def get_entry(self, key: str, current_step: Optional[int] = None) -> Optional[CacheEntry]:
         entry = self._storage.get(key)
         if entry is None:
             self._record_miss()
@@ -118,8 +136,14 @@ class MemoryDistillCache(DistillCache):
             return None
         self._storage.move_to_end(key)
         self._record_hit()
-        return clone_payload(entry.payload, preserve_pin_memory=self.pin_memory)
+        return CacheEntry(
+            payload=clone_payload(entry.payload, preserve_pin_memory=self.pin_memory),
+            created_step=entry.created_step,
+            created_time=entry.created_time,
+            metadata=dict(entry.metadata),
+        )
 
+    @_synchronized
     def put(
         self,
         key: str,
@@ -144,6 +168,7 @@ class MemoryDistillCache(DistillCache):
             self._record_eviction()
         self._record_put()
 
+    @_synchronized
     def invalidate(self, key: str) -> None:
         if key in self._storage:
             del self._storage[key]
@@ -167,7 +192,13 @@ class DiskDistillCache(DistillCache):
         hashed = hashlib.sha1(key.encode("utf-8")).hexdigest()
         return os.path.join(self.cache_dir, f"{hashed}.pt")
 
+    @_synchronized
     def get(self, key: str, current_step: Optional[int] = None) -> Any:
+        entry = self.get_entry(key, current_step)
+        return entry.payload if entry is not None else None
+
+    @_synchronized
+    def get_entry(self, key: str, current_step: Optional[int] = None) -> Optional[CacheEntry]:
         path = self._path_for_key(key)
         if not os.path.exists(path):
             self._record_miss()
@@ -193,8 +224,10 @@ class DiskDistillCache(DistillCache):
         self._index[key] = path
         self._index.move_to_end(key)
         self._record_hit()
-        return clone_payload(entry.payload)
+        entry.payload = clone_payload(entry.payload)
+        return entry
 
+    @_synchronized
     def put(
         self,
         key: str,
@@ -204,15 +237,23 @@ class DiskDistillCache(DistillCache):
     ) -> None:
         path = self._path_for_key(key)
         stored_payload = detach_payload(payload, to_cpu=True, pin_memory=False)
-        torch.save(
-            {
-                "payload": stored_payload,
-                "created_step": current_step,
-                "created_time": time.time(),
-                "metadata": metadata or {},
-            },
-            path,
-        )
+        # A reader (including another rank) must never observe a partial archive.
+        fd, temporary_path = tempfile.mkstemp(prefix=".cache-", suffix=".pt", dir=self.cache_dir)
+        os.close(fd)
+        try:
+            torch.save(
+                {
+                    "payload": stored_payload,
+                    "created_step": current_step,
+                    "created_time": time.time(),
+                    "metadata": metadata or {},
+                },
+                temporary_path,
+            )
+            os.replace(temporary_path, path)
+        finally:
+            if os.path.exists(temporary_path):
+                os.remove(temporary_path)
         self._index[key] = path
         self._index.move_to_end(key)
         while len(self._index) > self.max_entries:
@@ -222,6 +263,7 @@ class DiskDistillCache(DistillCache):
             self._record_eviction()
         self._record_put()
 
+    @_synchronized
     def invalidate(self, key: str) -> None:
         path = self._path_for_key(key)
         self._index.pop(key, None)
@@ -262,6 +304,7 @@ class HybridDistillCache(DistillCache):
         self._cold_hits = 0
         self._promotions = 0
 
+    @_synchronized
     def get(self, key: str, current_step: Optional[int] = None) -> Any:
         hot_value = self.hot_cache.get(key, current_step=current_step)
         if hot_value is not None:
@@ -269,8 +312,8 @@ class HybridDistillCache(DistillCache):
             self._record_hit()
             return hot_value
 
-        cold_value = self.cold_cache.get(key, current_step=current_step)
-        if cold_value is None:
+        cold_entry = self.cold_cache.get_entry(key, current_step=current_step)
+        if cold_entry is None:
             self._record_miss()
             return None
 
@@ -279,12 +322,15 @@ class HybridDistillCache(DistillCache):
         self._record_hit()
         self.hot_cache.put(
             key,
-            cold_value,
-            current_step=current_step if current_step is not None else 0,
-            metadata={"promoted": True},
+            cold_entry.payload,
+            current_step=cold_entry.created_step,
+            metadata={**cold_entry.metadata, "promoted": True},
         )
-        return cold_value
+        # Promotion changes residence, not the age of teacher supervision.
+        self.hot_cache._storage[key].created_time = cold_entry.created_time
+        return cold_entry.payload
 
+    @_synchronized
     def put(
         self,
         key: str,
@@ -299,6 +345,7 @@ class HybridDistillCache(DistillCache):
             self.cold_cache.put(key, payload, current_step=current_step, metadata=metadata)
         self._record_put()
 
+    @_synchronized
     def invalidate(self, key: str) -> None:
         self.hot_cache.invalidate(key)
         self.cold_cache.invalidate(key)
@@ -323,10 +370,10 @@ def detach_payload(payload: Any, to_cpu: bool = True, pin_memory: bool = False) 
     if isinstance(payload, torch.Tensor):
         detached = payload.detach()
         if to_cpu:
-            detached = detached.cpu()
+            detached = detached.to("cpu", copy=True)
             if pin_memory:
                 detached = _maybe_pin_tensor(detached)
-        return detached
+        return detached if to_cpu else detached.clone()
     if isinstance(payload, dict):
         return {k: detach_payload(v, to_cpu=to_cpu, pin_memory=pin_memory) for k, v in payload.items()}
     if isinstance(payload, list):

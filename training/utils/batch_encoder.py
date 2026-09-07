@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import inspect
+import json
+from pathlib import Path
 from typing import Any, Dict, Iterable, Sequence
 
 import torch
@@ -32,7 +34,10 @@ class DiffusersRawBatchEncoder:
             ) from exc
 
         logger.info(f"Loading diffusers auxiliary encoders from {model_path} for raw-video training")
-        pipe = DiffusionPipeline.from_pretrained(model_path, torch_dtype=dtype)
+        with (Path(model_path) / "model_index.json").open() as f:
+            pipeline_config = json.load(f)
+        unused = {name: None for name in ("transformer", "transformer_2", "unet") if name in pipeline_config}
+        pipe = DiffusionPipeline.from_pretrained(model_path, torch_dtype=dtype, **unused)
 
         self.pipe = pipe
         self.vae = getattr(pipe, "vae", None)
@@ -42,6 +47,10 @@ class DiffusersRawBatchEncoder:
         self.feature_extractor = getattr(pipe, "feature_extractor", None)
         self.encode_prompt = getattr(pipe, "encode_prompt", None)
         self.vae_scaling_factor = getattr(getattr(self.vae, "config", None), "scaling_factor", 1.0)
+        self.temporal_compression_ratio = int(getattr(pipe, "vae_scale_factor_temporal",
+                                                     getattr(getattr(self.vae, "config", None), "temporal_compression_ratio", 1)))
+        if self.temporal_compression_ratio < 1:
+            raise ValueError("VAE temporal compression ratio must be positive")
 
         if self.vae is None:
             raise RuntimeError(
@@ -49,16 +58,18 @@ class DiffusersRawBatchEncoder:
             )
 
         self._freeze_module(self.vae)
-        self._freeze_module(self.text_encoder)
         self._freeze_module(self.image_encoder)
 
         self.vae.to(device)
-        if self.text_encoder is not None:
-            self.text_encoder.to(device)
+        for attr in ("text_encoder", "text_encoder_2", "text_encoder_3"):
+            encoder = getattr(pipe, attr, None)
+            self._freeze_module(encoder)
+            if encoder is not None:
+                encoder.to(device)
         if self.image_encoder is not None:
             self.image_encoder.to(device)
 
-        for attr in ("transformer", "unet", "scheduler", "prior", "decoder"):
+        for attr in ("transformer", "transformer_2", "unet", "prior", "decoder"):
             if hasattr(self.pipe, attr):
                 try:
                     setattr(self.pipe, attr, None)
@@ -78,11 +89,31 @@ class DiffusersRawBatchEncoder:
             if "pixel_values" not in batch:
                 raise KeyError("Raw batch encoding requires `pixel_values` when `latents` are absent.")
             batch["latents"] = self._encode_pixels(batch["pixel_values"])
+            raw_t, latent_t = batch["pixel_values"].shape[2], batch["latents"].shape[2]
+            ratio = getattr(self, "temporal_compression_ratio", 1)
+            if ratio < 1:
+                raise ValueError("VAE temporal compression ratio must be positive")
+            if latent_t != raw_t and latent_t != (raw_t - 1) // ratio + 1:
+                raise ValueError("VAE temporal layout has no declared causal frame/control mapping")
+            # A VAE may preserve time (e.g. an explicitly frame-wise encoder)
+            # even if its enclosing pipeline advertises a compression factor.
+            anchors = torch.arange(latent_t, device=self.device) * (1 if latent_t == raw_t else ratio)
+            for key in ("actions", "camera_poses"):
+                if key not in batch:
+                    continue
+                value = batch[key]
+                if value.ndim < 2 or value.shape[1] != raw_t:
+                    raise ValueError(f"Raw {key} must have layout B,T,... aligned to sampled video frames")
+                batch[key] = value.index_select(1, anchors.to(value.device))
 
         if "encoder_hidden_states" not in batch and "text" in batch:
             prompt_embeds = self._encode_text(batch["text"])
-            if prompt_embeds is not None:
+            if isinstance(prompt_embeds, dict):
+                batch.update(prompt_embeds)
+            elif prompt_embeds is not None:
                 batch["encoder_hidden_states"] = prompt_embeds
+            else:
+                raise RuntimeError("Prompt encoding produced no conditioning; refusing unconditional fallback")
 
         return batch
 
@@ -97,7 +128,7 @@ class DiffusersRawBatchEncoder:
                 latents = self._extract_latents(encoded)
                 latents = self._reshape_latents_if_needed(latents, pixels.shape)
             except Exception as exc:
-                if pixels.dim() != 5:
+                if pixels.dim() != 5 or getattr(self, "temporal_compression_ratio", 1) != 1:
                     raise RuntimeError(f"VAE encode failed for raw batch: {exc}") from exc
 
                 logger.warning(
@@ -115,7 +146,22 @@ class DiffusersRawBatchEncoder:
                     )
                 latents = latents.reshape(batch_size, num_frames, *latents.shape[1:]).permute(0, 2, 1, 3, 4).contiguous()
 
-        return latents * self.vae_scaling_factor
+        return self._normalize_latents(latents)
+
+    def _normalize_latents(self, latents: torch.Tensor) -> torch.Tensor:
+        config = self.vae.config
+        mean, std = getattr(config, "latents_mean", None), getattr(config, "latents_std", None)
+        if mean is not None or std is not None:
+            if mean is None or std is None:
+                raise ValueError("VAE must declare both latents_mean and latents_std")
+            shape = (1, -1, *([1] * (latents.ndim - 2)))
+            mean = torch.as_tensor(mean, device=latents.device, dtype=torch.float32).reshape(shape)
+            std = torch.as_tensor(std, device=latents.device, dtype=torch.float32).reshape(shape)
+            if (std <= 0).any() or not torch.isfinite(std).all() or not torch.isfinite(mean).all() or mean.shape[1] != latents.shape[1] or std.shape[1] != latents.shape[1]:
+                raise ValueError("Invalid per-channel VAE normalization statistics")
+            return ((latents.float() - mean) / std).to(latents.dtype)
+        shift = getattr(config, "shift_factor", 0.0) or 0.0
+        return (latents - shift) * self.vae_scaling_factor
 
     def _encode_text(self, texts: Sequence[str] | str) -> torch.Tensor | None:
         prompt_list = self._normalize_prompts(texts)
@@ -128,7 +174,7 @@ class DiffusersRawBatchEncoder:
                 if prompt_embeds is not None:
                     return prompt_embeds
             except Exception as exc:
-                logger.warning(f"Pipeline `encode_prompt` failed in raw-video mode, falling back: {exc}")
+                raise RuntimeError(f"Model-specific prompt encoding failed: {exc}") from exc
 
         if self.tokenizer is None or self.text_encoder is None:
             logger.warning(
@@ -152,7 +198,8 @@ class DiffusersRawBatchEncoder:
 
         with torch.no_grad():
             outputs = self.text_encoder(**tokenized)
-        return self._extract_hidden_states(outputs)
+        return {"encoder_hidden_states": self._extract_hidden_states(outputs),
+                "encoder_attention_mask": tokenized["attention_mask"]}
 
     def _encode_text_via_pipeline(self, prompt_list: Sequence[str]) -> torch.Tensor | None:
         if self.encode_prompt is None:
@@ -169,6 +216,8 @@ class DiffusersRawBatchEncoder:
             "negative_prompt_2": None,
             "num_images_per_prompt": 1,
             "num_videos_per_prompt": 1,
+            "batch_size": len(prompt_list),
+            "dtype": self.dtype,
         }
         for key, value in candidates.items():
             if key in signature.parameters:
@@ -178,9 +227,18 @@ class DiffusersRawBatchEncoder:
         if isinstance(encoded, torch.Tensor):
             return encoded.to(self.device)
         if isinstance(encoded, (tuple, list)):
-            for item in encoded:
-                if isinstance(item, torch.Tensor):
-                    return item.to(self.device)
+            family = type(self.pipe).__name__
+            if "HunyuanVideo15" in family:
+                names = ("encoder_hidden_states", "encoder_attention_mask", "encoder_hidden_states_2", "encoder_attention_mask_2")
+            elif "HunyuanVideo" in family:
+                names = ("encoder_hidden_states", "pooled_projections", "encoder_attention_mask")
+            elif "LTX" in family:
+                names = ("encoder_hidden_states", "encoder_attention_mask")
+            else:
+                names = ("encoder_hidden_states",)
+            if len(encoded) < len(names) or any(not isinstance(value, torch.Tensor) for value in encoded[:len(names)]):
+                raise TypeError(f"{family}.encode_prompt returned an invalid conditioning tuple")
+            return {name: value.to(self.device) for name, value in zip(names, encoded)}
         return None
 
     @staticmethod

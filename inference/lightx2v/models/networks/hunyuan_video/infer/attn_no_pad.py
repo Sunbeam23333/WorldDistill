@@ -1,69 +1,5 @@
 import torch
 import torch.nn.functional as F
-from einops import rearrange
-from loguru import logger
-
-try:
-    from flash_attn import flash_attn_varlen_qkvpacked_func
-except ImportError:
-    flash_attn_varlen_qkvpacked_func = None
-    logger.info("flash_attn_varlen_qkvpacked_func not available")
-try:
-    from flash_attn.bert_padding import pad_input, unpad_input
-except ImportError:
-    pad_input = None
-    unpad_input = None
-    logger.info("flash_attn.bert_padding not available")
-
-try:
-    from flash_attn_interface import flash_attn_varlen_func as flash_attn_varlen_func_v3
-except ImportError:
-    flash_attn_varlen_func_v3 = None
-    logger.info("flash_attn_varlen_func_v3 not available")
-
-if torch.cuda.is_available() and torch.cuda.get_device_capability(0) in [(8, 9), (12, 0)]:
-    try:
-        from sageattention import sageattn_qk_int8_pv_fp16_triton as sageattn
-    except ImportError:
-        logger.info("sageattn not found, please install sageattention first")
-        sageattn = None
-else:
-    try:
-        from sageattention import sageattn
-    except ImportError:
-        logger.info("sageattn not found, please install sageattention first")
-        sageattn = None
-
-try:
-    from sageattn3 import sageattn3_blackwell
-except ImportError:
-    logger.info("sageattn3 not found, please install sageattention first")
-    sageattn3_blackwell = None
-
-
-def flash_attn_no_pad(qkv, key_padding_mask, causal=False, dropout_p=0.0, softmax_scale=None, deterministic=False):
-    batch_size = qkv.shape[0]
-    seqlen = qkv.shape[1]
-    nheads = qkv.shape[-2]
-    x = rearrange(qkv, "b s three h d -> b s (three h d)")
-    x_unpad, indices, cu_seqlens, max_s, used_seqlens_in_batch = unpad_input(x, key_padding_mask)
-
-    x_unpad = rearrange(x_unpad, "nnz (three h d) -> nnz three h d", three=3, h=nheads)
-    output_unpad = flash_attn_varlen_qkvpacked_func(
-        x_unpad,
-        cu_seqlens,
-        max_s,
-        dropout_p,
-        softmax_scale=softmax_scale,
-        causal=causal,
-        deterministic=deterministic,
-    )
-    output = rearrange(
-        pad_input(rearrange(output_unpad, "nnz h d -> nnz (h d)"), indices, batch_size, seqlen),
-        "b s (h d) -> b s h d",
-        h=nheads,
-    )
-    return output
 
 
 def torch_sdpa_no_pad(qkv, key_padding_mask, causal=False, dropout_p=0.0, softmax_scale=None, deterministic=False):
@@ -116,65 +52,47 @@ def torch_sdpa_no_pad(qkv, key_padding_mask, causal=False, dropout_p=0.0, softma
     return output
 
 
-def flash_attn_no_pad_v3(qkv, key_padding_mask, causal=False, dropout_p=0.0, softmax_scale=None, deterministic=False):
-    if flash_attn_varlen_func_v3 is None:
-        raise ImportError("FlashAttention V3 backend not available")
+def _backend_no_pad(qkv, key_padding_mask, backend, causal=False, dropout_p=0.0,
+                    softmax_scale=None, deterministic=False):
+    # Each unpadded row is a separate sequence. No optional FlashAttention
+    # padding helpers and no concatenation across sample boundaries.
+    from lightx2v.utils.attention import attention
 
-    batch_size, seqlen, _, nheads, head_dim = qkv.shape
-    query, key, value = qkv.unbind(dim=2)
-
-    query_unpad, indices, cu_seqlens_q, max_seqlen_q, _ = unpad_input(rearrange(query, "b s h d -> b s (h d)"), key_padding_mask)
-    key_unpad, _, cu_seqlens_k, _, _ = unpad_input(rearrange(key, "b s h d -> b s (h d)"), key_padding_mask)
-    value_unpad, _, _, _, _ = unpad_input(rearrange(value, "b s h d -> b s (h d)"), key_padding_mask)
-
-    query_unpad = rearrange(query_unpad, "nnz (h d) -> nnz h d", h=nheads)
-    key_unpad = rearrange(key_unpad, "nnz (h d) -> nnz h d", h=nheads)
-    value_unpad = rearrange(value_unpad, "nnz (h d) -> nnz h d", h=nheads)
-
-    output_unpad = flash_attn_varlen_func_v3(
-        query_unpad, key_unpad, value_unpad, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_q, softmax_scale=softmax_scale, causal=causal, deterministic=deterministic
-    )
-
-    output = rearrange(pad_input(rearrange(output_unpad, "nnz h d -> nnz (h d)"), indices, batch_size, seqlen), "b s (h d) -> b s h d", h=nheads)
+    if qkv.ndim != 5 or qkv.shape[2] != 3:
+        raise ValueError("qkv must have shape [batch, tokens, 3, heads, head_dim]")
+    batch, tokens = qkv.shape[:2]
+    if key_padding_mask is None:
+        key_padding_mask = torch.ones(batch, tokens, dtype=torch.bool, device=qkv.device)
+    if key_padding_mask.shape != (batch, tokens):
+        raise ValueError("key_padding_mask must match qkv batch and tokens")
+    mask = key_padding_mask.to(device=qkv.device, dtype=torch.bool)
+    output = torch.zeros_like(qkv[:, :, 0])
+    for index in range(batch):
+        positions = mask[index].nonzero().flatten()
+        if positions.numel() == 0:
+            continue
+        q, k, v = qkv[index].index_select(0, positions).unbind(dim=1)
+        result = attention(q, k, v, backend=backend, causal=causal,
+            dropout_p=dropout_p, softmax_scale=softmax_scale, deterministic=deterministic)
+        output[index].index_copy_(0, positions, result)
     return output
+
+
+def flash_attn_no_pad(qkv, key_padding_mask, causal=False, dropout_p=0.0, softmax_scale=None, deterministic=False):
+    return _backend_no_pad(qkv, key_padding_mask, "flash_attn2", causal, dropout_p, softmax_scale, deterministic)
+
+
+def flash_attn_no_pad_v3(qkv, key_padding_mask, causal=False, dropout_p=0.0, softmax_scale=None, deterministic=False):
+    return _backend_no_pad(qkv, key_padding_mask, "flash_attn3", causal, dropout_p, softmax_scale, deterministic)
+
+
+def flash_attn_no_pad_v4(qkv, key_padding_mask, causal=False, dropout_p=0.0, softmax_scale=None, deterministic=False):
+    return _backend_no_pad(qkv, key_padding_mask, "flash_attn4", causal, dropout_p, softmax_scale, deterministic)
 
 
 def sage_attn_no_pad_v2(qkv, key_padding_mask, causal=False, dropout_p=0.0, softmax_scale=None, deterministic=False):
-    batch_size, seqlen, _, nheads, head_dim = qkv.shape
-    query, key, value = qkv.unbind(dim=2)
-
-    query_unpad, indices, cu_seqlens_q, max_seqlen_q, _ = unpad_input(rearrange(query, "b s h d -> b s (h d)"), key_padding_mask)
-    key_unpad, _, cu_seqlens_k, _, _ = unpad_input(rearrange(key, "b s h d -> b s (h d)"), key_padding_mask)
-    value_unpad, _, _, _, _ = unpad_input(rearrange(value, "b s h d -> b s (h d)"), key_padding_mask)
-
-    query_unpad = rearrange(query_unpad, "nnz (h d) -> nnz h d", h=nheads)
-    key_unpad = rearrange(key_unpad, "nnz (h d) -> nnz h d", h=nheads)
-    value_unpad = rearrange(value_unpad, "nnz (h d) -> nnz h d", h=nheads)
-
-    output_unpad = sageattn(
-        query_unpad.unsqueeze(0),
-        key_unpad.unsqueeze(0),
-        value_unpad.unsqueeze(0),
-        tensor_layout="NHD",
-    ).squeeze(0)
-
-    output = rearrange(pad_input(rearrange(output_unpad, "nnz h d -> nnz (h d)"), indices, batch_size, seqlen), "b s (h d) -> b s h d", h=nheads)
-    return output
+    return _backend_no_pad(qkv, key_padding_mask, "sage_attn2", causal, dropout_p, softmax_scale, deterministic)
 
 
 def sage_attn_no_pad_v3(qkv, key_padding_mask, causal=False, dropout_p=0.0, softmax_scale=None, deterministic=False):
-    batch_size, seqlen, _, nheads, head_dim = qkv.shape
-    query, key, value = qkv.unbind(dim=2)
-
-    query_unpad, indices, cu_seqlens_q, max_seqlen_q, _ = unpad_input(rearrange(query, "b s h d -> b s (h d)"), key_padding_mask)
-    key_unpad, _, cu_seqlens_k, _, _ = unpad_input(rearrange(key, "b s h d -> b s (h d)"), key_padding_mask)
-    value_unpad, _, _, _, _ = unpad_input(rearrange(value, "b s h d -> b s (h d)"), key_padding_mask)
-
-    query_unpad = rearrange(query_unpad, "nnz (h d) -> nnz h d", h=nheads)
-    key_unpad = rearrange(key_unpad, "nnz (h d) -> nnz h d", h=nheads)
-    value_unpad = rearrange(value_unpad, "nnz (h d) -> nnz h d", h=nheads)
-
-    output_unpad = sageattn3_blackwell(query_unpad.unsqueeze(0).transpose(1, 2), key_unpad.unsqueeze(0).transpose(1, 2), value_unpad.unsqueeze(0).transpose(1, 2)).transpose(1, 2).squeeze(0)
-
-    output = rearrange(pad_input(rearrange(output_unpad, "nnz h d -> nnz (h d)"), indices, batch_size, seqlen), "b s (h d) -> b s h d", h=nheads)
-    return output
+    return _backend_no_pad(qkv, key_padding_mask, "sage_attn3", causal, dropout_p, softmax_scale, deterministic)

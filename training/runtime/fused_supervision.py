@@ -12,14 +12,13 @@ from __future__ import annotations
 from typing import Optional
 
 import torch
-import torch.nn.functional as F
 
 try:
     import triton
     import triton.language as tl
 
     _HAS_TRITON = True
-except ImportError:  # pragma: no cover - optional dependency
+except (ImportError, OSError, RuntimeError):  # pragma: no cover - optional dependency
     triton = None
     tl = None
     _HAS_TRITON = False
@@ -35,6 +34,7 @@ if _HAS_TRITON:
         partial_ptr,
         numel,
         BLOCK_SIZE: tl.constexpr,
+        HAS_MASK: tl.constexpr,
     ):
         pid = tl.program_id(axis=0)
         offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
@@ -42,7 +42,10 @@ if _HAS_TRITON:
 
         prediction = tl.load(prediction_ptr + offsets, mask=in_bounds, other=0.0).to(tl.float32)
         target = tl.load(target_ptr + offsets, mask=in_bounds, other=0.0).to(tl.float32)
-        mask_value = tl.load(mask_ptr + offsets, mask=in_bounds, other=0.0).to(tl.float32)
+        if HAS_MASK:
+            mask_value = tl.load(mask_ptr + offsets, mask=in_bounds, other=0.0).to(tl.float32)
+        else:
+            mask_value = 1.0
 
         diff = prediction - target
         partial = tl.sum(diff * diff * mask_value, axis=0)
@@ -68,22 +71,25 @@ class _FusedMaskedMSEFunction(torch.autograd.Function):
         else:
             expanded_mask = None
 
+        # Keep a masked denominator on the device: .item() would synchronize
+        # every training step and interrupt teacher/student stream overlap.
+        ctx.has_mask = expanded_mask is not None
+        if expanded_mask is None:
+            ctx.save_for_backward(prediction, target)
+            ctx.denominator = max(prediction.numel(), 1)
+        else:
+            denominator = expanded_mask.float().sum().clamp(min=1.0)
+            ctx.save_for_backward(prediction, target, expanded_mask, denominator)
+
         if not _can_use_fused_kernel(prediction, target, expanded_mask):
-            loss = _torch_masked_mse(prediction, target, expanded_mask)
-            ctx.use_torch_backward = True
-            ctx.has_mask = expanded_mask is not None
-            if expanded_mask is None:
-                ctx.save_for_backward(prediction, target)
-                ctx.denominator = float(prediction.numel())
-            else:
-                ctx.save_for_backward(prediction, target, expanded_mask)
-                ctx.denominator = float(expanded_mask.float().sum().item())
-            return loss
+            return _torch_masked_mse(prediction, target, expanded_mask)
 
         prediction_flat = prediction.contiguous().view(-1)
         target_flat = target.contiguous().view(-1)
         if expanded_mask is None:
-            mask_flat = torch.ones_like(prediction_flat, dtype=torch.float32)
+            # Unused pointer in the HAS_MASK=False specialization. Avoid a full
+            # FP32 all-ones allocation and a second reduction for unmasked MSE.
+            mask_flat = prediction_flat
         else:
             mask_flat = expanded_mask.contiguous().view(-1).to(device=prediction.device, dtype=torch.float32)
 
@@ -97,39 +103,34 @@ class _FusedMaskedMSEFunction(torch.autograd.Function):
             partial,
             numel,
             BLOCK_SIZE=1024,
+            HAS_MASK=expanded_mask is not None,
         )
 
         numerator = partial.sum()
-        denominator = mask_flat.sum().clamp(min=1.0)
-        ctx.use_torch_backward = False
-        ctx.has_mask = expanded_mask is not None
         if expanded_mask is None:
-            ctx.save_for_backward(prediction, target)
-        else:
-            ctx.save_for_backward(prediction, target, expanded_mask)
-        ctx.denominator = float(denominator.item())
+            denominator = ctx.denominator
         return numerator / denominator
 
     @staticmethod
     def backward(ctx, grad_output: torch.Tensor):
         saved = ctx.saved_tensors
         if ctx.has_mask:
-            prediction, target, mask = saved
-            weight = mask.to(dtype=prediction.dtype)
+            prediction, target, mask, denominator = saved
+            weight = mask.float()
         else:
             prediction, target = saved
             weight = None
+            denominator = ctx.denominator
 
-        grad_scale = grad_output.to(dtype=prediction.dtype)
-        denom = max(ctx.denominator, 1.0)
-        grad_prediction = 2.0 * (prediction - target) / denom
+        # Subtract, normalize and apply GradScaler's upstream gradient in FP32.
+        # Casting before these operations can overflow an otherwise finite FP16
+        # gradient, or underflow small gradients before loss scaling rescues it.
+        gradient = 2.0 * (prediction.float() - target.float()) / denominator
         if weight is not None:
-            grad_prediction = grad_prediction * weight
-        grad_prediction = grad_prediction * grad_scale
-
-        grad_target = None
-        if ctx.needs_input_grad[1]:
-            grad_target = -grad_prediction
+            gradient = gradient * weight
+        gradient = gradient * grad_output.float()
+        grad_prediction = gradient.to(prediction.dtype) if ctx.needs_input_grad[0] else None
+        grad_target = -gradient.to(target.dtype) if ctx.needs_input_grad[1] else None
         return grad_prediction, grad_target, None
 
 
@@ -150,6 +151,12 @@ def fused_masked_mse_loss(
     Returns:
         Scalar mean-squared error over the masked region.
     """
+    if prediction.shape != target.shape or prediction.device != target.device:
+        raise ValueError("prediction and target must have matching shape and device")
+    if not prediction.is_floating_point() or not target.is_floating_point():
+        raise TypeError("prediction and target must be floating-point tensors")
+    if mask is not None and mask.requires_grad:
+        raise ValueError("supervision masks are fixed weights and must not require gradients")
     prepared_mask = _prepare_mask(mask, prediction) if mask is not None else None
     if not enabled:
         return _torch_masked_mse(prediction, target, prepared_mask)

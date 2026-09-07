@@ -5,6 +5,11 @@ from __future__ import annotations
 import json
 import logging
 import os
+import math
+import platform
+from pathlib import Path
+import time
+import uuid
 from dataclasses import asdict, is_dataclass
 from typing import Any
 
@@ -23,9 +28,12 @@ class ExperimentTracker:
         self.report_to = self._parse_backends(getattr(args, "report_to", "console"))
         self._tensorboard_writer = None
         self._wandb_run = None
+        self.run_id = uuid.uuid4().hex
+        self._local_metrics = None
 
         if self.output_dir:
             os.makedirs(self.output_dir, exist_ok=True)
+            self._local_metrics = open(os.path.join(self.output_dir, "metrics.jsonl"), "a", encoding="utf-8")
 
         self._init_tensorboard()
         self._init_wandb()
@@ -53,6 +61,18 @@ class ExperimentTracker:
 
     def log_config(self, config: dict[str, Any]) -> None:
         payload = self._to_serializable(config)
+        Path(self.output_dir, "config_snapshot.json").write_text(json.dumps(payload, indent=2) + "\n")
+        import torch
+        host = {"run_id": self.run_id, "python": platform.python_version(), "torch": torch.__version__,
+                "cuda_runtime": torch.version.cuda, "cuda_available": torch.cuda.is_available(),
+                "devices": [{"name": torch.cuda.get_device_name(i), "capability": list(torch.cuda.get_device_capability(i))}
+                            for i in range(torch.cuda.device_count())]}
+        Path(self.output_dir, "host_manifest.json").write_text(json.dumps(host, indent=2) + "\n")
+        Path(self.output_dir, "run_card.md").write_text(
+            "# Training run\n\n" + f"Run ID: {self.run_id}\n\n" +
+            "Host details: `host_manifest.json`. Exact config: `config_snapshot.json`.\n\n" +
+            "Raw observations: `metrics.jsonl`. This is a run record, not a signed hardware certification.\n"
+        )
         if self._tensorboard_writer is not None:
             self._tensorboard_writer.add_text(
                 "config/json",
@@ -66,10 +86,13 @@ class ExperimentTracker:
         payload: dict[str, float | int] = {}
         for key, value in metrics.items():
             scalar = self._to_scalar(value)
-            if scalar is not None:
+            if scalar is not None and math.isfinite(scalar):
                 payload[key] = scalar
         if not payload:
             return
+        if self._local_metrics is not None:
+            self._local_metrics.write(json.dumps({"run_id": self.run_id, "step": step, "time": time.time(), **payload}) + "\n")
+            self._local_metrics.flush()
         if self._tensorboard_writer is not None:
             for key, value in payload.items():
                 self._tensorboard_writer.add_scalar(key, value, global_step=step)
@@ -78,6 +101,9 @@ class ExperimentTracker:
             self._wandb_run.log(payload, step=step)
 
     def close(self) -> None:
+        if self._local_metrics is not None:
+            self._local_metrics.close()
+            self._local_metrics = None
         if self._tensorboard_writer is not None:
             self._tensorboard_writer.flush()
             self._tensorboard_writer.close()

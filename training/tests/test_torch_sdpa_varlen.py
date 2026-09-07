@@ -25,7 +25,7 @@ def _load_torch_sdpa_class():
     stubs = {}
     for name in package_names:
         module = types.ModuleType(name)
-        module.__path__ = []
+        module.__path__ = [str(PROJECT_ROOT / "inference" / name.replace(".", "/"))]
         stubs[name] = module
 
     registry = types.ModuleType("lightx2v.utils.registry_factory")

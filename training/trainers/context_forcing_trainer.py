@@ -238,6 +238,20 @@ class ContextForcingTrainer(BaseDistillTrainer):
         num_loss_chunks = 0
 
         for chunk_idx, (start, end) in enumerate(chunk_ranges):
+            if (
+                self.use_teacher_context
+                and chunk_idx + 1 < len(chunk_ranges)
+                and self.runtime is not None
+                and hasattr(self.runtime, "prefetch_teacher_context")
+            ):
+                next_indices = self._select_memory_frame_indices(
+                    effective_frames, chunk_idx + 1, chunk_size, latents.device
+                )
+                if next_indices is not None:
+                    next_batch = self._slice_temporal_conditions(batch, next_indices, total_frames)
+                    self.runtime.prefetch_teacher_context(
+                        next_batch, self.global_step, next_indices.detach().cpu().tolist()
+                    )
             num_target = end - start
             target_frames = latents[:, :, start:end]
 

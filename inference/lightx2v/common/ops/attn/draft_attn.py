@@ -5,30 +5,14 @@ import torch.nn.functional as F
 from loguru import logger
 
 from lightx2v.utils.registry_factory import ATTN_WEIGHT_REGISTER
+from lightx2v.utils.attention import attention as dense_attention
 
 from .template import AttnWeightTemplate
 
 try:
     from magi_attention.functional import flex_flash_attn_func as magi_ffa_func
-except ImportError:
+except (ImportError, OSError, RuntimeError):
     magi_ffa_func = None
-
-
-flash_attn_varlen_func = None
-try:
-    from flash_attn.flash_attn_interface import flash_attn_varlen_func as _func
-
-    flash_attn_varlen_func = _func
-except ImportError:
-    logger.info("flash_attn_varlen_func not found, please install flash_attn2 first")
-
-
-try:
-    from flash_attn_interface import flash_attn_varlen_func as _func
-
-    flash_attn_varlen_func = _func
-except ImportError:
-    logger.info("flash_attn_varlen_func_v3 not found, please install flash_attn3 first")
 
 
 @ATTN_WEIGHT_REGISTER("draft_attn")
@@ -209,14 +193,15 @@ class DraftAttnWeight(AttnWeightTemplate):
                 cu_seqlens_q = cu_seqlens_q.to(q.device)
             if cu_seqlens_kv is not None:
                 cu_seqlens_kv = cu_seqlens_kv.to(k.device)
-            out = flash_attn_varlen_func(
+            out = dense_attention(
                 q,
                 k,
                 v,
-                cu_seqlens_q,
-                cu_seqlens_kv,
-                max_seqlen_q,
-                max_seqlen_kv,
+                cu_seqlens_q=cu_seqlens_q,
+                cu_seqlens_k=cu_seqlens_kv,
+                max_seqlen_q=max_seqlen_q,
+                max_seqlen_k=max_seqlen_kv,
+                config=self.config,
             )
             return out.reshape(out.shape[0], -1)
 

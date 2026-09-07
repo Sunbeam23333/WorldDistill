@@ -1,5 +1,6 @@
 import re
 from abc import ABCMeta, abstractmethod
+from functools import wraps
 
 import torch
 import torch.distributed as dist
@@ -7,6 +8,7 @@ from loguru import logger
 from safetensors import safe_open
 
 from cuda_compat import validate_lightx2v_quant_backend
+from quant_compat import fp8_per_token_quantize, optional_attr, require_quant_backend
 
 from lightx2v.common.ops.mm.triton_kernels import (
     fp8_gemm_bias_triton,
@@ -15,6 +17,7 @@ from lightx2v.common.ops.mm.triton_kernels import (
     int8_gemm_bias_triton,
     int8_gemm_triton,
     int8_quantize_triton,
+    triton as _triton,
 )
 from lightx2v.common.ops.utils import *
 from lightx2v.utils.envs import *
@@ -57,27 +60,27 @@ def _require_sm120_quant_backend(scheme, *operators):
 
 try:
     from vllm import _custom_ops as ops
-except ImportError:
+except (ImportError, OSError, RuntimeError):
     ops = None
 
 try:
     import sgl_kernel
-except ImportError:
+except (ImportError, OSError, RuntimeError):
     sgl_kernel = None
 
 try:
     from q8_kernels.functional.linear import q8_linear
-except ImportError:
+except (ImportError, OSError, RuntimeError):
     q8_linear = None
 
 try:
     from q8_kernels.functional.linear import fp8_linear
-except ImportError:
+except (ImportError, OSError, RuntimeError):
     fp8_linear = None
 
 try:
     import deep_gemm
-except ImportError:
+except (ImportError, OSError, RuntimeError):
     deep_gemm = None
 
 try:
@@ -87,7 +90,7 @@ try:
     from torchao.quantization.utils import (
         quantize_activation_per_token_absmax as torchao_int8_quant,
     )
-except ImportError:
+except (ImportError, OSError, RuntimeError):
     try:
         from torchao.quantization.utils import (
             _quant_int8_per_token_matmul as torchao_int8_gemm,
@@ -95,17 +98,17 @@ except ImportError:
         from torchao.quantization.utils import (
             _quantize_activation_per_token_absmax as torchao_int8_quant,
         )
-    except ImportError:
+    except (ImportError, OSError, RuntimeError):
         torchao_int8_gemm, torchao_int8_quant = None, None
 
 try:
     import gguf
-except ImportError:
+except (ImportError, OSError, RuntimeError):
     gguf = None
 
 try:
     import marlin_cuda_quant
-except ImportError:
+except (ImportError, OSError, RuntimeError):
     marlin_cuda_quant = None
 
 import torch.distributed as dist
@@ -342,7 +345,56 @@ class MMWeight(MMWeightTemplate):
                 del bias_tensor
 
 
+def _require_registered_quant_backend(scheme, device=None):
+    triton_jit = optional_attr(_triton, "jit")
+    cutlass_mm = optional_attr(torch.ops._C, "cutlass_scaled_mm")
+    fp8_vllm_quant = optional_attr(ops, "scaled_fp8_quant")
+    int8_vllm_quant = optional_attr(ops, "scaled_int8_quant")
+    requirements = {
+        "fp8-vllm": {"vllm.scaled_fp8_quant": fp8_vllm_quant, "_C.cutlass_scaled_mm": cutlass_mm},
+        "int8-vllm": {"vllm.scaled_int8_quant": int8_vllm_quant, "_C.cutlass_scaled_mm": cutlass_mm},
+        "fp8-sgl": {"sgl_per_token_quant_fp8": optional_attr(sgl_kernel, "sgl_per_token_quant_fp8"), "fp8_scaled_mm": optional_attr(sgl_kernel, "fp8_scaled_mm")},
+        "int8-sgl": {"vllm.scaled_int8_quant": int8_vllm_quant, "sgl.int8_scaled_mm": optional_attr(sgl_kernel, "int8_scaled_mm")},
+        "fp8-triton": {"triton.jit": triton_jit},
+        "int8-triton": {"triton.jit": triton_jit},
+        "fp8-q8f": {"q8.fp8_linear": fp8_linear, "activation_quant": fp8_vllm_quant if callable(fp8_vllm_quant) else triton_jit},
+        "int8-q8f": {"q8.q8_linear": q8_linear, "activation_quant": int8_vllm_quant if callable(int8_vllm_quant) else triton_jit},
+        "fp8-torchao": {"torch._scaled_mm": optional_attr(torch, "_scaled_mm")},
+        "fp8-pertensor": {"torch._scaled_mm": optional_attr(torch, "_scaled_mm")},
+        "int8-torchao": {"torchao.quant": torchao_int8_quant, "torchao.gemm": torchao_int8_gemm},
+        "fp8-b128-deepgemm": {"deep_gemm.gemm_fp8_fp8_bf16_nt": optional_attr(deep_gemm, "gemm_fp8_fp8_bf16_nt"), "deep_gemm.ceil_div": optional_attr(deep_gemm, "ceil_div"), "sgl.group_quant": optional_attr(sgl_kernel, "sgl_per_token_group_quant_fp8")},
+        "int4-g128-marlin": {"marlin.mul": optional_attr(marlin_cuda_quant, "mul")},
+        "nvfp4": {"quant": scaled_nvfp4_quant, "gemm": cutlass_scaled_nvfp4_mm},
+        "mxfp4": {"quant": scaled_mxfp4_quant, "gemm": cutlass_scaled_mxfp4_mm},
+        "mxfp6-mxfp8": {"quant": scaled_mxfp8_quant, "gemm": cutlass_scaled_mxfp6_mxfp8_mm},
+        "mxfp8": {"quant": scaled_mxfp8_quant, "gemm": cutlass_scaled_mxfp8_mm},
+    }
+    require_quant_backend(scheme, requirements[scheme], device=device)
+
+
 class MMWeightQuantTemplate(MMWeightTemplate):
+    QUANT_BACKEND = None
+
+    def __init_subclass__(cls, **kwargs):
+        super().__init_subclass__(**kwargs)
+        method = cls.__dict__.get("apply")
+        if method is None:
+            return
+
+        @wraps(method)
+        def checked_apply(self, input_tensor, *args, **kwargs):
+            if self.QUANT_BACKEND == "fp8-b128-deepgemm" and input_tensor.dtype != torch.bfloat16:
+                raise TypeError("DeepGEMM gemm_fp8_fp8_bf16_nt requires BF16 output/input activation dtype")
+            if self.QUANT_BACKEND == "int4-g128-marlin" and input_tensor.dtype != torch.float16:
+                raise TypeError("The vendored Marlin W4A16 entry requires FP16 activations")
+            device_key = str(input_tensor.device)
+            if self.QUANT_BACKEND and device_key not in self._validated_quant_devices:
+                _require_registered_quant_backend(self.QUANT_BACKEND, input_tensor.device)
+                self._validated_quant_devices.add(device_key)
+            return method(self, input_tensor, *args, **kwargs)
+
+        cls.apply = checked_apply
+
     def __init__(
         self,
         weight_name,
@@ -366,6 +418,9 @@ class MMWeightQuantTemplate(MMWeightTemplate):
             lora_prefix,
             lora_path,
         )
+        self._validated_quant_devices = set()
+        if self.QUANT_BACKEND:
+            _require_registered_quant_backend(self.QUANT_BACKEND)
         self.weight_scale_name = self.weight_name.removesuffix(".weight") + ".weight_scale"
         self.load_func = None
         self.weight_need_transpose = True
@@ -545,11 +600,7 @@ class MMWeightQuantTemplate(MMWeightTemplate):
         return input_tensor_quant, input_tensor_scale
 
     def act_quant_fp8_perchannel_sym_torchao(self, x):
-        abs_max = x.abs().max(dim=-1, keepdim=True)[0]
-        abs_max = torch.clamp(abs_max, min=1e-8)
-        scale = abs_max / 448.0
-        quantized = torch.clamp(x / scale, -448, 448).to(torch.float8_e4m3fn)
-        return quantized, scale.float()
+        return fp8_per_token_quantize(x)
 
     def act_quant_fp8_perchannel_sym_vllm(self, x):
         input_tensor_quant, input_tensor_scale = ops.scaled_fp8_quant(x, None, scale_ub=None, use_per_token_if_dynamic=True)
@@ -557,8 +608,8 @@ class MMWeightQuantTemplate(MMWeightTemplate):
 
     def act_quant_fp8_perchannel_sym_sgl(self, x):
         m, k = x.shape
-        input_tensor_quant = torch.empty((m, k), dtype=torch.float8_e4m3fn, device="cuda", requires_grad=False)
-        input_tensor_scale = torch.empty((m, 1), dtype=torch.float32, device="cuda", requires_grad=False)
+        input_tensor_quant = torch.empty((m, k), dtype=torch.float8_e4m3fn, device=x.device, requires_grad=False)
+        input_tensor_scale = torch.empty((m, 1), dtype=torch.float32, device=x.device, requires_grad=False)
         sgl_kernel.sgl_per_token_quant_fp8(x, input_tensor_quant, input_tensor_scale)
         return input_tensor_quant, input_tensor_scale
 
@@ -587,8 +638,10 @@ class MMWeightQuantTemplate(MMWeightTemplate):
 
     def act_quant_fp8_perchannelgroup128_sym_sgl(self, x):
         m, k = x.shape
-        input_tensor_quant = torch.empty((m, k), dtype=torch.float8_e4m3fn, device="cuda", requires_grad=False)
-        input_tensor_scale = torch.empty((m, k // 128), dtype=torch.float32, device="cuda", requires_grad=False)
+        if k % 128:
+            raise ValueError("DeepGEMM group-128 activation quantization requires K divisible by 128")
+        input_tensor_quant = torch.empty((m, k), dtype=torch.float8_e4m3fn, device=x.device, requires_grad=False)
+        input_tensor_scale = torch.empty((m, k // 128), dtype=torch.float32, device=x.device, requires_grad=False)
         sgl_kernel.sgl_per_token_group_quant_fp8(
             x,
             input_tensor_quant,
@@ -603,6 +656,7 @@ class MMWeightQuantTemplate(MMWeightTemplate):
 
 @MM_WEIGHT_REGISTER("fp8-vllm")
 class MMWeightWfp8channelAfp8channeldynamicVllm(MMWeightQuantTemplate):
+    QUANT_BACKEND = "fp8-vllm"
     """
     Name: W-fp8-channel-sym-A-fp8-channel-sym-dynamic-Vllm
 
@@ -662,6 +716,7 @@ class MMWeightWfp8channelAfp8channeldynamicVllm(MMWeightQuantTemplate):
 
 @MM_WEIGHT_REGISTER("int8-vllm")
 class MMWeightWint8channelAint8channeldynamicVllm(MMWeightQuantTemplate):
+    QUANT_BACKEND = "int8-vllm"
     """
     Name: W-int8-channel-sym-A-int8-channel-sym-dynamic-Vllm
 
@@ -721,6 +776,7 @@ class MMWeightWint8channelAint8channeldynamicVllm(MMWeightQuantTemplate):
 
 @MM_WEIGHT_REGISTER("mxfp4")
 class MMWeightWmxfp4Amxfp4dynamic(MMWeightQuantTemplate):
+    QUANT_BACKEND = "mxfp4"
     """
     Name: W-mxfp4-A-mxfp4-dynamic
 
@@ -781,6 +837,7 @@ class MMWeightWmxfp4Amxfp4dynamic(MMWeightQuantTemplate):
 
 @MM_WEIGHT_REGISTER("mxfp6-mxfp8")
 class MMWeightWmxfp6Amxfp8dynamic(MMWeightQuantTemplate):
+    QUANT_BACKEND = "mxfp6-mxfp8"
     """
     Name: W-mxfp6-A-nvfp8-dynamic
 
@@ -841,6 +898,7 @@ class MMWeightWmxfp6Amxfp8dynamic(MMWeightQuantTemplate):
 
 @MM_WEIGHT_REGISTER("mxfp8")
 class MMWeightWmxfp8Amxfp8dynamic(MMWeightQuantTemplate):
+    QUANT_BACKEND = "mxfp8"
     """
     Name: W-mxfp8-A-nvfp8-dynamic
 
@@ -901,6 +959,7 @@ class MMWeightWmxfp8Amxfp8dynamic(MMWeightQuantTemplate):
 
 @MM_WEIGHT_REGISTER("nvfp4")
 class MMWeightWnvfp4Anvfp4dynamic(MMWeightQuantTemplate):
+    QUANT_BACKEND = "nvfp4"
     """
     Name: W-nvfp4-A-nvfp4-dynamic
 
@@ -1327,6 +1386,7 @@ class MMCalibNvfp4(MMWeight):
 
 @MM_WEIGHT_REGISTER("fp8-q8f")
 class MMWeightWfp8channelAfp8channeldynamicQ8F(MMWeightQuantTemplate):
+    QUANT_BACKEND = "fp8-q8f"
     """
     Name: W-fp8-channel-sym-A-fp8-channel-sym-dynamic-Q8F
 
@@ -1363,7 +1423,7 @@ class MMWeightWfp8channelAfp8channeldynamicQ8F(MMWeightQuantTemplate):
         self.weight_need_transpose = False
         self.bias_force_fp32 = True
         self.scale_force_fp32 = True
-        if ops is not None:
+        if callable(optional_attr(ops, "scaled_fp8_quant")):
             self.act_quant_func = self.act_quant_fp8_perchannel_sym_vllm
         else:
             self.act_quant_func = fp8_quantize_triton
@@ -1385,6 +1445,7 @@ class MMWeightWfp8channelAfp8channeldynamicQ8F(MMWeightQuantTemplate):
 
 @MM_WEIGHT_REGISTER("int8-q8f")
 class MMWeightWint8channelAint8channeldynamicQ8F(MMWeightQuantTemplate):
+    QUANT_BACKEND = "int8-q8f"
     """
     Name: W-int8-channel-sym-A-int8-channel-sym-dynamic-Q8F
 
@@ -1421,7 +1482,7 @@ class MMWeightWint8channelAint8channeldynamicQ8F(MMWeightQuantTemplate):
         self.weight_need_transpose = False
         self.bias_force_fp32 = True
         self.scale_force_fp32 = True
-        if ops is not None:
+        if callable(optional_attr(ops, "scaled_int8_quant")):
             self.act_quant_func = self.act_quant_int8_perchannel_sym_vllm
         else:
             self.act_quant_func = int8_quantize_triton
@@ -1444,6 +1505,7 @@ class MMWeightWint8channelAint8channeldynamicQ8F(MMWeightQuantTemplate):
 
 @MM_WEIGHT_REGISTER("fp8-triton")
 class MMWeightWfp8channelAfp8channeldynamicTriton(MMWeightQuantTemplate):
+    QUANT_BACKEND = "fp8-triton"
     """
     Name: W-fp8-channel-sym-A-fp8-channel-sym-dynamic-triton
 
@@ -1507,6 +1569,7 @@ class MMWeightWfp8channelAfp8channeldynamicTriton(MMWeightQuantTemplate):
 
 @MM_WEIGHT_REGISTER("int8-triton")
 class MMWeightWint8channelAint8channeldynamicTriton(MMWeightQuantTemplate):
+    QUANT_BACKEND = "int8-triton"
     """
     Name: W-int8-channel-sym-A-int8-channel-sym-dynamic-triton
 
@@ -1571,6 +1634,7 @@ class MMWeightWint8channelAint8channeldynamicTriton(MMWeightQuantTemplate):
 
 @MM_WEIGHT_REGISTER("fp8-b128-deepgemm")
 class MMWeightWfp8block128Afp8channelgroup128dynamicDeepgemmActSgl(MMWeightQuantTemplate):
+    QUANT_BACKEND = "fp8-b128-deepgemm"
     """
     Name: W-fp8-block128-sym-A-fp8-channel-group128-sym-dynamic-Deepgemm-ActSgl
 
@@ -1628,6 +1692,7 @@ class MMWeightWfp8block128Afp8channelgroup128dynamicDeepgemmActSgl(MMWeightQuant
 
 @MM_WEIGHT_REGISTER("fp8-sgl")
 class MMWeightWfp8channelAfp8channeldynamicSgl(MMWeightQuantTemplate):
+    QUANT_BACKEND = "fp8-sgl"
     """
     Name: W-fp8-channel-sym-A-fp8-channel-sym-dynamic-Sgl
 
@@ -1682,6 +1747,7 @@ class MMWeightWfp8channelAfp8channeldynamicSgl(MMWeightQuantTemplate):
 
 @MM_WEIGHT_REGISTER("int8-sgl")
 class MMWeightWint8channelAint8channeldynamicSglActVllm(MMWeightQuantTemplate):
+    QUANT_BACKEND = "int8-sgl"
     """
     Name: W-int8-channel-sym-A-int8-channel-sym-dynamic-Sgl-ActVllm
 
@@ -1741,6 +1807,7 @@ class MMWeightWint8channelAint8channeldynamicSglActVllm(MMWeightQuantTemplate):
 
 @MM_WEIGHT_REGISTER("fp8-torchao")
 class MMWeightWfp8channelAfp8channeldynamicTorchao(MMWeightQuantTemplate):
+    QUANT_BACKEND = "fp8-torchao"
     """
     Name: W-fp8-channel-sym-A-fp8-channel-sym-dynamic-Torchao
 
@@ -1796,6 +1863,7 @@ class MMWeightWfp8channelAfp8channeldynamicTorchao(MMWeightQuantTemplate):
 
 @MM_WEIGHT_REGISTER("int8-torchao")
 class MMWeightWint8channelAint8channeldynamicTorchao(MMWeightQuantTemplate):
+    QUANT_BACKEND = "int8-torchao"
     """
     Name: W-int8-channel-sym-A-int8-channel-sym-dynamic-Torchao
 
@@ -2044,6 +2112,7 @@ class MMWeightGGUFQ3KS(MMWeightGGUFTemplate):
 
 @MM_WEIGHT_REGISTER("int4-g128-marlin")
 class MMWeightWint4group128Marlin(MMWeightQuantTemplate):
+    QUANT_BACKEND = "int4-g128-marlin"
     """
     Name: "W-int4-group128-sym-Marlin
 
@@ -2116,6 +2185,7 @@ class MMWeightWint4group128Marlin(MMWeightQuantTemplate):
 
 @MM_WEIGHT_REGISTER("fp8-pertensor")
 class MMWeightWfp8tensorAfp8tensordynamic(MMWeightQuantTemplate):
+    QUANT_BACKEND = "fp8-pertensor"
     def __init__(
         self,
         weight_name,

@@ -51,11 +51,29 @@ bash scripts/setup_env.sh --install-deepspeed
 ```
 
 `--install-kernels` installs the PyPI `flash-attn` package (the FA2 import path)
-and `sgl-kernel`. FA3 uses the separate top-level `flash_attn_interface` build;
+and `sgl-kernel`. FA3 accepts the separate `flash_attn_3.flash_attn_interface`
+package and the older top-level `flash_attn_interface` build;
 Sage2 and Sage3 use `sageattention` and `sageattn3`. Install those manually from
 a revision documented for the target GPU and record that revision. Kernel
 installation may require a compiler, CUDA toolkit, and Ninja. A package
 importing successfully on one GPU does not establish compatibility on another.
+
+### Isolated modern training integration
+
+The vendored inference engine retains its Transformers 4.57.1 pin. The optional
+`requirements-validation.txt` instead describes the separate Diffusers 0.40.0 /
+Transformers 5.16.1 **training** environment tested by CI. In a fresh Python 3.11
+environment, install a target-appropriate PyTorch build first, then:
+
+```bash
+python -m pip install -r requirements-validation.txt
+python -m pytest -q training/tests
+```
+
+Run training from the repository with `python -m training.train_distill` and
+`--required_transformers_version 5.16.1` (plus the model/data arguments). Do not
+install this requirements file over a working inference environment, or treat
+these CPU integration tests as qualification of a CUDA wheel or kernel binary.
 
 ### Server frontend assets
 

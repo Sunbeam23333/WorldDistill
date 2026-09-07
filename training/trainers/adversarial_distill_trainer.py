@@ -29,6 +29,7 @@ References:
 """
 
 import os
+from contextlib import contextmanager
 from typing import Any, Dict
 
 import torch
@@ -37,6 +38,23 @@ import torch.nn.functional as F
 from loguru import logger
 
 from training.trainers.base_distill_trainer import BaseDistillTrainer
+
+
+@contextmanager
+def frozen_discriminator(model):
+    """Keep critic parameters and spectral-norm buffers fixed during G updates."""
+    parameters = list(model.parameters())
+    states = [parameter.requires_grad for parameter in parameters]
+    was_training = model.training
+    try:
+        model.eval()
+        for parameter in parameters:
+            parameter.requires_grad_(False)
+        yield
+    finally:
+        model.train(was_training)
+        for parameter, state in zip(parameters, states):
+            parameter.requires_grad_(state)
 
 
 class ProjectionDiscriminator(nn.Module):
@@ -115,7 +133,7 @@ class ProjectionDiscriminator(nn.Module):
             features = self._forward_2d(x)  # (B*T, final_dim)
             features = features.view(B, T, -1).permute(0, 2, 1)  # (B, D, T)
             features = self.temporal_pool(features).squeeze(-1)  # (B, D)
-            return self.head[2](features).unsqueeze(-1)  # Use only the linear layer
+            return self.head[2](features)  # (B, 1)
         else:
             features = self._forward_2d(x)
             return self.head(features.unsqueeze(-1).unsqueeze(-1))
@@ -198,7 +216,7 @@ class AdversarialDistillTrainer(BaseDistillTrainer):
         ):
             self.discriminator = nn.parallel.DistributedDataParallel(
                 self.discriminator,
-                device_ids=[int(os.environ.get("LOCAL_RANK", 0))],
+                device_ids=[int(os.environ.get("LOCAL_RANK", 0))] if self.device.type == "cuda" else None,
                 find_unused_parameters=False,
             )
         super().train()
@@ -244,7 +262,7 @@ class AdversarialDistillTrainer(BaseDistillTrainer):
             only_inputs=True,
         )[0]
 
-        r1_penalty = gradients.view(gradients.size(0), -1).norm(2, dim=1).pow(2).mean()
+        r1_penalty = gradients.reshape(gradients.size(0), -1).norm(2, dim=1).pow(2).mean()
         return r1_penalty
 
     def _forward_and_loss(self, batch: Dict[str, Any]) -> torch.Tensor:
@@ -255,6 +273,7 @@ class AdversarialDistillTrainer(BaseDistillTrainer):
         """
         latents = batch["latents"]
         bs = latents.shape[0]
+        training = torch.is_grad_enabled() and self.student_model.training
 
         # Sample timesteps and create noisy latents
         timesteps = self._sample_timesteps(bs)
@@ -266,7 +285,7 @@ class AdversarialDistillTrainer(BaseDistillTrainer):
         # ---- Step 1: Discriminator update ----
         disc_loss = torch.tensor(0.0, device=self.device)
         if (
-            self.global_step >= self.disc_start_step
+            training and self.global_step >= self.disc_start_step
             and self.global_step % self.disc_update_freq == 0
         ):
             self.discriminator.train()
@@ -287,7 +306,7 @@ class AdversarialDistillTrainer(BaseDistillTrainer):
             d_loss_fake = F.relu(1.0 + fake_logits).mean()  # Hinge loss
 
             # R1 gradient penalty
-            r1_penalty = self._compute_r1_penalty(latents)
+            r1_penalty = self._compute_r1_penalty(latents) if self.r1_penalty_weight > 0 else 0.0
 
             disc_loss = d_loss_real + d_loss_fake + self.r1_penalty_weight * r1_penalty
             disc_loss.backward()
@@ -317,8 +336,10 @@ class AdversarialDistillTrainer(BaseDistillTrainer):
         if self.global_step >= self.disc_start_step:
             # Generate from student (with grad this time)
             fake_x0 = self._v_to_x0(student_output, noisy_latents, sigmas_expanded)
-            fake_logits = self.discriminator(fake_x0)
-            gen_adv_loss = -fake_logits.mean()  # Non-saturating GAN loss
+            raw_disc = self._unwrap_model(self.discriminator)
+            with frozen_discriminator(raw_disc):
+                fake_logits = raw_disc(fake_x0)
+                gen_adv_loss = -fake_logits.mean()
 
         # Combined generator loss
         total_gen_loss = (
@@ -328,6 +349,10 @@ class AdversarialDistillTrainer(BaseDistillTrainer):
 
         self._gen_loss_ema = 0.9 * self._gen_loss_ema + 0.1 * total_gen_loss.item()
         return total_gen_loss
+
+    def validation_step(self, batch):
+        with torch.no_grad():
+            return self._forward_and_loss(batch)
 
     def compute_distill_loss(
         self,

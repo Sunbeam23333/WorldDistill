@@ -77,7 +77,9 @@ class VideoDataset(Dataset):
 
         video_path = os.path.join(self.video_dir, video_key) if self.video_dir and not os.path.isabs(video_key) else video_key
 
-        frames = self._load_video(video_path, item.get("num_frames", self.num_frames))
+        frames, frame_indices, source_frames = self._load_video(
+            video_path, item.get("num_frames", self.num_frames), return_metadata=True
+        )
 
         result = {
             "pixel_values": frames,  # (C, T, H, W) float32 in [-1, 1]
@@ -85,6 +87,9 @@ class VideoDataset(Dataset):
             "resolution": item.get("resolution", [self.target_h, self.target_w]),
             "num_frames": frames.shape[1],
             "video_path": video_path,
+            "sample_id": str(item.get("sample_id") or video_path),
+            "manifest_idx": idx,
+            "source_frame_indices": frame_indices,
         }
 
         if "camera_path" in item and item.get("camera_path"):
@@ -92,6 +97,19 @@ class VideoDataset(Dataset):
 
         if "action_path" in item and item.get("action_path"):
             result["actions"] = self._load_optional_tensor(item["action_path"], "action")
+
+        for key, prefix in (("actions", "action"), ("camera_poses", "camera")):
+            if key not in result:
+                continue
+            value = result[key]
+            axis = int(item.get(f"{prefix}_temporal_axis", 0))
+            if value.ndim == 0 or not -value.ndim <= axis < value.ndim or value.shape[axis] != source_frames:
+                raise ValueError(
+                    f"Raw {key} must declare one entry per source video frame ({source_frames}); "
+                    f"got {tuple(value.shape)} on temporal axis {axis}. Resample timestamped controls before loading."
+                )
+            # Standardize to T,... before DataLoader adds the batch dimension.
+            result[key] = value.index_select(axis, frame_indices).movedim(axis, 0)
 
         return result
 
@@ -118,7 +136,7 @@ class VideoDataset(Dataset):
             )
         return value
 
-    def _load_video(self, video_path: str, num_frames: int) -> torch.Tensor:
+    def _load_video(self, video_path: str, num_frames: int, *, return_metadata: bool = False):
         """Load video frames using decord or torchvision fallback.
 
         Returns:
@@ -154,11 +172,13 @@ class VideoDataset(Dataset):
                 )
 
         frames = self._pad_or_trim_frames(frames, num_frames)
+        if indices.numel() < num_frames:
+            indices = torch.cat((indices, indices[-1:].expand(num_frames - indices.numel())))
 
         if self.transform is not None:
             frames = self.transform(frames)
 
-        return frames
+        return (frames, indices, total) if return_metadata else frames
 
     @staticmethod
     def _sample_frame_indices(total_frames: int, target_frames: int) -> torch.Tensor:
@@ -234,6 +254,7 @@ class CachedLatentDataset(Dataset):
             "image_cond_path",
             "camera_path",
             "action_path",
+            "conditioning_path",
         )
         for idx, item in enumerate(self.data):
             if not isinstance(item, dict):
@@ -300,6 +321,18 @@ class CachedLatentDataset(Dataset):
             "sample_id": sample_id,
             "manifest_idx": idx,
         }
+
+        # Model-specific multi-encoder tensors (e.g. Hunyuan pooled/text2/masks)
+        # travel together, rather than being silently reduced to one embedding.
+        if item.get("conditioning_path"):
+            conditioning = self._load_cached_tensor(item, idx, "conditioning_path")
+            if not isinstance(conditioning, dict) or any(not isinstance(k, str) or not torch.is_tensor(v)
+                                                         for k, v in conditioning.items()):
+                raise TypeError("conditioning_path must contain a dict of named tensors")
+            reserved = {"latents", "num_frames", "sample_id", "manifest_idx"}
+            if reserved.intersection(conditioning):
+                raise ValueError("conditioning_path cannot override latent/sample metadata")
+            result.update(conditioning)
 
         # Load text embeddings
         if "text_embed_path" in item:

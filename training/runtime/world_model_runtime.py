@@ -109,26 +109,48 @@ class WorldModelTeacherStudentRuntime(TeacherStudentRuntime):
         producer: Callable[[], torch.Tensor],
     ) -> torch.Tensor:
         allow_cache = self.cache_mode in {"teacher_context", "hybrid"}
-        conditioning = {
-            key: batch[key]
-            for key in ("encoder_hidden_states", "image_cond", "camera_poses", "actions")
-            if key in batch and batch[key] is not None
-        }
         return self.get_or_create_cached_value(
             namespace="teacher_context",
             batch=batch,
             global_step=global_step,
             producer=producer,
-            extra={
-                "chunk_start": chunk_start,
-                "chunk_end": chunk_end,
-                "frame_indices": frame_indices or [],
-                "prefetch_policy": self.prefetch_policy,
-                "memory_policy": self.memory_policy,
-                "memory_budget_frames": self.memory_budget_frames,
-                "conditioning": conditioning,
-            },
+            extra=self._teacher_context_cache_extra(batch, chunk_start, chunk_end, frame_indices),
             allow_cache=allow_cache,
+        )
+
+    def _teacher_context_cache_extra(self, batch, chunk_start, chunk_end, frame_indices):
+        conditioning = {
+            key: batch[key]
+            for key in (
+                "encoder_hidden_states", "encoder_attention_mask", "pooled_projections",
+                "encoder_hidden_states_2", "encoder_attention_mask_2", "image_embeds",
+                "encoder_hidden_states_image", "image_cond", "camera_poses", "actions",
+                "guidance", "timestep_r", "image_rotary_emb", "rope_interpolation_scale",
+            )
+            if key in batch and batch[key] is not None
+        }
+        return {
+            "chunk_start": chunk_start,
+            "chunk_end": chunk_end,
+            "frame_indices": frame_indices or [],
+            "prefetch_policy": self.prefetch_policy,
+            "memory_policy": self.memory_policy,
+            "memory_budget_frames": self.memory_budget_frames,
+            "conditioning": conditioning,
+            # IDs alone do not identify an augmented/replaced source video.
+            "source_latents": batch.get("latents"),
+        }
+
+    def prefetch_teacher_context(self, batch, global_step, frame_indices):
+        if self.cache_mode not in {"teacher_context", "hybrid"} or not frame_indices:
+            return False
+        return self.prefetch_cached_value(
+            namespace="teacher_context",
+            batch=batch,
+            global_step=global_step,
+            extra=self._teacher_context_cache_extra(
+                batch, frame_indices[0], frame_indices[-1] + 1, frame_indices
+            ),
         )
 
     def build_prefetch_request(

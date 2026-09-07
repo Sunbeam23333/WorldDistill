@@ -7,7 +7,7 @@ with non-decreasing noise levels for finite-window long-video training.
 Key training dynamics:
 - Per-frame independent timestep sampling with monotonic non-decreasing constraint
 - Sliding window training with overlap for temporal consistency
-- Optional causal attention masking (future frames don't attend to past)
+- Optional causal attention masking (past frames cannot attend to future)
 - Teacher provides guidance at matched per-frame noise levels
 - Supports autoregressive unrolling for end-to-end training
 
@@ -110,7 +110,9 @@ class StreamDistillTrainer(BaseDistillTrainer):
         batch: Dict[str, Any],
         frame_indices: torch.Tensor,
         total_frames: int,
-    ) -> torch.Tensor:
+        generated_context=None,
+        return_generated: bool = False,
+    ):
         """Compute loss for a single sliding window.
 
         Args:
@@ -127,34 +129,44 @@ class StreamDistillTrainer(BaseDistillTrainer):
 
         # Sample per-frame timesteps (non-decreasing)
         per_frame_timesteps = self._sample_per_frame_timesteps(bs, num_frames)
+        context_frames = 0 if generated_context is None else generated_context.shape[2]
+        if context_frames:
+            # Previously generated overlap is clean conditioning, never re-noised
+            # GT. Keep its graph so later-window loss can train earlier outputs.
+            per_frame_timesteps[:, :context_frames] = 0
         per_frame_sigmas = per_frame_timesteps / self.num_train_timesteps
 
         # Create per-frame noisy latents
         noise = torch.randn_like(latents_window)
         sigmas_expanded = per_frame_sigmas.view(bs, 1, num_frames, 1, 1)
         noisy_latents = (1 - sigmas_expanded) * latents_window + sigmas_expanded * noise
+        if context_frames:
+            noisy_latents = torch.cat(
+                [generated_context, noisy_latents[:, :, context_frames:]], dim=2
+            )
 
-        # Build input kwargs
-        teacher_input = self.prepare_teacher_input(window_batch, noisy_latents, per_frame_timesteps)
-        student_input = self.prepare_student_input(window_batch, noisy_latents, per_frame_timesteps)
-
-        # Add causal mask if enabled
-        if self.causal_attention:
-            causal_mask = self._build_causal_mask(num_frames)
-            teacher_input["temporal_mask"] = causal_mask
-            student_input["temporal_mask"] = causal_mask
-
-        teacher_output, student_output = self._run_teacher_student_pair(
-            teacher_input=teacher_input,
-            student_input=student_input,
-            batch=window_batch,
-            cache_extra={"timesteps": per_frame_timesteps, "mode": "stream_window", "window_frames": num_frames},
-        )
-
-        loss = self.compute_distill_loss(
-            teacher_output, student_output, window_batch, per_frame_timesteps
-        )
-        return loss
+        loss = torch.zeros((), device=self.device)
+        current = noisy_latents
+        for step_index in range(self.denoising_steps):
+            step_timesteps = per_frame_timesteps * (1.0 - step_index / self.denoising_steps)
+            teacher_input = self.prepare_teacher_input(window_batch, current.to(latents_window.dtype), step_timesteps)
+            student_input = self.prepare_student_input(window_batch, current.to(latents_window.dtype), step_timesteps)
+            if self.causal_attention:
+                causal_mask = self._build_causal_mask(num_frames)
+                teacher_input["temporal_mask"] = causal_mask
+                student_input["temporal_mask"] = causal_mask
+            teacher_output, student_output = self._run_teacher_student_pair(
+                teacher_input=teacher_input,
+                student_input=student_input,
+                batch=window_batch,
+                cache_extra={"timesteps": step_timesteps, "mode": "stream_unroll", "step": step_index},
+            )
+            loss = loss + self.compute_distill_loss(
+                teacher_output, student_output, window_batch, step_timesteps
+            )
+            current = current.float() - sigmas_expanded / self.denoising_steps * student_output.float()
+        loss = loss / self.denoising_steps
+        return (loss, current) if return_generated else loss
 
     def _forward_and_loss(self, batch: Dict[str, Any]) -> torch.Tensor:
         """Override forward to use sliding window with per-frame noise levels."""
@@ -170,6 +182,7 @@ class StreamDistillTrainer(BaseDistillTrainer):
         total_loss = torch.tensor(0.0, device=self.device)
         num_windows = 0
         stride = max(1, self.window_size - self.overlap_frames)
+        generated_context = None
 
         for start in range(0, num_frames - self.overlap_frames, stride):
             end = min(start + self.window_size, num_frames)
@@ -179,12 +192,15 @@ class StreamDistillTrainer(BaseDistillTrainer):
                 continue
 
             frame_indices = torch.arange(start, end, device=latents.device)
-            window_loss = self._compute_window_loss(
+            window_loss, generated = self._compute_window_loss(
                 latents_window,
                 batch,
                 frame_indices,
                 num_frames,
+                generated_context=generated_context,
+                return_generated=True,
             )
+            generated_context = generated[:, :, -self.overlap_frames:] if self.overlap_frames else None
             total_loss = total_loss + window_loss
             num_windows += 1
 

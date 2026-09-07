@@ -43,19 +43,31 @@ run_train_phase() {
 }
 
 run_infer_phase() {
+    if [[ "${INFER_NUM_GPUS}" != "1" ]]; then
+        echo "ERROR: the exported-student Diffusers sampler currently supports INFER_NUM_GPUS=1 only." >&2
+        exit 1
+    fi
     mkdir -p "${OUTPUT_ROOT}/samples"
     warn_if_template_manifest "${ACTION_PATH}"
+    # Original WorldPlay runners and Diffusers training weights are not
+    # interchangeable. A compatible pipeline must declare its action inputs.
+    if [[ -z "${STUDENT_PIPELINE_CONDITIONS:-}" && "${DRY_RUN}" != "1" ]]; then
+        echo "ERROR: set STUDENT_PIPELINE_CONDITIONS to the trained pipeline's action/control kwargs JSON; controls are never silently dropped." >&2
+        exit 1
+    fi
+    if [[ -z "${STUDENT_NUM_STEPS:-}" && "${DRY_RUN}" != "1" ]]; then
+        echo "ERROR: set STUDENT_NUM_STEPS for the compatible world-model sampler; context-forcing does not define a universal inference timetable." >&2
+        exit 1
+    fi
+    run_cmd python3 "${PROJECT_ROOT}/tools/export_student.py" \
+        --base_model "${TEACHER_MODEL}" --checkpoint "${OUTPUT_ROOT}/train" \
+        --output_dir "${OUTPUT_ROOT}/student_export" --num_steps "${STUDENT_NUM_STEPS:-4}"
     print_header "World-model distilled rollout"
-    run_cmd bash "${PROJECT_ROOT}/scripts/run_infer.sh" \
-        --model_cls worldplay_distill \
-        --task game \
-        --model_path "${MODEL_ROOT_DIR}" \
-        --transformer_model_name 480p_i2v \
-        --action_ckpt "${ACTION_CKPT}" \
-        --action_path "${ACTION_PATH}" \
+    run_cmd python3 "${PROJECT_ROOT}/tools/sample_student.py" \
+        --bundle "${OUTPUT_ROOT}/student_export" \
+        --conditions "${STUDENT_PIPELINE_CONDITIONS:-/path/to/pipeline_conditions.json}" \
         --image_path "${INPUT_IMAGE}" \
         --prompt "${PROMPT}" \
-        --gpus "${INFER_NUM_GPUS}" \
         --save_path "${OUTPUT_ROOT}/samples/worldplay_distill.mp4"
 
     print_header "World-model AR baseline rollout"

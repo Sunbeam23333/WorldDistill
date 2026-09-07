@@ -119,10 +119,13 @@ class TrainerArgs:
 
     # --- Distribution Matching Distillation (DMD/DMD2) ---
     dmd_variant: str = "dmd"  # dmd | dmd2
-    dmd_lambda_distill: float = 1.0  # Weight for teacher distillation loss
-    dmd_lambda_reg: float = 1.0  # Weight for distribution regularization loss (DMD)
+    dmd_lambda_distill: float = 1.0  # Weight for distribution-matching generator gradient
+    dmd_lambda_reg: float = 1.0  # Paired teacher-trajectory regression, DMD only
     dmd_fake_score_lr_ratio: float = 1.0  # LR ratio for fake score network vs student
     dmd_fake_score_update_freq: int = 1  # Fake score update frequency
+    dmd_fake_score_updates: int = 5  # DSM optimizer updates per generator iteration
+    dmd_student_steps: int = 1  # Actual differentiable generator sampling steps
+    dmd_teacher_steps: int = 32  # Online teacher sampler for DMD paired regression
     dmd_use_ema_fake_score: bool = False  # Use EMA for fake score network
     dmd_use_gan: bool = False  # Use GAN loss (DMD2-style)
     dmd_gan_weight: float = 0.1  # Weight for GAN generator loss
@@ -241,6 +244,8 @@ class TrainerArgs:
 
     # --- Inference Steps (for script compatibility) ---
     num_inference_steps: int = 4
+    profile_warmup_steps: int = 0
+    profile_active_steps: int = 0
 
     def __post_init__(self):
         if self.distill_preset:
@@ -258,6 +263,8 @@ class TrainerArgs:
             )
         if self.gradient_accumulation_steps < 1:
             raise ValueError("gradient_accumulation_steps must be at least 1")
+        if self.profile_warmup_steps < 0 or self.profile_active_steps < 0:
+            raise ValueError("Profiler step counts must be non-negative")
         if self.max_grad_norm < 0:
             raise ValueError("max_grad_norm must be non-negative")
         if self.grad_skip_threshold <= 0:
@@ -371,6 +378,8 @@ def build_training_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--required_transformers_version", type=str, default=_expected_transformers_version)
     parser.add_argument("--config_json", type=str, default="")
     parser.add_argument("--output_dir", type=str, default="./results/distill")
+    parser.add_argument("--profile_warmup_steps", type=int, default=0)
+    parser.add_argument("--profile_active_steps", type=int, default=0)
 
     # Distillation
     parser.add_argument(
@@ -517,6 +526,9 @@ def build_training_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--dmd_lambda_reg", type=float, default=1.0)
     parser.add_argument("--dmd_fake_score_lr_ratio", type=float, default=1.0)
     parser.add_argument("--dmd_fake_score_update_freq", type=int, default=1)
+    parser.add_argument("--dmd_fake_score_updates", type=int, default=5)
+    parser.add_argument("--dmd_student_steps", type=int, default=1)
+    parser.add_argument("--dmd_teacher_steps", type=int, default=32)
     parser.add_argument("--dmd_use_ema_fake_score", action="store_true")
     parser.add_argument("--dmd_use_gan", action="store_true")
     parser.add_argument("--dmd_gan_weight", type=float, default=0.1)

@@ -2,12 +2,7 @@ import torch
 import torch.distributed as dist
 from loguru import logger
 
-try:
-    import flash_attn  # noqa: F401
-    from flash_attn.flash_attn_interface import flash_attn_varlen_func
-except ImportError:
-    logger.info("flash_attn_varlen_func not found, please install flash_attn2 first")
-    flash_attn_varlen_func = None
+from lightx2v.utils.attention import attention as dense_attention
 
 from lightx2v.models.input_encoders.hf.seko_audio.audio_adapter import align_hidden_states_and_mask, calculate_n_query_tokens, get_qk_lens_audio_range
 from lightx2v.models.networks.wan.infer.offload.transformer_infer import WanOffloadTransformerInfer
@@ -92,7 +87,7 @@ class WanAudioTransformerInfer(WanOffloadTransformerInfer):
                 q=q, k=k, v=v, cu_seqlens_q=self.perceiver_attn_cu_seqlens_q, cu_seqlens_kv=self.perceiver_attn_cu_seqlens_k, max_seqlen_q=self.max_seqlen_q, max_seqlen_kv=self.max_seqlen_k
             )
         else:
-            out = flash_attn_varlen_func(
+            out = dense_attention(
                 q=q,
                 k=k,
                 v=v,
@@ -103,8 +98,8 @@ class WanAudioTransformerInfer(WanOffloadTransformerInfer):
                 dropout_p=0.0,
                 softmax_scale=None,
                 causal=False,
-                window_size=(-1, -1),
                 deterministic=False,
+                config=self.config,
             )
         out = out.view(-1, self.num_heads * self.head_dim)
         return phase.to_out.apply(out) * gate

@@ -5,7 +5,7 @@ import triton.language as tl
 
 try:
     from cuvs.cluster.kmeans import KMeansParams, fit
-except ImportError:
+except (ImportError, OSError, RuntimeError):
     KMeansParams = None
     fit = None
 

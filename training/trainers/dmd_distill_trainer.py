@@ -3,15 +3,16 @@
 DMD (CVPR 2024):
 - Uses a learned fake score network to estimate the student's distribution.
 - Two-time-scale update: fake score update + student update.
-- Student loss combines teacher distillation + distribution regularization.
+- Student gradients match teacher and learned fake distributions; optional
+  regression uses online paired teacher-sampler trajectories.
 
 DMD2 (arXiv 2024):
 - Removes regression dataset construction and adds GAN loss on real data.
-- Student loss combines teacher distillation + GAN adversarial loss.
+- Keeps the fake score network, removes paired regression, and adds GAN loss.
 
 This trainer supports both variants via `dmd_variant`:
-- dmd: fake score network + distribution matching regularization
-- dmd2: GAN loss on real data (no fake score by default)
+- dmd: distribution matching + paired teacher trajectory regression
+- dmd2: distribution matching + GAN, with multiple critic updates per generator
 
 References:
 - DMD: https://arxiv.org/abs/2311.18828
@@ -27,9 +28,10 @@ import torch.nn as nn
 import torch.nn.functional as F
 from loguru import logger
 
-from training.trainers.adversarial_distill_trainer import ProjectionDiscriminator
+from training.trainers.adversarial_distill_trainer import ProjectionDiscriminator, frozen_discriminator
 from training.trainers.base_distill_trainer import BaseDistillTrainer, EMAModel
 from training.utils.model_output import extract_prediction_tensor
+from training.utils.replicated_gradients import broadcast_replicated_model, synchronize_replicated_gradients
 
 
 class DMDDistillTrainer(BaseDistillTrainer):
@@ -64,6 +66,9 @@ class DMDDistillTrainer(BaseDistillTrainer):
         self.lambda_reg = getattr(self.args, "dmd_lambda_reg", 1.0)
         self.fake_score_lr_ratio = getattr(self.args, "dmd_fake_score_lr_ratio", 1.0)
         self.fake_score_update_freq = getattr(self.args, "dmd_fake_score_update_freq", 1)
+        self.fake_score_updates = int(getattr(self.args, "dmd_fake_score_updates", 5))
+        self.student_steps = int(getattr(self.args, "dmd_student_steps", 1))
+        self.teacher_steps = int(getattr(self.args, "dmd_teacher_steps", 32))
         self.use_ema_fake_score = getattr(self.args, "dmd_use_ema_fake_score", True)
 
         # DMD2 / GAN hyperparameters
@@ -77,11 +82,15 @@ class DMDDistillTrainer(BaseDistillTrainer):
             raise ValueError("dmd_fake_score_update_freq must be positive")
         if self.disc_update_freq <= 0:
             raise ValueError("dmd_disc_update_freq must be positive")
+        if min(self.fake_score_updates, self.student_steps, self.teacher_steps) <= 0:
+            raise ValueError("DMD score updates and student/teacher sampling steps must be positive")
+        if self.lambda_distill <= 0 or self.lambda_reg < 0:
+            raise ValueError("DMD distribution weight must be positive and regression weight nonnegative")
 
-        # Fake score network is only used in DMD
-        self.enable_fake_score = self.dmd_variant == "dmd" and self.lambda_reg > 0
+        # Both DMD and DMD2 require an estimator of the evolving fake distribution.
+        self.enable_fake_score = True
 
-        # Build fake score network (DMD only)
+        # Build the fake score network for both variants.
         self.fake_score_model = None
         self.fake_score_optimizer = None
         self.fake_score_ema = None
@@ -92,7 +101,13 @@ class DMDDistillTrainer(BaseDistillTrainer):
             self.fake_score_model.train()
             for p in self.fake_score_model.parameters():
                 p.requires_grad = True
-            self.fake_score_model.to(self.device)
+            self.fake_score_model.to(device=self.device, dtype=torch.float32)
+            self._manual_fake_sync = bool(
+                self.is_distributed
+                and getattr(self.fake_score_model, "requires_unused_parameter_detection", False)
+            )
+            if self._manual_fake_sync:
+                broadcast_replicated_model(self.fake_score_model)
 
             self.fake_score_optimizer = torch.optim.AdamW(
                 self.fake_score_model.parameters(),
@@ -108,7 +123,7 @@ class DMDDistillTrainer(BaseDistillTrainer):
                     decay=self.args.ema_decay,
                     warmup_steps=getattr(self.args, "ema_warmup_steps", 0),
                 )
-                self.fake_score_ema_model = copy.deepcopy(raw_teacher)
+                self.fake_score_ema_model = copy.deepcopy(self.fake_score_model)
                 self.fake_score_ema_model.eval()
                 for p in self.fake_score_ema_model.parameters():
                     p.requires_grad = False
@@ -148,44 +163,120 @@ class DMDDistillTrainer(BaseDistillTrainer):
     def train(self):
         """Override train to also DDP-wrap fake_score_model/discriminator."""
         if self.is_distributed:
-            if self.enable_fake_score and not isinstance(self.fake_score_model, nn.parallel.DistributedDataParallel):
+            if self.enable_fake_score and not self._manual_fake_sync and not isinstance(self.fake_score_model, nn.parallel.DistributedDataParallel):
                 self.fake_score_model = nn.parallel.DistributedDataParallel(
                     self.fake_score_model,
-                    device_ids=[int(os.environ.get("LOCAL_RANK", 0))],
-                    find_unused_parameters=False,
+                    device_ids=[int(os.environ.get("LOCAL_RANK", 0))] if self.device.type == "cuda" else None,
+                    find_unused_parameters=bool(getattr(self.fake_score_model, "requires_unused_parameter_detection", False)),
                 )
             if self.use_gan and not isinstance(self.discriminator, nn.parallel.DistributedDataParallel):
                 self.discriminator = nn.parallel.DistributedDataParallel(
                     self.discriminator,
-                    device_ids=[int(os.environ.get("LOCAL_RANK", 0))],
+                    device_ids=[int(os.environ.get("LOCAL_RANK", 0))] if self.device.type == "cuda" else None,
                     find_unused_parameters=False,
                 )
         super().train()
 
     def _generate_student_samples(self, batch: Dict[str, Any], noise: torch.Tensor) -> torch.Tensor:
-        """Generate samples from the student in one step (no grad)."""
-        bs = noise.shape[0]
-        timesteps = torch.full((bs,), self.num_train_timesteps * 0.999, device=self.device)
-
-        student_input = self.prepare_student_input(batch, noise, timesteps)
+        """Draw from the actual student inference trajectory without a graph."""
         with torch.no_grad():
-            student_v = self.run_student(student_input, batch)
-
-        sigma = 0.999
-        x0_pred = noise.float() - sigma * student_v.float()
-        return x0_pred.detach()
+            return self._generate_student_samples_with_grad(batch, noise).detach()
 
     def _generate_student_samples_with_grad(self, batch: Dict[str, Any], noise: torch.Tensor) -> torch.Tensor:
-        """Generate samples from the student in one step (with grad)."""
+        """Differentiable flow-Euler generation from sigma=1 all the way to 0.
+
+        Multi-step DMD2 uses generated, rather than GT-noised, intermediate
+        states, closing the train/inference input-distribution mismatch.
+        """
         bs = noise.shape[0]
-        timesteps = torch.full((bs,), self.num_train_timesteps * 0.999, device=self.device)
+        current = noise
+        for index in range(self.student_steps):
+            sigma = 1.0 - index / self.student_steps
+            timesteps = torch.full((bs,), sigma * self.num_train_timesteps, device=self.device)
+            inputs = self.prepare_student_input(batch, current.to(noise.dtype), timesteps)
+            current = current.float() - self.run_student(inputs, batch).float() / self.student_steps
+        return current
 
-        student_input = self.prepare_student_input(batch, noise, timesteps)
-        student_v = self.run_student(student_input, batch)
+    def _sample_score_timesteps(self, batch_size: int) -> torch.Tensor:
+        # Interior noise levels avoid singular endpoint score conversions.
+        return (0.02 + 0.96 * torch.rand(batch_size, device=self.device)) * self.num_train_timesteps
 
-        sigma = 0.999
-        x0_pred = noise.float() - sigma * student_v.float()
-        return x0_pred
+    @staticmethod
+    def distribution_matching_loss(generated, teacher_x0, fake_x0):
+        """Inject the normalized reverse-KL score direction into the generator.
+
+        Flow velocity v gives x0=xt-sigma*v. The denoised difference below is
+        the flow-matching equivalent of the DMD/DMD2 score-difference update.
+        Normalization and a detached surrogate follow the authors' algorithm:
+        https://github.com/tianweiy/DMD2/blob/main/main/sd_guidance.py
+        """
+        with torch.no_grad():
+            real_residual = generated.float() - teacher_x0.float()
+            axes = tuple(range(1, generated.ndim))
+            normalizer = real_residual.abs().mean(dim=axes, keepdim=True).clamp_min(1e-6)
+            direction = (fake_x0.float() - teacher_x0.float()) / normalizer
+            direction = torch.nan_to_num(direction)
+            target = generated.float() - direction
+        return 0.5 * F.mse_loss(generated.float(), target)
+
+    def _distribution_loss(self, batch, generated):
+        with torch.no_grad():
+            timesteps = self._sample_score_timesteps(generated.shape[0])
+            sigma = (timesteps / self.num_train_timesteps).view(
+                generated.shape[0], *([1] * (generated.ndim - 1))
+            )
+            noise = torch.randn_like(generated)
+            noisy = (1 - sigma) * generated.detach() + sigma * noise
+            dtype = batch["latents"].dtype
+            inputs = self.prepare_teacher_input(batch, noisy.to(dtype), timesteps)
+            real_v = self.run_teacher(inputs, batch, allow_cache=False)
+            score_model = self.fake_score_model
+            if self.fake_score_ema is not None:
+                self.fake_score_ema.apply_to(self.fake_score_ema_model)
+                score_model = self.fake_score_ema_model
+            # No DDP reducer participation is needed for a frozen score query.
+            raw_score = self._unwrap_model(score_model)
+            with frozen_discriminator(raw_score):
+                fake_v = extract_prediction_tensor(raw_score(**inputs), tag="DMD fake score")
+            teacher_x0 = noisy.float() - sigma * real_v.float()
+            fake_x0 = noisy.float() - sigma * fake_v.float()
+        return self.distribution_matching_loss(generated, teacher_x0, fake_x0)
+
+    def _update_fake_score(self, batch, generated):
+        """Denoising score matching on generated data, never on teacher outputs."""
+        generated = generated.detach()
+        timesteps = self._sample_score_timesteps(generated.shape[0])
+        sigma = (timesteps / self.num_train_timesteps).view(
+            generated.shape[0], *([1] * (generated.ndim - 1))
+        )
+        noise = torch.randn_like(generated)
+        noisy = (1 - sigma) * generated + sigma * noise
+        inputs = self.prepare_teacher_input(batch, noisy.to(batch["latents"].dtype), timesteps)
+        prediction = extract_prediction_tensor(self.fake_score_model(**inputs), tag="DMD fake-score training")
+        target_velocity = noise.float() - generated.float()
+        loss = F.mse_loss(prediction.float(), target_velocity)
+        self.fake_score_optimizer.zero_grad(set_to_none=True)
+        loss.backward()
+        if self._manual_fake_sync:
+            synchronize_replicated_gradients(self.fake_score_model)
+        if self.args.max_grad_norm > 0:
+            torch.nn.utils.clip_grad_norm_(self.fake_score_model.parameters(), self.args.max_grad_norm)
+        self.fake_score_optimizer.step()
+        if self.fake_score_ema is not None:
+            self.fake_score_ema.update(self._unwrap_model(self.fake_score_model))
+        return loss.detach()
+
+    @torch.no_grad()
+    def _teacher_regression_target(self, batch, noise):
+        """Online equivalent of DMD's paired noise/teacher-sample dataset."""
+        current = noise
+        for index in range(self.teacher_steps):
+            sigma = 1.0 - index / self.teacher_steps
+            timestep = torch.full((noise.shape[0],), sigma * self.num_train_timesteps, device=self.device)
+            inputs = self.prepare_teacher_input(batch, current.to(noise.dtype), timestep)
+            velocity = self.run_teacher(inputs, batch, allow_cache=False)
+            current = current.float() - velocity.float() / self.teacher_steps
+        return current
 
     def _compute_r1_penalty(self, real_samples: torch.Tensor) -> torch.Tensor:
         real_samples = real_samples.detach().requires_grad_(True)
@@ -199,28 +290,36 @@ class DMDDistillTrainer(BaseDistillTrainer):
             retain_graph=True,
             only_inputs=True,
         )[0]
-        r1_penalty = gradients.view(gradients.size(0), -1).norm(2, dim=1).pow(2).mean()
+        r1_penalty = gradients.reshape(gradients.size(0), -1).norm(2, dim=1).pow(2).mean()
         return r1_penalty
 
     def _forward_and_loss(self, batch: Dict[str, Any]) -> torch.Tensor:
-        """DMD/DMD2 forward with optional fake score update and GAN loss."""
+        """Alternating fake DSM / discriminator updates, then generator KL loss."""
         latents = batch["latents"]
-        bs = latents.shape[0]
+        training = torch.is_grad_enabled() and self.student_model.training
+        noise = torch.randn_like(latents)
+        # Fake updates use independent detached samples and cannot backpropagate
+        # through a generator whose graph is later used by the outer optimizer.
+        fake_samples = self._generate_student_samples(batch, noise)
+
+        fake_score_losses = []
+        if training and self.global_step % self.fake_score_update_freq == 0:
+            for _ in range(self.fake_score_updates):
+                fake_score_losses.append(self._update_fake_score(batch, fake_samples))
+        if fake_score_losses:
+            value = torch.stack(fake_score_losses).mean().item()
+            self._fake_score_loss_ema = 0.9 * self._fake_score_loss_ema + 0.1 * value
 
         # ---- GAN Discriminator Update (DMD2) ----
-        if self.use_gan and self.global_step >= self.disc_start_step:
+        if training and self.use_gan and self.global_step >= self.disc_start_step:
             if self.global_step % self.disc_update_freq == 0:
                 self.discriminator.train()
                 self.disc_optimizer.zero_grad()
 
-                with torch.no_grad():
-                    gen_noise = torch.randn_like(latents)
-                    fake_x0 = self._generate_student_samples(batch, gen_noise)
-
                 real_logits = self.discriminator(latents)
                 d_loss_real = F.relu(1.0 - real_logits).mean()
 
-                fake_logits = self.discriminator(fake_x0.detach())
+                fake_logits = self.discriminator(fake_samples.to(latents.dtype))
                 d_loss_fake = F.relu(1.0 + fake_logits).mean()
 
                 r1_penalty = (
@@ -233,90 +332,20 @@ class DMDDistillTrainer(BaseDistillTrainer):
                 self.disc_optimizer.step()
                 self._disc_loss_ema = 0.9 * self._disc_loss_ema + 0.1 * disc_loss.item()
 
-        # ---- Fake Score Update (DMD only) ----
-        fake_score_loss = torch.tensor(0.0, device=self.device)
-        if self.enable_fake_score and self.global_step % self.fake_score_update_freq == 0:
-            self.fake_score_optimizer.zero_grad()
-
-            gen_noise = torch.randn_like(latents)
-            with torch.no_grad():
-                student_x0 = self._generate_student_samples(batch, gen_noise)
-
-            t_fake = self._sample_timesteps(bs)
-            sigma_fake = t_fake / self.num_train_timesteps
-            noise_fake = torch.randn_like(student_x0)
-            sigma_fake_exp = sigma_fake.view(bs, *([1] * (student_x0.dim() - 1)))
-            student_xt = (1 - sigma_fake_exp) * student_x0 + sigma_fake_exp * noise_fake
-
-            teacher_input = self.prepare_teacher_input(batch, student_xt.to(latents.dtype), t_fake)
-            teacher_v_on_student = self.run_teacher(
-                teacher_input,
-                batch,
-                cache_extra={"mode": "dmd_fake_score_teacher", "timesteps": t_fake},
-            )
-
-            fake_input = self.prepare_teacher_input(batch, student_xt.to(latents.dtype), t_fake)
-            fake_score_v = extract_prediction_tensor(
-                self.fake_score_model(**fake_input),
-                tag="DMD fake-score model",
-            )
-
-            fake_score_loss = F.mse_loss(fake_score_v.float(), teacher_v_on_student.float().detach())
-            fake_score_loss.backward()
-
-            if self.args.max_grad_norm > 0:
-                raw_fake = self._unwrap_model(self.fake_score_model)
-                torch.nn.utils.clip_grad_norm_(raw_fake.parameters(), self.args.max_grad_norm)
-            self.fake_score_optimizer.step()
-
-            if self.fake_score_ema is not None:
-                self.fake_score_ema.update(self._unwrap_model(self.fake_score_model))
-
-            self._fake_score_loss_ema = 0.9 * self._fake_score_loss_ema + 0.1 * fake_score_loss.item()
-
         # ---- Student Update ----
-        timesteps = self._sample_timesteps(bs)
-        sigmas = timesteps / self.num_train_timesteps
-        noise = torch.randn_like(latents)
-        sigmas_expanded = sigmas.view(bs, *([1] * (latents.dim() - 1)))
-        noisy_latents = (1 - sigmas_expanded) * latents + sigmas_expanded * noise
-
-        teacher_input = self.prepare_teacher_input(batch, noisy_latents, timesteps)
-        student_input = self.prepare_student_input(batch, noisy_latents, timesteps)
-        teacher_output, student_output = self._run_teacher_student_pair(
-            teacher_input=teacher_input,
-            student_input=student_input,
-            batch=batch,
-            cache_extra={"mode": "dmd_teacher", "timesteps": timesteps},
-        )
-
-        distill_loss = self.compute_supervision_loss(student_output, teacher_output.detach())
-
+        generated = self._generate_student_samples_with_grad(batch, noise)
+        distill_loss = self._distribution_loss(batch, generated)
         reg_loss = torch.tensor(0.0, device=self.device)
-        if self.enable_fake_score and self.lambda_reg > 0:
-            if self.fake_score_ema is not None and self.fake_score_ema_model is not None:
-                self.fake_score_ema.apply_to(self.fake_score_ema_model)
-                fake_input = self.prepare_teacher_input(batch, noisy_latents, timesteps)
-                with torch.no_grad():
-                    fake_v = extract_prediction_tensor(
-                        self.fake_score_ema_model(**fake_input),
-                        tag="DMD fake-score EMA",
-                    )
-            else:
-                fake_input = self.prepare_teacher_input(batch, noisy_latents, timesteps)
-                with torch.no_grad():
-                    fake_v = extract_prediction_tensor(
-                        self.fake_score_model(**fake_input),
-                        tag="DMD fake-score model",
-                    )
-            reg_loss = F.mse_loss(student_output.float(), fake_v.float().detach())
+        if self.dmd_variant == "dmd" and self.lambda_reg > 0:
+            reg_loss = F.mse_loss(generated.float(), self._teacher_regression_target(batch, noise).float())
 
         gan_loss = torch.tensor(0.0, device=self.device)
         if self.use_gan and self.global_step >= self.disc_start_step:
-            gen_noise = torch.randn_like(latents)
-            fake_x0 = self._generate_student_samples_with_grad(batch, gen_noise)
-            fake_logits = self.discriminator(fake_x0)
-            gan_loss = -fake_logits.mean()
+            # Avoid DDP reducer hooks and auxiliary gradients on generator turns.
+            raw_disc = self._unwrap_model(self.discriminator)
+            with frozen_discriminator(raw_disc):
+                fake_logits = raw_disc(generated.to(latents.dtype))
+                gan_loss = -fake_logits.mean()
 
         total_loss = (
             self.lambda_distill * distill_loss
@@ -329,6 +358,12 @@ class DMDDistillTrainer(BaseDistillTrainer):
         self._gan_loss_ema = 0.9 * self._gan_loss_ema + 0.1 * gan_loss.item()
 
         return total_loss
+
+    def validation_step(self, batch):
+        # Base validation measures pointwise teacher MSE, not distribution loss.
+        # Validation must not update either auxiliary optimizer.
+        with torch.no_grad():
+            return self._forward_and_loss(batch)
 
     def compute_distill_loss(
         self,
