@@ -1,2 +1,2 @@
-# Optional distributed runtime.
-deepspeed>=0.14.0
+# Official Torch AMP engine/scaler contract used by mixed-precision training.
+deepspeed>=0.19.6

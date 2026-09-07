@@ -42,7 +42,7 @@ def test_exact_architecture_extensions_fail_closed():
 
 
 def test_actual_tensor_device_is_checked():
-    with patch.object(torch.cuda, "is_available", return_value=True), patch.object(torch.version, "cuda", "12.8"), patch.object(torch.cuda, "get_device_capability", return_value=(9, 0)) as capability:
+    with patch.object(torch.cuda, "is_available", return_value=True), patch.object(torch.version, "cuda", "12.8"), patch.object(torch.cuda, "get_device_name", return_value="H100"), patch.object(torch.cuda, "get_device_capability", return_value=(9, 0)) as capability:
         require_quant_backend("fp8-triton", {"jit": lambda: None}, device="cuda:3")
         capability.assert_called_once_with(torch.device("cuda:3"))
         with pytest.raises(RuntimeError, match="cannot execute"):

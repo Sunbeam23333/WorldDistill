@@ -146,13 +146,10 @@ class CudaCompatibilityTests(unittest.TestCase):
 
     def test_every_unverified_capability_uses_only_native_sdpa(self) -> None:
         capabilities = (
-            (7, 5),
-            (8, 6),
             (9, 1),
             (10, 1),
             (10, 2),
             (10, 4),
-            (11, 0),
             (11, 9),
             (12, 2),
             (13, 0),
@@ -231,7 +228,9 @@ class CudaCompatibilityTests(unittest.TestCase):
         report = inspect_torch_cuda(FakeTorch())
 
         self.assertFalse(report["devices"][0]["native_arch_compiled"])
-        self.assertTrue(any("native sm_100" in issue for issue in report["issues"]))
+        self.assertTrue(any("native sm_100" in issue for issue in report["native_arch_issues"]))
+        self.assertEqual(report["issues"], [])  # native SASS absence is not a failed launch.
+        self.assertFalse(report["qualified"])
 
 
 if __name__ == "__main__":

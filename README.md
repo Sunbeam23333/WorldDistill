@@ -9,7 +9,7 @@
 [![PyTorch core ≥2.5.1](https://img.shields.io/badge/PyTorch_core-%E2%89%A52.5.1-EE4C2C.svg)](https://pytorch.org/)
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache%202.0-0B6B45.svg)](LICENSE)
 
-[Installation](docs/installation.md) · [Inference](docs/inference.md) · [Training](docs/training.md) · [Model support](docs/model-support.md) · [CUDA policy](docs/cuda-compatibility.md) · [Implementation audit](docs/implementation-audit.md)
+[Installation](docs/installation.md) · [Inference](docs/inference.md) · [Training](docs/training.md) · [Multi-node launch](docs/distributed-launch.md) · [Model support](docs/model-support.md) · [CUDA policy](docs/cuda-compatibility.md) · [Qualification & expected results](docs/hardware-expectations.md) · [Implementation audit](docs/implementation-audit.md)
 
 </div>
 
@@ -53,6 +53,8 @@ into one support checkmark. [Figure provenance](assets/readme/PROVENANCE.md).
 | Dense attention fallback | Device-aware FA2/FA3/Sage/SDPA selection after config overlays | Simulated A100/H20/B200/B300 dispatch tests |
 | Fused target-only MSE | Triton kernel with PyTorch reference path | CPU numerical reference test; CUDA JIT test pending |
 | DDP / FSDP / DeepSpeed | Wrapper and collective checkpoint control flow | Actual two-process CPU/Gloo train/resume tests; multi-rank GPU restart test pending |
+| Multi-node launch | Manual/Slurm, fixed-size static/c10d rendezvous, node-aware hybrid FSDP groups | Local two-agent collective/DDP controls; physical multi-node NCCL pending |
+| Automatic precision | Real GEMM/math-attention probes and all-rank common dtype selection; explicit unsupported requests fail | CPU policy tests; hardware probe records must be produced on each target GPU |
 | Adversarial / DMD-style paths | Latent discriminator; fake-distribution DSM and detached teacher-minus-fake generator gradients | Tiny-model updates and numerical contracts; pretrained quality/paper-reproduction validation pending |
 
 ## Core mechanisms
@@ -102,7 +104,7 @@ git clone https://github.com/Sunbeam23333/WorldDistill.git
 cd WorldDistill
 bash scripts/setup_env.sh --dev
 
-python tools/check_cuda_compat.py --json
+python tools/check_cuda_compat.py --probe-precision --json
 python -m pytest -q training/tests
 ```
 
@@ -117,6 +119,18 @@ python tools/check_cuda_compat.py --strict
 See [installation and hardware notes](docs/installation.md) before using
 Blackwell. A CUDA version table is a compatibility policy, not a substitute for
 an actual kernel forward/backward run on the target host.
+
+Training defaults to `--mixed_precision auto`: choose the common supported
+BF16/FP16/FP32 mode after actual device probes and trainer-specific scaler
+checks. This does not qualify optional attention/quantization kernels. Older
+NVIDIA cards may require an archived software stack; unknown architectures are
+not certified by extrapolation.
+
+For multi-node manual/Slurm launch and fixed-size restarts, see the
+[launch guide](docs/distributed-launch.md). For executable GPU gates, feature
+acceptance targets, memory formulas and carefully scoped published reference
+numbers, see [qualification and expected results](docs/hardware-expectations.md)
+and the [training verification commands](docs/training.md#hardware-qualification-commands).
 
 ## Inference CLI
 
@@ -252,6 +266,9 @@ native validation. The vendored low-bit CUTLASS extension is explicitly
 
 - No repository artifact yet proves end-to-end execution on A100, H20, B200, or
   B300. The current CUDA matrix is implemented policy plus simulated tests.
+- Fixed-size homogeneous worker counts are supported by the launcher. Uneven
+  workers, changed-world-size elastic recovery and generic model-layer TP/PP/SP
+  are not implemented; a working rendezvous is not a claim of universal topology support.
 - Runner-native training is incomplete; most real-model training still depends
   on a compatible Diffusers transformer or an explicit adapter.
 - Multi-rank FSDP/DeepSpeed now receive CPU-staged student parameters instead of

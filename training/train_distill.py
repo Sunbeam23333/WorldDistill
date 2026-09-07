@@ -106,12 +106,15 @@ def _configure_cuda_backend(args) -> None:
         return
 
     enable_tf32 = bool(getattr(args, "enable_tf32", False))
-    torch.backends.cuda.matmul.allow_tf32 = enable_tf32
-    torch.backends.cudnn.allow_tf32 = enable_tf32
-
     precision = str(getattr(args, "float32_matmul_precision", "high") or "high").lower()
+    # set_float32_matmul_precision('high') can itself enable TF32. Apply the
+    # explicit policy last, and do not let the default override --enable_tf32.
+    if not enable_tf32:
+        precision = "highest"
     if hasattr(torch, "set_float32_matmul_precision") and precision in {"highest", "high", "medium"}:
         torch.set_float32_matmul_precision(precision)
+    torch.backends.cuda.matmul.allow_tf32 = enable_tf32
+    torch.backends.cudnn.allow_tf32 = enable_tf32
 
     if is_main_process():
         logger.info(
@@ -236,6 +239,8 @@ def main():
     rank, world_size = setup_distributed()
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
     device = torch.device(f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu")
+    from training.utils.precision import resolve_training_precision
+    precision_report = resolve_training_precision(args, device)
 
     # Model/adaptor initialization must be identical before DDP/FSDP/ZeRO
     # synchronization. Per-rank stochastic training seeds are installed only
@@ -259,6 +264,7 @@ def main():
         elif args.parallel_mode == "fsdp":
             logger.info(f"FSDP shard strategy: {args.fsdp_shard_strategy}")
         os.makedirs(args.output_dir, exist_ok=True)
+        Path(args.output_dir, "precision_preflight.json").write_text(json.dumps(precision_report, indent=2) + "\n")
 
     # --- Build Dataset & DataLoader ---
     train_data_mode = _resolve_data_mode(args.data_json, args.data_mode)

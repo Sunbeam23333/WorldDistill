@@ -4,6 +4,11 @@ This release fixes executable correctness contracts identified after the 0.2.0
 audit. It is an initial validation release, **not completion of every model and
 hardware cell**. The paper's simulated results are not promoted to measurements.
 
+For the subsequent launcher, mixed-precision, DeepSpeed scaler/CPUAdam and
+expanded hardware-qualification work, see the
+[multi-node follow-up](multinode-validation.md). The counts below describe the
+preceding release, not the newer suite.
+
 ## Correctness changes
 
 - Dense attention uses a shared batch/packed/GQA/mask/scale/causal contract.

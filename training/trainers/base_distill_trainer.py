@@ -208,6 +208,8 @@ class BaseDistillTrainer(ABC):
 
         # Parallel strategy
         self.parallel_mode = getattr(args, "parallel_mode", "ddp")  # ddp | fsdp | deepspeed
+        from training.utils.precision import resolve_training_precision
+        resolve_training_precision(args, self.device)
         self._deepspeed_engine = None  # Set during train() if using DeepSpeed
         self._validate_ema_parallel_contract()
         self._validate_optimizer_parallel_contract()
@@ -772,6 +774,15 @@ class BaseDistillTrainer(ABC):
             lr_scheduler=self.lr_scheduler,
         )
         self._deepspeed_engine = self.student_model
+        # ZeRO-1/2 moves a CPU-staged student during engine initialization.
+        # Its replicated EMA must follow that move before the first update;
+        # keep the shadow's original precision. ZeRO-3 EMA is rejected earlier.
+        if self.ema is not None:
+            parameters = dict(self._unwrap_model(self.student_model).named_parameters())
+            self.ema.shadow = {
+                name: value.to(device=parameters[name].device)
+                for name, value in self.ema.shadow.items()
+            }
         self._refresh_distributed_state()
         logger.info(f"DeepSpeed ZeRO-{ds_stage} initialized.")
 
@@ -999,7 +1010,11 @@ class BaseDistillTrainer(ABC):
                 if self.sp_group is not None and "latents" in batch:
                     batch["latents"] = scatter_sequence(batch["latents"], self.sp_group, dim=2)
 
-            loss = self._forward_and_loss(batch)
+            # The engine owns student loss scaling, but the frozen teacher /
+            # EMA targets are external modules. They need the same autocast
+            # context when their stored dtype differs from the input latents.
+            with torch.amp.autocast("cuda", dtype=self.amp_dtype, enabled=self.use_amp):
+                loss = self._forward_and_loss(batch)
 
             # DeepSpeed owns loss scaling and the accumulation boundary. Its
             # step() is called for every microbatch and updates parameters only
@@ -1501,6 +1516,9 @@ class BaseDistillTrainer(ABC):
         }
         if self.ema is not None:
             client_state["ema"] = self.ema.state_dict()
+        amp_state = self._collect_deepspeed_amp_scaler_state()
+        if amp_state is not None:
+            client_state["torch_amp_scaler_by_rank"] = amp_state
 
         def _save() -> Any:
             result = self._deepspeed_engine.save_checkpoint(
@@ -1515,6 +1533,68 @@ class BaseDistillTrainer(ABC):
         self._run_all_ranks_or_raise(_save, f"Save DeepSpeed checkpoint {ckpt_dir}")
         if self._checkpoint_is_main_process():
             logger.info(f"DeepSpeed checkpoint saved to {ckpt_dir}")
+
+    def _deepspeed_amp_scaler(self):
+        """The Torch AMP scaler is distinct from ZeRO's native loss_scaler."""
+        if getattr(self.args, "mixed_precision", "no") != "fp16":
+            return None
+        engine = self._deepspeed_engine
+        enabled = getattr(engine, "torch_autocast_enabled", None)
+        if not callable(enabled) or not enabled():
+            raise RuntimeError("DeepSpeed FP16 requires its configured Torch AMP engine")
+        if int(getattr(self.args, "deepspeed_stage", 2)) == 0:
+            scaler = getattr(engine, "torch_autocast_z0_gradscaler", None)
+        else:
+            scaler = getattr(engine.optimizer, "torch_autocast_gradscaler", None)
+        if scaler is None or not all(callable(getattr(scaler, method, None)) for method in
+                                     ("state_dict", "load_state_dict", "is_enabled")) or not scaler.is_enabled():
+            raise RuntimeError("DeepSpeed FP16 Torch AMP GradScaler is missing or disabled")
+        return scaler
+
+    def _collect_deepspeed_amp_scaler_state(self):
+        def _local():
+            scaler = self._deepspeed_amp_scaler()
+            return None if scaler is None else {"rank": self._checkpoint_rank(), "state": scaler.state_dict()}
+        # Propagate a missing/broken scaler before any peer enters the gather.
+        local = self._run_all_ranks_or_raise(_local, "Capture DeepSpeed Torch AMP scaler")
+        if local is None:
+            return None
+        rank_states = [local]
+        if self._checkpoint_distributed():
+            rank_states = [None] * dist.get_world_size()
+            dist.all_gather_object(rank_states, local)
+        return {"schema_version": 1, "world_size": len(rank_states), "rank_states": rank_states}
+
+    def _restore_deepspeed_amp_scaler_state(self, state):
+        scaler = self._deepspeed_amp_scaler()
+        if scaler is None:
+            if state is not None:
+                raise ValueError("FP16 Torch AMP scaler checkpoint requires matching FP16 precision")
+            return
+        world = dist.get_world_size() if self._checkpoint_distributed() else int(getattr(self, "world_size", 1))
+        if (not isinstance(state, dict) or type(state.get("schema_version")) is not int
+                or state["schema_version"] != 1 or type(state.get("world_size")) is not int
+                or state["world_size"] != world):
+            raise ValueError("DeepSpeed checkpoint is missing valid same-world-size Torch AMP scaler state")
+        rows = state.get("rank_states")
+        if not isinstance(rows, list) or len(rows) != world:
+            raise ValueError("DeepSpeed Torch AMP scaler rank_states are invalid")
+        # Validate all ranks, including fields load_state_dict otherwise ignores.
+        required = {"scale", "growth_factor", "backoff_factor", "growth_interval", "_growth_tracker"}
+        for rank, row in enumerate(rows):
+            if (not isinstance(row, dict) or type(row.get("rank")) is not int
+                    or row["rank"] != rank or not isinstance(row.get("state"), dict)):
+                raise ValueError("DeepSpeed Torch AMP scaler rank identity is invalid")
+            value = row["state"]
+            if set(value) != required:
+                raise ValueError("DeepSpeed Torch AMP scaler fields are incomplete or unsupported")
+            if (any(type(value[key]) not in (int, float) or not math.isfinite(value[key]) for key in required)
+                    or value["scale"] <= 0 or value["growth_factor"] <= 1
+                    or not 0 < value["backoff_factor"] < 1
+                    or type(value["growth_interval"]) is not int or value["growth_interval"] < 1
+                    or type(value["_growth_tracker"]) is not int or value["_growth_tracker"] < 0):
+                raise ValueError("DeepSpeed Torch AMP scaler contains invalid numeric state")
+        scaler.load_state_dict(rows[self._checkpoint_rank()]["state"])
 
     def _save_checkpoint_fsdp(self, step: int, ckpt_dir: str):
         """Collect canonical full FSDP model/optimizer state on rank zero."""
@@ -1646,6 +1726,7 @@ class BaseDistillTrainer(ABC):
             self.epoch = client_state["epoch"]
             self.best_loss = client_state["best_loss"]
             self._restore_resume_state(client_state.get("resume_state"))
+            self._restore_deepspeed_amp_scaler_state(client_state.get("torch_amp_scaler_by_rank"))
             if self.ema is not None:
                 self.ema.load_state_dict(client_state["ema"])
             return str(load_path)

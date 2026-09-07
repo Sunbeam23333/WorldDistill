@@ -149,7 +149,7 @@ class TrainerArgs:
     gradient_accumulation_steps: int = 1
     max_grad_norm: float = 1.0
     grad_skip_threshold: float = float("inf")  # Native-only application-level step skip
-    mixed_precision: str = "bf16"  # no | fp16 | bf16
+    mixed_precision: str = "auto"  # auto | no | fp16 | bf16
     seed: int = 42
 
     # --- Loss ---
@@ -253,9 +253,9 @@ class TrainerArgs:
         self._validate_and_normalize()
 
     def _validate_and_normalize(self) -> None:
-        if self.mixed_precision not in {"no", "fp16", "bf16"}:
+        if self.mixed_precision not in {"auto", "no", "fp16", "bf16"}:
             raise ValueError(
-                f"mixed_precision must be 'no', 'fp16', or 'bf16', got {self.mixed_precision!r}"
+                f"mixed_precision must be 'auto', 'no', 'fp16', or 'bf16', got {self.mixed_precision!r}"
             )
         if self.parallel_mode not in {"ddp", "fsdp", "deepspeed"}:
             raise ValueError(
@@ -409,7 +409,7 @@ def build_training_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--gradient_accumulation_steps", type=int, default=1)
     parser.add_argument("--max_grad_norm", type=float, default=1.0)
     parser.add_argument("--grad_skip_threshold", type=float, default=float("inf"))
-    parser.add_argument("--mixed_precision", type=str, default="bf16", choices=["no", "fp16", "bf16"])
+    parser.add_argument("--mixed_precision", type=str, default="auto", choices=["auto", "no", "fp16", "bf16"])
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--batch_size", type=int, default=1)
     parser.add_argument("--num_workers", type=int, default=4)

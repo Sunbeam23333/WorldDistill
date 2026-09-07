@@ -50,6 +50,16 @@ bash scripts/setup_env.sh --install-kernels
 bash scripts/setup_env.sh --install-deepspeed
 ```
 
+The distributed extra requires DeepSpeed 0.19.6+ for its explicit Torch AMP
+engine/scaler contract. BF16/FP16 are configured as `torch_autocast`, not native
+low-precision model conversion: this preserves FP32 timesteps and keyword inputs
+while the engine manages operation precision and scaling. Older manually
+installed engines are rejected for mixed precision; FP32 still requires its
+own compatible engine/build test. CPU optimizer offload additionally needs a
+working DeepSpeedCPUAdam extension. No DeepSpeed GPU run has been performed in
+the CPU development environment. See the official
+[mixed-precision API](https://deepspeed.readthedocs.io/en/latest/training.html#mixed-precision-training).
+
 `--install-kernels` installs the PyPI `flash-attn` package (the FA2 import path)
 and `sgl-kernel`. FA3 accepts the separate `flash_attn_3.flash_attn_interface`
 package and the older top-level `flash_attn_interface` build;
@@ -142,14 +152,17 @@ Redis `GETDEL`) before increasing the worker count.
 python tools/check_cuda_compat.py
 python tools/check_cuda_compat.py --json
 python tools/check_cuda_compat.py --strict
+python tools/check_cuda_compat.py --probe-precision --json --output results/device-probe.json
 python -m pytest -q training/tests
 SKIP_PLATFORM_CHECK=1 python -c 'import training.train_distill; import lightx2v.infer'
 ```
 
 `--strict` fails if CUDA is unavailable, the reported CUDA runtime is below the
-policy minimum, or the PyTorch build does not list the native architecture. PTX
-JIT may still run in some environments, but it is reported separately from a
-native target.
+policy minimum, or the architecture is unverified. `--strict-native-arch`
+separately requires a listed native architecture; compatible PTX/cubin execution
+is not the same as native SASS qualification. `--probe-precision` executes small
+GEMM/math-attention forward/backward tests; it does not certify full models or
+optional extensions. CPU-only hosts return `qualified=false` and exit 2.
 
 ## Hardware guidance
 
@@ -162,6 +175,10 @@ native target.
 
 The repository currently has simulated policy tests, not signed results for
 these four systems. See [CUDA compatibility](cuda-compatibility.md).
+Older server/consumer NVIDIA families and ARM64 platforms have explicit policy
+lanes, not one universal wheel. See the complete
+[GPU and topology qualification tables](hardware-expectations.md) and
+[fixed-size multi-node launcher](distributed-launch.md).
 
 ## Minimal and legacy requirement files
 

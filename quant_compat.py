@@ -8,12 +8,37 @@ documented for SM90/SM100. Unknown architectures fail closed.
 
 from collections.abc import Mapping
 
-from cuda_compat import LIGHTX2V_SM120_QUANT_SCHEMES, validate_lightx2v_quant_backend
+from cuda_compat import (
+    LIGHTX2V_SM120_QUANT_SCHEMES,
+    minimum_cuda_issue,
+    profile_cuda_device,
+    validate_lightx2v_quant_backend,
+)
 
 _INT8_CAPABILITIES = frozenset({(8, 0), (8, 6), (8, 9), (9, 0), (10, 0), (10, 3), (12, 0), (12, 1)})
 _FP8_CAPABILITIES = _INT8_CAPABILITIES - {(8, 0), (8, 6)}
 _INT8_BACKENDS = frozenset({"int8-triton", "int8-torchao", "int8-vllm", "int8-sgl", "int4-g128-marlin"})
 _FP8_BACKENDS = frozenset({"fp8-triton", "fp8-torchao", "fp8-vllm", "fp8-sgl", "fp8-pertensor"})
+
+
+def quant_backend_capabilities(scheme: str) -> frozenset[tuple[int, int]]:
+    """Exact policy targets, NOT evidence of available/runnable binaries.
+
+    Native INT8/FP8/FP4 hardware features do not authorize these particular
+    implementations. In particular, adding old GPUs, Orin or Thor to the
+    FP32/FP16 policy does not silently expand any quantization backend.
+    """
+    if scheme in LIGHTX2V_SM120_QUANT_SCHEMES:
+        return frozenset({(12, 0)})
+    if scheme in _INT8_BACKENDS:
+        return _INT8_CAPABILITIES
+    if scheme in _FP8_BACKENDS:
+        return _FP8_CAPABILITIES
+    if scheme in {"int8-q8f", "fp8-q8f"}:
+        return frozenset({(8, 9)})
+    if scheme == "fp8-b128-deepgemm":
+        return frozenset({(9, 0), (10, 0)})
+    raise ValueError(f"No quantization compatibility policy exists for {scheme!r}")
 
 
 def validate_quant_backend(scheme: str, capability: tuple[int, int], operators: Mapping[str, object]) -> None:
@@ -22,16 +47,7 @@ def validate_quant_backend(scheme: str, capability: tuple[int, int], operators: 
     if scheme in LIGHTX2V_SM120_QUANT_SCHEMES:
         validate_lightx2v_quant_backend(scheme, capability, callables_available=bool(operators) and all(callable(op) for op in operators.values()))
         return
-    if scheme in _INT8_BACKENDS:
-        supported = _INT8_CAPABILITIES
-    elif scheme in _FP8_BACKENDS:
-        supported = _FP8_CAPABILITIES
-    elif scheme in {"int8-q8f", "fp8-q8f"}:
-        supported = {(8, 9)}
-    elif scheme == "fp8-b128-deepgemm":
-        supported = {(9, 0), (10, 0)}
-    else:
-        raise ValueError(f"No quantization compatibility policy exists for {scheme!r}")
+    supported = quant_backend_capabilities(scheme)
     if capability not in supported:
         targets = ", ".join(f"sm_{major}{minor}" for major, minor in sorted(supported))
         raise RuntimeError(
@@ -57,6 +73,10 @@ def require_quant_backend(scheme: str, operators: Mapping[str, object], *, devic
         raise RuntimeError(f"Quantization backend {scheme!r} cannot execute on {resolved}")
     capability = tuple(torch.cuda.get_device_capability(resolved))
     validate_quant_backend(scheme, capability, operators)
+    profile = profile_cuda_device(torch.cuda.get_device_name(resolved), capability)
+    issue = minimum_cuda_issue(profile, torch.version.cuda)
+    if issue:
+        raise RuntimeError(f"Quantization backend {scheme!r}: {issue}")
 
 
 def optional_attr(module, name):

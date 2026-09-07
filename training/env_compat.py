@@ -72,9 +72,16 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="WorldDistill environment compatibility checker")
     parser.add_argument("--mode", type=str, default="train", choices=["train", "infer"])
     parser.add_argument("--no-strict", action="store_true")
+    parser.add_argument("--required_transformers_version", default=EXPECTED_TRANSFORMERS_VERSION)
+    parser.add_argument("--dist_backend", choices=["auto", "nccl", "gloo"])
+    parser.add_argument("--nproc_per_node", type=int)
     args = parser.parse_args()
 
-    result = validate_runtime_dependency_versions(strict=not args.no_strict)
+    result = validate_runtime_dependency_versions(strict=not args.no_strict,
+                                                  required_transformers_version=args.required_transformers_version)
+    if args.dist_backend is not None or args.nproc_per_node is not None:
+        validate_local_distributed_devices(args.dist_backend or "auto",
+                                           args.nproc_per_node if args.nproc_per_node is not None else 1)
     print(f"[worlddistill:{args.mode}] dependency check ok={result['ok']}")
     for package_name, version_str in result["versions"].items():
         print(f"  - {package_name}: {version_str}")
@@ -82,6 +89,31 @@ def main() -> None:
         print("  issues:")
         for issue in result["issues"]:
             print(f"    * {issue}")
+
+
+def validate_local_distributed_devices(backend: str = "auto", nproc_per_node: int = 1) -> dict[str, Any]:
+    """Preflight local workers without importing any model or changing visibility."""
+    import torch
+    import torch.distributed as dist
+
+    if type(nproc_per_node) is not int or nproc_per_node < 1:
+        raise ValueError("nproc_per_node must be a positive integer")
+    if backend not in {"auto", "nccl", "gloo"}:
+        raise ValueError("Distributed backend must be auto, nccl or gloo")
+    cuda_available = torch.cuda.is_available()
+    selected = ("nccl" if cuda_available else "gloo") if backend == "auto" else backend
+    if selected == "nccl":
+        if (not torch.version.cuda or getattr(torch.version, "hip", None)
+                or not cuda_available or not dist.is_nccl_available()):
+            raise RuntimeError("NCCL requires an NVIDIA CUDA PyTorch build and visible NVIDIA GPUs; ROCm/RCCL is unsupported")
+        if nproc_per_node > torch.cuda.device_count():
+            raise ValueError("Worker count exceeds scheduler-visible GPUs; reduce --nproc_per_node, do not replace the GPU mask")
+    elif cuda_available:
+        raise ValueError("Gloo is CPU-only validation; set CUDA_VISIBLE_DEVICES='' explicitly to hide CUDA")
+    elif not dist.is_gloo_available():
+        raise RuntimeError("Gloo is unavailable in this PyTorch build")
+    return {"backend": selected, "nproc_per_node": nproc_per_node,
+            "visible_cuda_devices": torch.cuda.device_count() if cuda_available else 0}
 
 
 if __name__ == "__main__":
