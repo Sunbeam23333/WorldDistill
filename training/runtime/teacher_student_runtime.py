@@ -5,7 +5,7 @@ substrate for distillation-aware overlap:
 - teacher-output / teacher-context caching
 - CUDA-stream based teacher-student overlap (DPP primitive)
 - cache-backed supervision buffering
-- future heterogeneous placement / prefetch planning
+- bounded CPU cache prefetch and explicit future heterogeneous-placement plans
 """
 
 from __future__ import annotations
@@ -14,6 +14,8 @@ import hashlib
 import json
 import os
 import uuid
+from collections import OrderedDict
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
 
@@ -94,6 +96,14 @@ class TeacherStudentRuntime:
         self.enable_dpp = bool(getattr(args, "runtime_enable_dpp", False))
         self.teacher_stream_priority = int(getattr(args, "runtime_teacher_stream_priority", 0))
         self.cache_identity = self._build_cache_identity()
+        self._base_cache_identity = self.cache_identity
+        self._prefetch_executor = None
+        self._prefetch_futures = OrderedDict()
+        self._prefetch_submitted = 0
+        self._prefetch_consumed = 0
+        self._prefetch_failed = 0
+        self._prefetch_completed = 0
+        self._prefetch_hits = 0
 
         self._heterogeneous_notice_emitted = False
         self._placement_notice_emitted = False
@@ -117,6 +127,69 @@ class TeacherStudentRuntime:
 
     def finish_step(self) -> None:
         return None
+
+    def close(self) -> None:
+        """Drain CPU I/O before releasing runtime/cache ownership."""
+        if self._prefetch_executor is not None:
+            self._prefetch_executor.shutdown(wait=True, cancel_futures=True)
+            self._prefetch_executor = None
+        self._prefetch_futures.clear()
+
+    def advance_teacher_revision(self, revision: str) -> None:
+        """Invalidate supervision identity after an in-memory teacher handoff."""
+        self.close()
+        self.cache_identity = hashlib.sha256(
+            f"{self._base_cache_identity}:{revision}".encode("utf-8")
+        ).hexdigest()
+
+    def prefetch_cached_value(self, namespace, batch, global_step, extra=None) -> bool:
+        """Submit a bounded CPU-only cache read, not speculative teacher compute.
+
+        Callers must know the next batch/chunk identity. Hybrid cache reads
+        promote cold disk entries into pinned host memory in the worker; device
+        transfer and all model/CUDA execution stay on the training thread.
+        """
+        if self.prefetch_policy == "none" or self.distill_cache is None:
+            return False
+        if self.cache_backend not in {"disk", "hybrid"}:
+            return False
+        key = self.build_cache_key(namespace=namespace, batch=batch, extra=extra)
+        if key in self._prefetch_futures:
+            return False
+        # Keep at most two outstanding buffers/futures. Completed promotion is
+        # retained in the cache even when the corresponding future is retired.
+        for old_key, (future, _) in list(self._prefetch_futures.items()):
+            if future.done():
+                self._prefetch_futures.pop(old_key)
+        if len(self._prefetch_futures) >= 2:
+            return False
+        if self._prefetch_executor is None:
+            self._prefetch_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="worlddistill-cache")
+        def load_on_host():
+            value = self.distill_cache.get(key, current_step=global_step)
+            self._prefetch_completed += 1
+            self._prefetch_hits += int(value is not None)
+            return value
+
+        future = self._prefetch_executor.submit(load_on_host)
+        self._prefetch_futures[key] = (future, global_step)
+        self._prefetch_submitted += 1
+        return True
+
+    def _get_cached_value(self, key, current_step):
+        pending = self._prefetch_futures.pop(key, None)
+        if pending is not None:
+            future, prefetched_step = pending
+            try:
+                value = future.result()
+                # Never skip freshness checking across a timeline change.
+                if prefetched_step == current_step:
+                    self._prefetch_consumed += 1
+                    return value
+            except Exception as exc:
+                self._prefetch_failed += 1
+                logger.warning(f"Cache prefetch failed; retrying synchronously: {exc}")
+        return self.distill_cache.get(key, current_step=current_step)
 
     def can_pipeline_teacher_student(self) -> bool:
         return self._teacher_stream is not None
@@ -146,7 +219,7 @@ class TeacherStudentRuntime:
                 input_kwargs=input_kwargs,
                 extra=cache_extra,
             )
-            cached = self.distill_cache.get(cache_key, current_step=global_step)
+            cached = self._get_cached_value(cache_key, current_step=global_step)
             if cached is not None:
                 self._async_teacher_cache_hits += 1
                 self._plan_prefetch(
@@ -190,6 +263,7 @@ class TeacherStudentRuntime:
             assert teacher_stream is not None
             current_stream = torch.cuda.current_stream(device=self.device)
             teacher_stream.wait_stream(current_stream)
+            self._record_payload_stream(input_kwargs, teacher_stream)
             with torch.cuda.stream(teacher_stream):
                 output = self._run_model(self.teacher_model, input_kwargs, no_grad=True, tag="teacher")
             ready_event = torch.cuda.Event(blocking=False)
@@ -227,6 +301,7 @@ class TeacherStudentRuntime:
         if handle.ready_event is not None and self.device.type == "cuda":
             current_stream = torch.cuda.current_stream(device=self.device)
             current_stream.wait_event(handle.ready_event)
+            self._record_payload_stream(handle.output, current_stream)
             self._async_teacher_waits += 1
 
         if handle.cache_enabled and handle.cache_key is not None and not handle.cache_written:
@@ -283,7 +358,7 @@ class TeacherStudentRuntime:
             return producer()
 
         cache_key = self.build_cache_key(namespace=namespace, batch=batch, extra=extra)
-        cached = self.distill_cache.get(cache_key, current_step=global_step)
+        cached = self._get_cached_value(cache_key, current_step=global_step)
         if cached is not None:
             return move_payload_to_device(cached, self.device)
 
@@ -426,6 +501,11 @@ class TeacherStudentRuntime:
         if self.distill_cache is not None:
             base_stats.update(self.distill_cache.stats())
         base_stats["planned_prefetches"] = self._planned_prefetches
+        base_stats["prefetch_submitted"] = self._prefetch_submitted
+        base_stats["prefetch_consumed"] = self._prefetch_consumed
+        base_stats["prefetch_failed"] = self._prefetch_failed
+        base_stats["prefetch_completed"] = self._prefetch_completed
+        base_stats["prefetch_hits"] = self._prefetch_hits
         base_stats["async_teacher_launches"] = self._async_teacher_launches
         base_stats["async_teacher_waits"] = self._async_teacher_waits
         base_stats["async_teacher_cache_hits"] = self._async_teacher_cache_hits
@@ -448,6 +528,19 @@ class TeacherStudentRuntime:
     @staticmethod
     def _normalize_model_output(output: Any, tag: str = "model") -> Any:
         return extract_prediction_tensor(output, tag=tag)
+
+    @staticmethod
+    def _record_payload_stream(payload, stream):
+        """Protect cross-stream tensor storage until the consuming stream ends."""
+        if isinstance(payload, torch.Tensor):
+            if payload.is_cuda:
+                payload.record_stream(stream)
+        elif isinstance(payload, dict):
+            for value in payload.values():
+                TeacherStudentRuntime._record_payload_stream(value, stream)
+        elif isinstance(payload, (tuple, list)):
+            for value in payload:
+                TeacherStudentRuntime._record_payload_stream(value, stream)
 
     def _build_teacher_placement_plan(self, namespace: str) -> RuntimePlacementPlan:
         execution_device = str(self.device)
@@ -487,8 +580,9 @@ class TeacherStudentRuntime:
         self._planned_prefetches += 1
         if not self._placement_notice_emitted:
             logger.info(
-                "TeacherStudentRuntime 记录 prefetch skeleton：当前会为后续 chunk/batch 生成计划，"
-                "但尚未启动独立异步 worker 执行数据搬运。"
+                "TeacherStudentRuntime 记录后续 chunk/batch 计划；"
+                "提供确切 cache key 的 context 路径会执行后台 CPU 预取，"
+                "通用 next_batch 计划不代表已搬运数据。"
             )
             self._placement_notice_emitted = True
 

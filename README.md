@@ -21,9 +21,10 @@ runners. Image and audio-video support currently belongs primarily to the
 inference backend; it is not presented as end-to-end distillation training.
 
 > **Evidence boundary.** CPU tests validate interfaces, cache/memory semantics,
-> a two-step toy distillation loop, single-rank exact save/resume, and CLI construction. CUDA
+> all seven trainer loops, real tiny Diffusers denoisers, trained-student export/reload,
+> and exact save/resume (including two-process CPU/Gloo). CUDA
 > policies are implemented and simulated for A100, H20, B200, and B300 profiles,
-> but this repository does not yet contain signed hardware run records for those
+> but this repository does not yet contain measured hardware run records for those
 > GPUs. “Integrated” below never means “benchmark-validated.”
 
 ## Architecture
@@ -43,16 +44,16 @@ into one support checkmark. [Figure provenance](assets/readme/PROVENANCE.md).
 | Component | Repository state | Validation in this repository |
 |---|---|---|
 | Shared model metadata | YAML registry plus train/infer resolvers and aliases | CPU catalog/config consistency tests |
-| Step distillation | Fixed-timestep trainer, target-only supervision, checkpoints | Two CPU train steps plus RNG/data-cursor resume smoke test |
-| Stream / Progressive / Consistency | Registered trainer implementations | Import, argument, and registry tests; real-model validation pending |
+| Step distillation | Fixed-timestep trainer, target-only supervision, checkpoint-native dual teacher/student experts | Real tiny Wan forward/backward and exact export/reload; pretrained-model validation pending |
+| Stream / Progressive / Consistency | Generated-overlap multi-step unroll, complete progressive intervals, EMA consistency | CPU optimizer/restart tests; real tiny Wan tests where its forward contract supports the method |
 | Context Forcing | Teacher context, target mask, frame-aligned action/camera packing, tail-safe chunking | CPU memory, temporal-index, and non-divisible-tail tests |
 | Hybrid-Sparse Memory | Full-history sparse anchors plus contiguous recent tail | Deterministic selector tests |
-| DistillCache | Memory, disk, and hot/cold hybrid stores with freshness statistics | CPU cache/runtime tests |
+| DistillCache | Memory/disk/hybrid stores; original-age-preserving promotion; bounded background CPU prefetch | CPU freshness, worker and runtime regressions |
 | CUDA stream runtime | Independent teacher stream, event recording, explicit wait | CPU fallback tests; GPU profiler evidence pending |
 | Dense attention fallback | Device-aware FA2/FA3/Sage/SDPA selection after config overlays | Simulated A100/H20/B200/B300 dispatch tests |
 | Fused target-only MSE | Triton kernel with PyTorch reference path | CPU numerical reference test; CUDA JIT test pending |
-| DDP / FSDP / DeepSpeed | Wrapper and collective checkpoint control flow | Static/CPU checks; multi-rank GPU restart test pending |
-| Adversarial / DMD-style paths | Research scaffolds and auxiliary networks | Experimental; not yet objective-parity validated |
+| DDP / FSDP / DeepSpeed | Wrapper and collective checkpoint control flow | Actual two-process CPU/Gloo train/resume tests; multi-rank GPU restart test pending |
+| Adversarial / DMD-style paths | Latent discriminator; fake-distribution DSM and detached teacher-minus-fake generator gradients | Tiny-model updates and numerical contracts; pretrained quality/paper-reproduction validation pending |
 
 ## Core mechanisms
 
@@ -253,12 +254,11 @@ native validation. The vendored low-bit CUTLASS extension is explicitly
   B300. The current CUDA matrix is implemented policy plus simulated tests.
 - Runner-native training is incomplete; most real-model training still depends
   on a compatible Diffusers transformer or an explicit adapter.
-- FSDP and DeepSpeed currently shard only after the loader has materialized a
-  full teacher and FP32 student on each GPU. They reduce steady-state optimizer/
-  parameter memory, but cannot yet initialize a model that does not fit during
-  construction; CPU/meta initialization and sharded weight loading remain open.
-- Asynchronous prefetch and heterogeneous offload currently record placement and
-  prefetch plans; they do not run a background transfer worker.
+- Multi-rank FSDP/DeepSpeed now receive CPU-staged student parameters instead of
+  an already materialized full GPU student. The teacher remains replicated;
+  host RAM, GPU wrapping peaks and sharded GPU restart still need measurement.
+- Bounded asynchronous cold-cache prefetch is implemented. Teacher-parameter
+  offload across CPU/GPU remains a separate unimplemented executor.
 - The adversarial and DMD-style trainers are research scaffolds, not certified
   formula-parity implementations of every ADD/LADD/DMD/DMD2 paper variant.
 - Sequence-parallel helpers are adapter-gated. Generic models fail fast for
@@ -275,7 +275,8 @@ native validation. The vendored low-bit CUTLASS extension is explicitly
 See [docs/reproducibility.md](docs/reproducibility.md) for the evidence levels and
 the GPU validation record expected before upgrading any claim. The release
 [implementation audit](docs/implementation-audit.md) records fixed contracts and
-the remaining gates.
+the remaining gates. The [operator/training follow-up](docs/operator-training-audit.md)
+documents the latest fixes, executable checks, and deliberately unclaimed capabilities.
 
 ## Repository map
 

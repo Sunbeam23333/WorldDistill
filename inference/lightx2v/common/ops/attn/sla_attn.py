@@ -13,18 +13,18 @@ try:
     import spas_sage_attn._fused as fused
     import spas_sage_attn._qattn as qattn
     from spas_sage_attn.utils import block_map_lut_triton, get_vanilla_qk_quant
-except ImportError:
+except (ImportError, OSError, RuntimeError):
     logger.warning("spas_sage_attn is not installed. SageSparseLinearAttention will not be available.")
 
 SAGE2PP_ENABLED = True
 try:
     from spas_sage_attn._qattn import qk_int8_sv_f8_accum_f16_block_sparse_attn_inst_buf_fuse_v_scale_with_pv_threshold
-except ImportError:
+except (ImportError, OSError, RuntimeError):
     SAGE2PP_ENABLED = False
 
 try:
     from magi_attention.functional import flex_flash_attn_func as magi_ffa_func
-except ImportError:
+except (ImportError, OSError, RuntimeError):
     magi_ffa_func = None
 
 

@@ -6,17 +6,10 @@ from loguru import logger
 from lightx2v.utils.envs import *
 from lightx2v.utils.quant_utils import dequant_fp8_vllm, quant_fp8_vllm
 from lightx2v.utils.registry_factory import ATTN_WEIGHT_REGISTER
+from lightx2v.utils.attention import attention as dense_attention, attention_with_lse
 
 from .template import AttnWeightTemplate
 from .utils.ring_comm import RingComm
-
-try:
-    import flash_attn
-    from flash_attn.flash_attn_interface import flash_attn_varlen_func
-except ImportError:
-    logger.info("flash_attn_varlen_func not found, please install flash_attn2 first")
-    flash_attn_varlen_func = None
-
 
 @torch.jit.script
 def _update_out_and_lse(
@@ -73,6 +66,7 @@ class RingAttnWeight(AttnWeightTemplate):
             torch.Tensor: 计算得到的注意力结果
         """
         assert not enable_head_parallel, "RingAttn can't support head parallel mode."
+        self._dense_backend = attention_type
 
         use_kv_fusion = use_tensor_fusion
         # 获取当前进程的排名和全局进程数
@@ -96,6 +90,7 @@ class RingAttnWeight(AttnWeightTemplate):
         q = q.unsqueeze(0)
         k = k.unsqueeze(0)
         v = v.unsqueeze(0)
+        padding_qkv = tuple(t[:, img_qkv_len + txt_qkv_len:] for t in (q, k, v))
 
         heads, hidden_dims = k.shape[-2], k.shape[-1]
         img_q, img_k, img_v = q[:, :img_qkv_len, :, :].contiguous(), k[:, :img_qkv_len, :, :].contiguous(), v[:, :img_qkv_len, :, :].contiguous()
@@ -167,20 +162,8 @@ class RingAttnWeight(AttnWeightTemplate):
 
         attn1 = out.to(GET_DTYPE()).squeeze(0).reshape(img_qkv_len + txt_qkv_len, -1)
 
-        if txt_mask_len > 0:
-            attn2, *_ = flash_attn.flash_attn_interface._flash_attn_forward(
-                q[:, -(txt_mask_len - txt_qkv_len) :, :, :].contiguous(),
-                k[:, -(txt_mask_len - txt_qkv_len) :, :, :].contiguous(),
-                v[:, -(txt_mask_len - txt_qkv_len) :, :, :].contiguous(),
-                dropout_p=0.0,
-                softmax_scale=q.shape[-1] ** (-0.5),
-                causal=False,
-                window_size_left=-1,
-                window_size_right=-1,
-                softcap=0.0,
-                alibi_slopes=None,
-                return_softmax=False,
-            )
+        if txt_mask_len is not None and txt_mask_len > txt_qkv_len:
+            attn2 = dense_attention(*padding_qkv, config=self.config, backend=attention_type)
 
             attn2 = attn2.to(GET_DTYPE()).squeeze(0).reshape((txt_mask_len - txt_qkv_len), -1)
             attn1 = torch.cat([attn1, attn2], dim=0)
@@ -188,41 +171,17 @@ class RingAttnWeight(AttnWeightTemplate):
         return attn1
 
     def ring_attn_sub_kv_fusion(self, q, kv, dropout_p=0.0, softmax_scale=None, causal=False, window_size=(-1, -1), softcap=0.0, alibi_slopes=None, return_softmax=False):
-        if softmax_scale is None:
-            softmax_scale = q.shape[-1] ** (-0.5)
-
-        block_out, block_lse, _, _ = flash_attn.flash_attn_interface._flash_attn_forward(
-            q,
-            kv[:1, :, :, :],
-            kv[1:, :, :, :],
-            dropout_p=dropout_p,
-            softmax_scale=softmax_scale,
-            causal=causal,
-            window_size_left=window_size[0],
-            window_size_right=window_size[1],
-            softcap=softcap,
-            alibi_slopes=alibi_slopes,
-            return_softmax=return_softmax,
-        )
-        return block_out, block_lse
+        return self.ring_attn_sub(q, kv[:1], kv[1:], dropout_p=dropout_p,
+            softmax_scale=softmax_scale, causal=causal, window_size=window_size,
+            softcap=softcap, alibi_slopes=alibi_slopes, return_softmax=return_softmax)
 
     def ring_attn_sub(self, q, k, v, dropout_p=0.0, softmax_scale=None, causal=False, window_size=(-1, -1), softcap=0.0, alibi_slopes=None, return_softmax=False):
-        if softmax_scale is None:
-            softmax_scale = q.shape[-1] ** (-0.5)
-        block_out, block_lse, _, _ = flash_attn.flash_attn_interface._flash_attn_forward(
-            q,
-            k,
-            v,
-            dropout_p=dropout_p,
-            softmax_scale=softmax_scale,
-            causal=causal,
-            window_size_left=window_size[0],
-            window_size_right=window_size[1],
-            softcap=softcap,
-            alibi_slopes=alibi_slopes,
-            return_softmax=return_softmax,
-        )
-        return block_out, block_lse
+        if dropout_p or window_size != (-1, -1) or softcap or alibi_slopes is not None or return_softmax:
+            raise ValueError("Ring dense fallback supports output/LSE with no dropout, local window, softcap, or ALiBi")
+        return attention_with_lse(q, k, v,
+            backend=getattr(self, "_dense_backend", "auto"),
+            strict=bool(self.config.get("strict_cuda_backend", False)),
+            softmax_scale=softmax_scale, causal=causal)
 
     def update_out_and_lse(
         self,

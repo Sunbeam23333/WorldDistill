@@ -27,6 +27,7 @@ importing the actual callable, not by seeing a registry key or module spec.
 For an explicit dense backend:
 
 - strict mode raises if it is missing or outside the device preference set;
+  explicit FA4 additionally requires its on-device numerical smoke;
 - non-strict mode chooses the first installed compatible backend;
 - Torch SDPA is the final safe dense fallback when the PyTorch build supports it.
 
@@ -34,12 +35,13 @@ Backend constructors also fail immediately with an actionable message if a
 selected FlashAttention or SageAttention callable is missing. This avoids a
 later `NoneType is not callable` failure inside a long forward pass.
 
-The optional installer does not make all four backends available:
+The optional installer does not make every backend available:
 
 | Resolver name | Python callable/import | Installation status |
 |---|---|---|
 | `flash_attn2` | `flash_attn.flash_attn_interface` | `--install-kernels` installs the PyPI package |
-| `flash_attn3` | top-level `flash_attn_interface` | separate Hopper/Blackwell-compatible source build required |
+| `flash_attn3` | `flash_attn_3.flash_attn_interface` or legacy top-level `flash_attn_interface` | separate Hopper build; CUDA >=12.3 |
+| `flash_attn4` | `flash_attn.cute` | separate FA4 CuTeDSL install; explicit request and device probe |
 | `sage_attn2` | `sageattention` | manual architecture-compatible install required |
 | `sage_attn3` | `sageattn3` | manual architecture-compatible install required |
 | `torch_sdpa` | `torch.nn.functional.scaled_dot_product_attention` | ships with compatible PyTorch |
@@ -49,6 +51,9 @@ compatible installed backend; strict mode fails.
 
 Sparse/distributed algorithms (`ulysses`, `ring`, `svg`, neighborhood attention,
 and similar) are not rewritten by this dense-backend policy.
+Their genuinely dense action/audio/text sublayers now use the shared policy.
+Ring's dense LSE sub-operation has a bounded-memory exact reference fallback;
+this does not establish optimized distributed throughput.
 
 ## Vendored low-bit CUTLASS extension
 
@@ -89,6 +94,13 @@ listed in the table—including intermediate and future CCs—fails closed to
 native SDPA until an explicit policy and kernel-launch probe are added.
 
 ## Hardware validation gate
+
+The metadata probe above does not execute a CUDA kernel. Use
+`tools/check_attention_kernels.py` for selected attention forward/backward cases
+and `tools/check_quant_kernels.py` for local GEMM/fused-loss numerical cases.
+Both report GPU-unavailable (nonzero exit) on CPU. External extension guards in
+`quant_compat.py` validate architecture prerequisites and callable symbols only;
+they do not attest to the installed binary's numerical accuracy.
 
 For each GPU/PyTorch/CUDA tuple, record:
 

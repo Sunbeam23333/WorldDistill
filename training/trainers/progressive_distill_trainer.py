@@ -55,7 +55,11 @@ class ProgressiveDistillTrainer(BaseDistillTrainer):
             raise ValueError("progressive_stages must contain at least two positive step counts")
         if any(left <= right for left, right in zip(self.stages, self.stages[1:])):
             raise ValueError("progressive_stages must be strictly descending")
+        if any(left != 2 * right for left, right in zip(self.stages, self.stages[1:])):
+            raise ValueError("progressive_stages must halve at each transition for two-step teacher targets")
         self.stage_steps = self.args.progressive_stage_steps
+        if self.stage_steps <= 0:
+            raise ValueError("progressive_stage_steps must be positive")
         self.loss_space = getattr(self.args, "progressive_loss_space", "v")  # "v" or "x0"
         if self.loss_space not in {"v", "x0"}:
             raise ValueError("progressive_loss_space must be 'v' or 'x0'")
@@ -153,7 +157,9 @@ class ProgressiveDistillTrainer(BaseDistillTrainer):
         student_ts = self._get_teacher_timesteps(self.current_student_steps)
 
         # Sample a random student step to train
-        max_idx = max(1, len(student_ts) - 1)
+        # The grid excludes t=0, but its last point still starts a trainable
+        # interval ending at zero. randint's upper bound is exclusive.
+        max_idx = len(student_ts)
         step_idx = torch.randint(0, max_idx, (1,)).item()
         t_start = student_ts[step_idx].item()
         t_end = student_ts[step_idx + 1].item() if step_idx + 1 < len(student_ts) else 0.0
@@ -230,6 +236,8 @@ class ProgressiveDistillTrainer(BaseDistillTrainer):
                 # Swap: current student becomes new teacher
                 src_state = self._unwrap_model(self.student_model).state_dict()
                 self.teacher_model.load_state_dict(src_state)
+                if self.runtime is not None:
+                    self.runtime.advance_teacher_revision(f"progressive-stage-{self.current_stage}")
                 self.teacher_model.eval()
                 for p in self.teacher_model.parameters():
                     p.requires_grad = False
@@ -323,6 +331,8 @@ class ProgressiveDistillTrainer(BaseDistillTrainer):
 
         def _restore_progressive_teacher():
             self.teacher_model.load_state_dict(state["teacher_model"], strict=True)
+            if self.runtime is not None and self.current_stage > 0:
+                self.runtime.advance_teacher_revision(f"progressive-stage-{self.current_stage}")
 
         self._run_all_ranks_or_raise(
             _restore_progressive_teacher,

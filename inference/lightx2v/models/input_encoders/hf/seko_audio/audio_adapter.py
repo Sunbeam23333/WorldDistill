@@ -1,8 +1,3 @@
-try:
-    import flash_attn
-except ModuleNotFoundError:
-    flash_attn = None
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F

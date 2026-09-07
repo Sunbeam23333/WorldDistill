@@ -42,6 +42,14 @@ class StepDistillTrainer(BaseDistillTrainer):
         super().__init__(**kwargs)
         self.denoising_step_list = self.args.denoising_step_list
         self.use_dual_model = self.args.use_dual_model
+        from training.model_adapter import NoiseRoutedDenoiser
+        if self.use_dual_model and isinstance(self.student_model, NoiseRoutedDenoiser):
+            if getattr(self.args, "student_low_model", None):
+                raise ValueError("student_low_model cannot override a checkpoint-native NoiseRoutedDenoiser")
+            # The checkpoint already contains both trainable experts.
+            self.use_dual_model = False
+            self.args.use_dual_model = False
+            logger.info("Using checkpoint-native noise routing; not duplicating its two student experts.")
         self.boundary_step_index = self.args.boundary_step_index
         self.num_distill_steps = len(self.denoising_step_list)
 
@@ -125,7 +133,7 @@ class StepDistillTrainer(BaseDistillTrainer):
             if not isinstance(self.student_low, nn.parallel.DistributedDataParallel):
                 self.student_low = nn.parallel.DistributedDataParallel(
                     self.student_low,
-                    device_ids=[int(os.environ.get("LOCAL_RANK", 0))],
+                    device_ids=[int(os.environ.get("LOCAL_RANK", 0))] if self.device.type == "cuda" else None,
                     find_unused_parameters=False,
                 )
         super().train()

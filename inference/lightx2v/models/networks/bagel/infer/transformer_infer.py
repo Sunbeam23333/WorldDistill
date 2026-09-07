@@ -4,11 +4,7 @@ from typing import Optional
 import torch
 import torch.nn.functional as F
 
-try:
-    import flash_attn  # noqa: F401
-    from flash_attn.flash_attn_interface import flash_attn_varlen_func
-except ImportError:
-    flash_attn_varlen_func = None
+from lightx2v.utils.attention import attention as dense_attention
 
 from lightx2v.common.transformer_infer.transformer_infer import BaseTransformerInfer
 from lightx2v.models.networks.bagel.model_io import NaiveCache
@@ -163,7 +159,7 @@ class BagelTransformerInfer(BaseTransformerInfer):
         cu_seqlens_q = torch.nn.functional.pad(torch.cumsum(query_lens, dim=0), (1, 0)).to(AI_DEVICE)
         cu_seqlens_k = torch.nn.functional.pad(torch.cumsum(key_values_lens, dim=0), (1, 0)).to(AI_DEVICE)
 
-        packed_attn_output = flash_attn_varlen_func(
+        packed_attn_output = dense_attention(
             q=packed_query_states,
             k=merged_key_states,
             v=merged_value_states,
@@ -172,6 +168,7 @@ class BagelTransformerInfer(BaseTransformerInfer):
             max_seqlen_q=max(query_lens).item(),
             max_seqlen_k=max(key_values_lens).item(),
             causal=is_causal,
+            config=self.config,
         )
         packed_attn_output = packed_attn_output.reshape(-1, self.hidden_size)
 

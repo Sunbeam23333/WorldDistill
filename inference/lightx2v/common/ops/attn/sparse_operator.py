@@ -7,17 +7,17 @@ from .kernels.sla_kernel import _attention
 
 try:
     from magi_attention.functional import flex_flash_attn_func as magi_ffa_func
-except ImportError:
+except (ImportError, OSError, RuntimeError):
     magi_ffa_func = None
 
 try:
     from flex_block_attn import flex_block_attn_func
-except ImportError:
+except (ImportError, OSError, RuntimeError):
     flex_block_attn_func = None
 
 try:
     import flashinfer
-except ImportError:
+except (ImportError, OSError, RuntimeError):
     flashinfer = None
 
 

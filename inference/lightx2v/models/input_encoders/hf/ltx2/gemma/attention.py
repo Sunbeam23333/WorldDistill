@@ -4,19 +4,13 @@ from typing import Protocol
 import torch
 
 from lightx2v.models.input_encoders.hf.ltx2.gemma.rope import LTXRopeType, apply_rotary_emb
+from lightx2v.utils.attention import attention as dense_attention
 
 memory_efficient_attention = None
-flash_attn_interface = None
 try:
     from xformers.ops import memory_efficient_attention
-except ImportError:
+except (ImportError, OSError, RuntimeError):
     memory_efficient_attention = None
-try:
-    # FlashAttention3 and XFormersAttention cannot be used together
-    if memory_efficient_attention is None:
-        import flash_attn_interface
-except ImportError:
-    flash_attn_interface = None
 
 
 class AttentionCallable(Protocol):
@@ -94,18 +88,15 @@ class FlashAttention3(AttentionCallable):
         heads: int,
         mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        if flash_attn_interface is None:
-            raise RuntimeError("FlashAttention3 was selected but `FlashAttention3` is not installed.")
-
         b, _, dim_head = q.shape
         dim_head //= heads
 
         q, k, v = (t.view(b, -1, heads, dim_head) for t in (q, k, v))
 
-        if mask is not None:
-            raise NotImplementedError("Mask is not supported for FlashAttention3")
-
-        out = flash_attn_interface.flash_attn_func(q.to(v.dtype), k.to(v.dtype), v)
+        if mask is not None and mask.ndim == 3:
+            mask = mask.unsqueeze(1)
+        out = dense_attention(q.to(v.dtype), k.to(v.dtype), v,
+                              backend="flash_attn3", attn_mask=mask)
         out = out.reshape(b, -1, heads * dim_head)
         return out
 

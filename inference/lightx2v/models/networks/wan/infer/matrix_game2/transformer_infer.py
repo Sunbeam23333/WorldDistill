@@ -3,19 +3,7 @@ import math
 import torch
 from einops import rearrange
 
-try:
-    import flash_attn_interface
-
-    FLASH_ATTN_3_AVAILABLE = True
-except ImportError:
-    try:
-        from flash_attn import flash_attn_func
-
-        FLASH_ATTN_3_AVAILABLE = False
-
-    except ImportError:
-        FLASH_ATTN_3_AVAILABLE = False
-
+from lightx2v.utils.attention import attention as dense_attention
 
 from lightx2v.models.networks.wan.infer.matrix_game2.posemb_layers import apply_rotary_emb, get_nd_rotary_pos_embed
 from lightx2v.models.networks.wan.infer.self_forcing.transformer_infer import WanSFTransformerInfer, causal_rope_apply
@@ -284,11 +272,19 @@ class WanMtxg2TransformerInfer(WanSFTransformerInfer):
 
         return x, attn_out
 
+    def _action_attention(self, q, k, v, **kwargs):
+        return dense_attention(q, k, v, config=self.config, **kwargs)
+
     def infer_action_model(self, phase, x, grid_sizes, seq_lens, mouse_condition=None, keyboard_condition=None, is_causal=False, use_rope_keyboard=True):
         tt, th, tw = grid_sizes
         current_start = self.scheduler.seg_index * self.num_frame_per_block
         start_frame = current_start
-        B, N_frames, C = keyboard_condition.shape
+        condition = keyboard_condition if keyboard_condition is not None else mouse_condition
+        if condition is None:
+            return x
+        B, N_frames, C = condition.shape
+        if B != 1:
+            raise ValueError("Matrix-Game2 action KV caches currently require batch size 1")
         assert tt * th * tw == x.shape[0]
         assert ((N_frames - 1) + self.vae_time_compression_ratio) % self.vae_time_compression_ratio == 0
         N_feats = int((N_frames - 1) / self.vae_time_compression_ratio) + 1
@@ -377,7 +373,7 @@ class WanMtxg2TransformerInfer(WanSFTransformerInfer):
                 attn_k = self.kv_cache_mouse[self.block_idx]["k"][:, max(0, local_end_index - max_attention_size) : local_end_index]
                 attn_v = self.kv_cache_mouse[self.block_idx]["v"][:, max(0, local_end_index - max_attention_size) : local_end_index]
 
-                attn = flash_attn_interface.flash_attn_func(
+                attn = self._action_attention(
                     q,
                     attn_k,
                     attn_v,
@@ -386,7 +382,7 @@ class WanMtxg2TransformerInfer(WanSFTransformerInfer):
                 self.kv_cache_mouse[self.block_idx]["global_end_index"].fill_(current_end)
                 self.kv_cache_mouse[self.block_idx]["local_end_index"].fill_(local_end_index)
             else:
-                attn = flash_attn_func(
+                attn = self._action_attention(
                     q,
                     k,
                     v,
@@ -482,29 +478,19 @@ class WanMtxg2TransformerInfer(WanSFTransformerInfer):
                         local_end_index = self.kv_cache_keyboard[self.block_idx]["local_end_index"].item() + current_end - self.kv_cache_keyboard[self.block_idx]["global_end_index"].item()
                         local_start_index = local_end_index - num_new_tokens
 
-                    assert k.shape[0] == 880  # BS == 1 or the cache should not be saved/ load method should be modified
+                    if k.shape[0] != B * S:
+                        raise ValueError("Action keys must match batch times spatial tokens")
                     self.kv_cache_keyboard[self.block_idx]["k"][:, local_start_index:local_end_index] = k[:1]
                     self.kv_cache_keyboard[self.block_idx]["v"][:, local_start_index:local_end_index] = v[:1]
 
-                    if FLASH_ATTN_3_AVAILABLE:
-                        attn_k = self.kv_cache_keyboard[self.block_idx]["k"][:, max(0, local_end_index - max_attention_size) : local_end_index].repeat(S, 1, 1, 1)
-                        attn_v = self.kv_cache_keyboard[self.block_idx]["v"][:, max(0, local_end_index - max_attention_size) : local_end_index].repeat(S, 1, 1, 1)
-                        attn = flash_attn_interface.flash_attn_func(
-                            q,
-                            attn_k,
-                            attn_v,
-                        )
-                    else:
-                        attn = flash_attn_func(
-                            q,
-                            self.kv_cache_keyboard[self.block_idx]["k"][max(0, local_end_index - max_attention_size) : local_end_index].repeat(S, 1, 1, 1),
-                            self.kv_cache_keyboard[self.block_idx]["v"][max(0, local_end_index - max_attention_size) : local_end_index].repeat(S, 1, 1, 1),
-                        )
+                    attn_k = self.kv_cache_keyboard[self.block_idx]["k"][:, max(0, local_end_index - max_attention_size) : local_end_index].repeat(S, 1, 1, 1)
+                    attn_v = self.kv_cache_keyboard[self.block_idx]["v"][:, max(0, local_end_index - max_attention_size) : local_end_index].repeat(S, 1, 1, 1)
+                    attn = self._action_attention(q, attn_k, attn_v)
 
                     self.kv_cache_keyboard[self.block_idx]["global_end_index"].fill_(current_end)
                     self.kv_cache_keyboard[self.block_idx]["local_end_index"].fill_(local_end_index)
                 else:
-                    attn = flash_attn_func(
+                    attn = self._action_attention(
                         q,
                         k,
                         v,
@@ -545,7 +531,7 @@ class WanMtxg2TransformerInfer(WanSFTransformerInfer):
                         local_start_index = local_end_index - num_new_tokens
                     self.kv_cache_keyboard[self.block_idx]["k"][:, local_start_index:local_end_index] = k
                     self.kv_cache_keyboard[self.block_idx]["v"][:, local_start_index:local_end_index] = v
-                    attn = flash_attn_func(
+                    attn = self._action_attention(
                         q,
                         self.kv_cache_keyboard[self.block_idx]["k"][:, max(0, local_end_index - max_attention_size) : local_end_index],
                         self.kv_cache_keyboard[self.block_idx]["v"][:, max(0, local_end_index - max_attention_size) : local_end_index],
@@ -553,7 +539,7 @@ class WanMtxg2TransformerInfer(WanSFTransformerInfer):
                     self.kv_cache_keyboard[self.block_idx]["global_end_index"].fill_(current_end)
                     self.kv_cache_keyboard[self.block_idx]["local_end_index"].fill_(local_end_index)
                 else:
-                    attn = flash_attn_func(
+                    attn = self._action_attention(
                         q,
                         k,
                         v,

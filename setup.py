@@ -20,7 +20,7 @@ setup(
         "third_party/licenses/TENCENT_HY_WORLDPLAY_COMMUNITY_LICENSE.txt",
     ],
     packages=find_packages(exclude=["tests", "docs"]),
-    py_modules=["distill_capabilities", "cuda_compat"],
+    py_modules=["distill_capabilities", "cuda_compat", "quant_compat"],
     python_requires=">=3.10,<3.13",
     install_requires=[
         "torch>=2.5.1",

@@ -28,7 +28,7 @@ def _load_flash_attn_module():
     stubs = {}
     for name in package_names:
         module = types.ModuleType(name)
-        module.__path__ = []
+        module.__path__ = [str(ROOT / "inference" / name.replace(".", "/"))]
         stubs[name] = module
 
     registry = types.ModuleType("lightx2v.utils.registry_factory")

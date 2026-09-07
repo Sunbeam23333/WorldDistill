@@ -16,7 +16,7 @@ from typing import Any, Iterable, MutableMapping
 Capability = tuple[int, int]
 
 DENSE_ATTENTION_BACKENDS = frozenset(
-    {"auto", "flash_attn2", "flash_attn3", "sage_attn2", "sage_attn3", "torch_sdpa"}
+    {"auto", "flash_attn2", "flash_attn3", "flash_attn4", "sage_attn2", "sage_attn3", "torch_sdpa"}
 )
 DENSE_ATTENTION_CONFIG_KEYS = (
     "attn_type",
@@ -159,12 +159,17 @@ def select_attention_backend(
     available_backends: Iterable[str],
     *,
     strict: bool = False,
+    validated_backends: Iterable[str] = (),
 ) -> str:
     """Resolve an attention backend with a deterministic safe fallback."""
     available = {str(name).strip() for name in available_backends if str(name).strip()}
     requested = str(requested or "auto").strip()
 
     compatible = available.intersection(profile.attention_preference)
+    # FA4 is opt-in after a real kernel probe on this exact host, never merely
+    # because its Python package imports. Auto stays on established defaults.
+    if profile.capability in {(9, 0), (10, 0), (10, 3)}:
+        compatible.update(available.intersection(validated_backends).intersection({"flash_attn4"}))
 
     if requested != "auto" and requested in compatible:
         return requested
@@ -213,6 +218,77 @@ def validate_lightx2v_quant_backend(
         )
 
 
+def import_attention_callable(backend: str, *, dense: bool = False):
+    """Support current packaged FA3 and its legacy source-install namespace."""
+    probes = {
+        "flash_attn2": (("flash_attn.flash_attn_interface", "flash_attn_varlen_func"),),
+        "flash_attn3": (("flash_attn_3.flash_attn_interface", "flash_attn_varlen_func"),
+                        ("flash_attn_interface", "flash_attn_varlen_func")),
+        "flash_attn4": (("flash_attn.cute", "flash_attn_varlen_func"),),
+        "sage_attn3": (("sageattn3", "sageattn3_blackwell"),),
+    }
+    for module_name, name in probes.get(backend, ()):
+        if dense and backend.startswith("flash_attn"):
+            name = "flash_attn_func"
+        try:
+            fn = getattr(importlib.import_module(module_name), name, None)
+        except (ImportError, OSError, RuntimeError):
+            continue
+        if callable(fn):
+            return fn
+    return None
+
+
+_FA4_PROBE_RESULTS: dict[tuple, dict[str, Any]] = {}
+
+
+def probe_flash_attention4(torch_module: Any, profile: CudaDeviceProfile) -> dict[str, Any]:
+    """Small forward-only host qualification; NOT an end-to-end benchmark.
+
+    Test FP16/BF16, packed batches, GQA and unequal-length causal attention
+    against native SDPA before permitting explicit FA4 dispatch. A successful
+    probe does not validate all model shapes or backward execution.
+    """
+    cuda = torch_module.cuda
+    fn = import_attention_callable("flash_attn4")
+    if not cuda.is_available() or not callable(fn) or profile.capability not in {(9, 0), (10, 0), (10, 3)}:
+        return {"passed": False, "reason": "FA4 requires a supported CUDA device and callable"}
+    index = cuda.current_device()
+    key = (str(torch_module.__version__), str(torch_module.version.cuda), index, profile.capability, id(fn))
+    if key in _FA4_PROBE_RESULTS:
+        return dict(_FA4_PROBE_RESULTS[key])
+    report = {"passed": False, "device_index": index, "capability": profile.capability,
+              "scope": "forward-only fp16/bf16 packed GQA + causal smoke"}
+    try:
+        device = torch_module.device("cuda", index)
+        generator = torch_module.Generator(device=device).manual_seed(1701)
+        with torch_module.no_grad(), cuda.device(index):
+            for dtype in (torch_module.float16, torch_module.bfloat16):
+                q = torch_module.randn(2, 16, 4, 64, device=device, dtype=dtype, generator=generator)
+                k = torch_module.randn(2, 24, 2, 64, device=device, dtype=dtype, generator=generator)
+                v = torch_module.randn(2, 24, 2, 64, device=device, dtype=dtype, generator=generator)
+                cq = torch_module.tensor([0, 16, 32], device=device, dtype=torch_module.int32)
+                ck = torch_module.tensor([0, 24, 48], device=device, dtype=torch_module.int32)
+                for causal in (False, True):
+                    mask = None
+                    if causal:
+                        mask = torch_module.arange(24, device=device)[None, :] <= torch_module.arange(16, device=device)[:, None] + 8
+                    expected = torch_module.nn.functional.scaled_dot_product_attention(
+                        q.transpose(1, 2), k.repeat_interleave(2, dim=2).transpose(1, 2),
+                        v.repeat_interleave(2, dim=2).transpose(1, 2), attn_mask=mask).transpose(1, 2)
+                    out = fn(q.flatten(0, 1), k.flatten(0, 1), v.flatten(0, 1),
+                        cu_seqlens_q=cq, cu_seqlens_k=ck, max_seqlen_q=16, max_seqlen_k=24,
+                        causal=causal).reshape_as(expected)
+                    cuda.synchronize(index)
+                    if not torch_module.allclose(out.float(), expected.float(), atol=0.04, rtol=0.04):
+                        raise RuntimeError(f"FA4 numerical probe failed for {dtype}, causal={causal}")
+        report["passed"] = True
+    except (ImportError, OSError, RuntimeError, TypeError, ValueError, AttributeError) as exc:
+        report["reason"] = f"{type(exc).__name__}: {exc}"
+    _FA4_PROBE_RESULTS[key] = report
+    return dict(report)
+
+
 def detect_attention_backends(torch_module: Any | None = None) -> set[str]:
     """Detect callable dense-attention implementations, not import specs alone."""
 
@@ -228,17 +304,8 @@ def detect_attention_backends(torch_module: Any | None = None) -> set[str]:
         if callable(getattr(functional, "scaled_dot_product_attention", None)):
             available.add("torch_sdpa")
 
-    probes = {
-        "flash_attn2": ("flash_attn.flash_attn_interface", "flash_attn_varlen_func"),
-        "flash_attn3": ("flash_attn_interface", "flash_attn_varlen_func"),
-        "sage_attn3": ("sageattn3", "sageattn3_blackwell"),
-    }
-    for backend, (module_name, callable_name) in probes.items():
-        try:
-            module = importlib.import_module(module_name)
-        except (ImportError, OSError, RuntimeError):
-            continue
-        if callable(getattr(module, callable_name, None)):
+    for backend in ("flash_attn2", "flash_attn3", "flash_attn4", "sage_attn3"):
+        if callable(import_attention_callable(backend)):
             available.add(backend)
 
     try:
@@ -293,6 +360,17 @@ def resolve_attention_config(
             )
 
     available = set(available_backends) if available_backends is not None else detect_attention_backends(torch_module)
+    runtime = getattr(getattr(torch_module, "version", None), "cuda", None)
+    if runtime:
+        # Device support and extension support have different minimum versions.
+        # Older source builds may work, but are not implicitly qualified here.
+        try:
+            version_pair = tuple(int(part) for part in runtime.split(".")[:2])
+            for backend, minimum in (("flash_attn2", (12, 0)), ("flash_attn3", (12, 3)), ("flash_attn4", (12, 8))):
+                if version_pair < minimum:
+                    available.discard(backend)
+        except (TypeError, ValueError):
+            available.intersection_update({"torch_sdpa"})
     strict_mode = bool(config.get("strict_cuda_backend", False)) if strict is None else strict
     changes: dict[str, tuple[str, str]] = {}
 
@@ -300,11 +378,18 @@ def resolve_attention_config(
         requested = str(container.get(key, ""))
         if requested not in DENSE_ATTENTION_BACKENDS:
             return
+        validated = ()
+        if requested == "flash_attn4" and requested in available and torch_module is not None:
+            report = probe_flash_attention4(torch_module, profile)
+            config.setdefault("attention_runtime_probes", {})["flash_attn4"] = report
+            if report["passed"]:
+                validated = ("flash_attn4",)
         resolved = select_attention_backend(
             requested=requested,
             profile=profile,
             available_backends=available,
             strict=strict_mode,
+            validated_backends=validated,
         )
         if resolved != requested:
             container[key] = resolved

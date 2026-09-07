@@ -3,7 +3,7 @@ from typing import Optional
 # Please reinstall flashinfer by referring to https://github.com/svg-project/Sparse-VideoGen
 try:
     import flashinfer
-except ImportError:
+except (ImportError, OSError, RuntimeError):
     flashinfer = None
 
 import torch

@@ -4,7 +4,7 @@ import torch
 
 try:
     import spas_sage_attn
-except ImportError:
+except (ImportError, OSError, RuntimeError):
     spas_sage_attn = None
 
 from lightx2v.utils.registry_factory import ATTN_WEIGHT_REGISTER

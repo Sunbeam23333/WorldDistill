@@ -35,13 +35,39 @@ jobs:
         run: |
           git ls-files --error-unmatch training/data/video_dataset.py
           git ls-files --error-unmatch inference/lightx2v/models/runners/default_runner.py
+          git ls-files --error-unmatch quant_compat.py
+          git ls-files --error-unmatch training/model_adapter.py training/student_export.py
+          git ls-files --error-unmatch inference/lightx2v/utils/attention.py
 
       - name: Run contract and training-loop tests
         run: python -m pytest -q training/tests
 
       - name: Static checks
         run: |
-          python -m compileall -q cuda_compat.py distill_capabilities.py training tools inference/lightx2v
+          python -m compileall -q cuda_compat.py quant_compat.py distill_capabilities.py training tools inference/lightx2v
           find scripts -type f -name '*.sh' -print0 | xargs -0 -n1 bash -n
           python setup.py --name --version
           git diff --check
+
+  diffusers-integration:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - diffusers: "0.36.0"
+            transformers: "4.57.1"
+          - diffusers: "0.40.0"
+            transformers: "5.16.1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - name: Install isolated model integration dependencies
+        run: |
+          python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
+          python -m pip install pytest loguru PyYAML packaging numpy safetensors einops accelerate peft pillow "diffusers==${{ matrix.diffusers }}" "transformers==${{ matrix.transformers }}"
+      - name: Real tiny-model forward, backward, export, and distributed resume
+        run: python -m pytest -q training/tests

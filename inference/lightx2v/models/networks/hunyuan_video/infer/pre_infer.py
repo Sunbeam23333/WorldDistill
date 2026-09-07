@@ -12,6 +12,7 @@ from lightx2v_platform.base.global_var import AI_DEVICE, PLATFORM
 from .attn_no_pad import (
     flash_attn_no_pad,
     flash_attn_no_pad_v3,
+    flash_attn_no_pad_v4,
     sage_attn_no_pad_v2,
     sage_attn_no_pad_v3,
     torch_sdpa_no_pad,
@@ -71,6 +72,8 @@ def attention(
         x = flash_attn_no_pad(qkv, attn_mask, causal=causal, dropout_p=drop_rate, softmax_scale=None)
     elif attn_type == "flash_attn3":
         x = flash_attn_no_pad_v3(qkv, attn_mask, causal=causal, dropout_p=drop_rate, softmax_scale=None)
+    elif attn_type == "flash_attn4":
+        x = flash_attn_no_pad_v4(qkv, attn_mask, causal=causal, dropout_p=drop_rate, softmax_scale=None)
     elif attn_type == "sage_attn2":
         x = sage_attn_no_pad_v2(qkv, attn_mask, causal=causal, dropout_p=drop_rate, softmax_scale=None)
     elif attn_type == "sage_attn3":

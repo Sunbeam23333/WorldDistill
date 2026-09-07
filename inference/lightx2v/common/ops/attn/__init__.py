@@ -1,5 +1,5 @@
 from .draft_attn import DraftAttnWeight
-from .flash_attn import FlashAttn2Weight, FlashAttn3Weight
+from .flash_attn import FlashAttn2Weight, FlashAttn3Weight, FlashAttn4Weight
 from .general_sparse_attn import GeneralSparseAttnWeight
 from .nbhd_attn import NbhdAttnWeight, NbhdAttnWeightFlashInfer
 from .radial_attn import RadialAttnWeight

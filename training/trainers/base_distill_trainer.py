@@ -53,6 +53,7 @@ from training.utils.distributed import (
 )
 from training.utils.experiment_tracking import ExperimentTracker
 from training.utils.model_output import extract_prediction_tensor
+from training.utils.replicated_gradients import broadcast_replicated_model, synchronize_replicated_gradients
 
 
 @contextlib.contextmanager
@@ -222,6 +223,23 @@ class BaseDistillTrainer(ABC):
 
         # Flow Matching parameters
         self.num_train_timesteps = 1000
+        for role, model in (("teacher", teacher_model), ("student", student_model)):
+            noise_process = getattr(model, "training_noise_process", "flow")
+            if noise_process != "flow":
+                raise ValueError(
+                    f"{role} declares training_noise_process={noise_process!r}, but the current "
+                    "trainers only implement flow-matching noise and prediction conversions. "
+                    "CogVideoX requires a VP scheduler/noise/prediction adapter; "
+                    "translating tensor layouts alone does not make VP and flow equivalent."
+                )
+            model_time_scale = getattr(model, "num_train_timesteps", self.num_train_timesteps)
+            if model_time_scale != self.num_train_timesteps:
+                raise ValueError(
+                    f"{role} declares num_train_timesteps={model_time_scale}, but the current "
+                    "training schedules use the 1000-step flow-matching time scale. "
+                    "Provide a compatible scheduler/model adapter; silently rescaling "
+                    "would change noise-expert routing and distillation targets."
+                )
         self.sigma_min = 0.0
         self.prediction_type = getattr(args, "prediction_type", "velocity")  # velocity | epsilon | x0
 
@@ -230,6 +248,13 @@ class BaseDistillTrainer(ABC):
         self.rank = dist.get_rank() if self.is_distributed else 0
         self.world_size = dist.get_world_size() if self.is_distributed else 1
         self.is_main_process = self.rank == 0
+        self._manual_replicated_sync = bool(
+            self.is_distributed and self.parallel_mode == "ddp"
+            and getattr(self.student_model, "requires_unused_parameter_detection", False)
+        )
+        if self._manual_replicated_sync:
+            # Initialize all future EMA copies from the same expert weights.
+            broadcast_replicated_model(self.student_model)
 
         # Sequence Parallelism
         self.sp_size = getattr(args, "sp_size", 1)
@@ -637,11 +662,11 @@ class BaseDistillTrainer(ABC):
             # DDP (default)
             if self.is_distributed and not isinstance(
                 self.student_model, torch.nn.parallel.DistributedDataParallel
-            ):
+            ) and not self._manual_replicated_sync:
                 self.student_model = torch.nn.parallel.DistributedDataParallel(
                     self.student_model,
-                    device_ids=[int(os.environ.get("LOCAL_RANK", 0))],
-                    find_unused_parameters=False,
+                    device_ids=[int(os.environ.get("LOCAL_RANK", 0))] if self.device.type == "cuda" else None,
+                    find_unused_parameters=bool(getattr(self.student_model, "requires_unused_parameter_detection", False)),
                 )
 
         # Resume only after the DeepSpeed/FSDP/DDP wrapper and its optimizer
@@ -653,6 +678,19 @@ class BaseDistillTrainer(ABC):
         self.student_model.train()
         self._initialize_data_iterator(resuming=bool(self.args.resume_from))
 
+        profiler = None
+        if getattr(self.args, "profile_active_steps", 0) > 0:
+            activities = [torch.profiler.ProfilerActivity.CPU]
+            if self.device.type == "cuda":
+                activities.append(torch.profiler.ProfilerActivity.CUDA)
+            trace_path = os.path.join(self.args.output_dir, f"trace-rank{self._checkpoint_rank()}.json")
+            profiler = torch.profiler.profile(
+                activities=activities, record_shapes=True,
+                schedule=torch.profiler.schedule(wait=0, warmup=self.args.profile_warmup_steps,
+                                                 active=self.args.profile_active_steps, repeat=1),
+                on_trace_ready=lambda p: p.export_chrome_trace(trace_path),
+            )
+            profiler.__enter__()
         try:
             while self.global_step < self.args.max_train_steps:
                 # Get next batch
@@ -666,10 +704,16 @@ class BaseDistillTrainer(ABC):
                 if self.sp_group is not None and "latents" in batch:
                     batch["latents"] = scatter_sequence(batch["latents"], self.sp_group, dim=2)
 
+                if self.device.type == "cuda":
+                    torch.cuda.synchronize(self.device)
                 step_start_time = time.perf_counter()
                 step_metrics = self.train_step(batch)
+                if self.device.type == "cuda":
+                    torch.cuda.synchronize(self.device)
                 self.global_step += 1
                 step_metrics = self._augment_step_metrics(step_metrics, batch, step_start_time)
+                if profiler is not None:
+                    profiler.step()
 
                 # EMA update
                 if self.ema is not None:
@@ -701,6 +745,10 @@ class BaseDistillTrainer(ABC):
             logger.info(f"Training completed at step {self.global_step}.")
             self.save_checkpoint(self.global_step, self.args.output_dir)
         finally:
+            if profiler is not None:
+                profiler.__exit__(None, None, None)
+            if self.runtime is not None and hasattr(self.runtime, "close"):
+                self.runtime.close()
             if self._tracker is not None:
                 self._tracker.close()
 
@@ -881,6 +929,9 @@ class BaseDistillTrainer(ABC):
                     loss = loss / self.args.gradient_accumulation_steps
                 self.scaler.scale(loss).backward()
             total_loss += loss.item()
+
+        if self._manual_replicated_sync:
+            synchronize_replicated_gradients(self.student_model)
 
         # FP16 must always complete an unscale/inf-check cycle, even when
         # clipping is disabled. Disabled scalers do not need this call.
@@ -1070,7 +1121,10 @@ class BaseDistillTrainer(ABC):
         return self.prepare_teacher_input(batch, noisy_latents, timesteps)
 
     def _augment_model_input(self, input_kwargs: Dict[str, Any], batch: Dict[str, Any]) -> Dict[str, Any]:
-        for key in ("encoder_hidden_states", "image_cond", "camera_poses", "actions"):
+        for key in ("encoder_hidden_states", "encoder_attention_mask", "pooled_projections",
+                    "encoder_hidden_states_2", "encoder_attention_mask_2", "image_embeds",
+                    "encoder_hidden_states_image", "image_cond", "camera_poses", "actions",
+                    "guidance", "timestep_r", "image_rotary_emb", "rope_interpolation_scale"):
             if key in batch and batch[key] is not None:
                 input_kwargs[key] = batch[key]
         return input_kwargs
@@ -1089,6 +1143,17 @@ class BaseDistillTrainer(ABC):
         """
 
         selected = dict(batch)
+        image_cond = batch.get("image_cond")
+        if isinstance(image_cond, torch.Tensor):
+            if image_cond.ndim != 5 or image_cond.shape[2] != total_frames:
+                raise ValueError(
+                    "Chunked image_cond must be encoded [B,C,T,H,W] and frame-aligned "
+                    f"with total_frames={total_frames}; got {tuple(image_cond.shape)}. "
+                    "Global/single-frame image conditions require a model-specific adapter."
+                )
+            selected["image_cond"] = image_cond.index_select(
+                2, frame_indices.to(device=image_cond.device, dtype=torch.long)
+            )
         for key in ("camera_poses", "actions"):
             value = batch.get(key)
             if not isinstance(value, torch.Tensor) or value.ndim < 2:

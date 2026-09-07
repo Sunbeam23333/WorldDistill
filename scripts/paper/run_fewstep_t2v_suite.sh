@@ -63,14 +63,21 @@ run_teacher_infer_phase() {
 }
 
 run_student_infer_phase() {
+    if [[ "${INFER_NUM_GPUS}" != "1" ]]; then
+        echo "ERROR: the exported-student Diffusers sampler currently supports INFER_NUM_GPUS=1 only." >&2
+        exit 1
+    fi
     mkdir -p "${OUTPUT_ROOT}/student_samples"
+    run_cmd python3 "${PROJECT_ROOT}/tools/export_student.py" \
+        --base_model "${TEACHER_MODEL}" \
+        --checkpoint "${OUTPUT_ROOT}/train" \
+        --output_dir "${OUTPUT_ROOT}/student_export" --num_steps 4
     print_header "Few-step T2V student inference"
-    run_cmd bash "${PROJECT_ROOT}/scripts/run_infer.sh" \
-        --model_cls wan2.2_moe_distill \
-        --task t2v \
-        --model_path "${MODEL_ROOT:-${PROJECT_ROOT}/models}" \
+    run_cmd python3 "${PROJECT_ROOT}/tools/sample_student.py" \
+        --bundle "${OUTPUT_ROOT}/student_export" \
         --prompt "${PROMPT}" \
-        --gpus "${INFER_NUM_GPUS}" \
+        --num_frames 81 --height 720 --width 1280 \
+        --num_steps 4 \
         --save_path "${OUTPUT_ROOT}/student_samples/student.mp4"
 }
 

@@ -1,0 +1,15 @@
+# Isolated modern TRAINING integration environment. Not a replacement for the
+# vendored inference engine's pinned transformers environment.
+# Install a target-appropriate PyTorch build separately.
+diffusers==0.40.0
+transformers==5.16.1
+accelerate>=0.34.2,<2
+peft>=0.17.0,<1
+pytest
+loguru
+PyYAML
+packaging
+numpy
+safetensors
+einops
+pillow

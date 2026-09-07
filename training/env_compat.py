@@ -36,15 +36,15 @@ def _check_range(package_name: str, version_str: str, minimum: str | None, maxim
     return None
 
 
-def validate_runtime_dependency_versions(strict: bool = True) -> dict[str, Any]:
+def validate_runtime_dependency_versions(strict: bool = True, required_transformers_version: str = EXPECTED_TRANSFORMERS_VERSION) -> dict[str, Any]:
     issues: list[str] = []
     versions: dict[str, str | None] = {
         "transformers": _installed_version("transformers"),
     }
-    if versions["transformers"] != EXPECTED_TRANSFORMERS_VERSION:
+    if versions["transformers"] != required_transformers_version:
         issues.append(
             "transformers 版本不匹配: "
-            f"检测到 {versions['transformers']!r}, 需要严格使用 {EXPECTED_TRANSFORMERS_VERSION}."
+            f"检测到 {versions['transformers']!r}, 需要严格使用 {required_transformers_version}."
         )
 
     for package_name, bounds in _COMPATIBLE_RANGES.items():
@@ -61,7 +61,7 @@ def validate_runtime_dependency_versions(strict: bool = True) -> dict[str, Any]:
     if strict and issues:
         install_hint = (
             "pip install "
-            f"'transformers=={EXPECTED_TRANSFORMERS_VERSION}' "
+            f"'transformers=={required_transformers_version}' "
             "'diffusers>=0.33.0,<1' 'accelerate>=0.34.2,<2' 'peft>=0.17.0,<1'"
         )
         raise RuntimeError("\n".join([*issues, f"建议执行: {install_hint}"]))

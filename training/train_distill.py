@@ -217,9 +217,22 @@ def _bucket_sampler_drop_last(world_size: int) -> bool:
     return world_size > 1
 
 
+def _resolve_native_dual_args(args, student_model) -> None:
+    from training.model_adapter import NoiseRoutedDenoiser
+
+    if not isinstance(student_model, NoiseRoutedDenoiser):
+        return
+    if getattr(args, "student_low_model", None):
+        raise ValueError("student_low_model cannot override a native dual-expert checkpoint; supply a complete matching student pipeline instead")
+    if args.use_dual_model:
+        logger.info("Checkpoint already supplies both noise experts; using its native boundary for teacher and student.")
+        args.use_dual_model = False
+
+
 def main():
     args = parse_training_args()
-    validate_runtime_dependency_versions(strict=getattr(args, "strict_env_check", True))
+    validate_runtime_dependency_versions(strict=getattr(args, "strict_env_check", True),
+                                         required_transformers_version=args.required_transformers_version)
     rank, world_size = setup_distributed()
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
     device = torch.device(f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu")
@@ -327,7 +340,9 @@ def main():
         args.config_json,
         device,
         teacher_dtype,
+        student_device=torch.device("cpu") if world_size > 1 and args.parallel_mode in {"fsdp", "deepspeed"} else device,
     )
+    _resolve_native_dual_args(args, student_model)
 
     # Apply LoRA if requested
     if args.use_lora:
@@ -481,6 +496,7 @@ def _load_models(
     config_json: str,
     device: torch.device,
     teacher_dtype: torch.dtype,
+    student_device: torch.device | None = None,
 ):
     """Load teacher and student models.
 
@@ -508,28 +524,35 @@ def _load_models(
 
     candidate_dirs = _candidate_model_dirs(teacher_path, model_cls, config_json)
 
-    # --- Strategy 1: diffusers pipeline ---
+    if os.path.isfile(teacher_path):
+        # An explicit file must not be replaced by a different, conventionally
+        # named checkpoint in the same directory during from_pretrained().
+        from training.model_adapter import load_diffusers_denoiser
+        from training.utils.checkpoint_io import load_model_state_file
+
+        parent = Path(teacher_path).parent
+        if not (parent / "config.json").is_file():
+            raise ValueError("An explicit teacher weight file requires its exact Diffusers config.json alongside it")
+        teacher_model = load_diffusers_denoiser(parent, dtype=teacher_dtype, weights=False)
+        state = load_model_state_file(teacher_path, map_location="cpu")
+        if set(state) == set(teacher_model.state_dict()):
+            teacher_model.load_state_dict(state, strict=True)
+        else:
+            teacher_model.model.load_state_dict(state, strict=True)
+        candidate_dirs = []
+
+    # Load the actual configured denoisers without also loading text/VAE weights.
+    # This preserves BOTH Wan2.2 experts and avoids the old Transformer2D guess.
+    from training.model_adapter import load_diffusers_training_model
     for candidate_dir in candidate_dirs:
-        has_diffusers = os.path.exists(os.path.join(candidate_dir, "model_index.json"))
+        has_diffusers = any(os.path.exists(os.path.join(candidate_dir, name))
+                            for name in ("model_index.json", "worlddistill_export.json"))
         if not has_diffusers:
             continue
-        try:
-            from diffusers import DiffusionPipeline
-            pipe = DiffusionPipeline.from_pretrained(candidate_dir, torch_dtype=teacher_dtype)
-            if hasattr(pipe, "transformer") and pipe.transformer is not None:
-                teacher_model = pipe.transformer.to(device)
-            elif hasattr(pipe, "unet") and pipe.unet is not None:
-                teacher_model = pipe.unet.to(device)
-            else:
-                logger.warning("diffusers pipeline loaded but no transformer/unet found.")
-            if teacher_model is not None:
-                logger.info(f"Loaded teacher via diffusers from {candidate_dir}: {type(teacher_model).__name__}")
-            del pipe
-            torch.cuda.empty_cache()
-            if teacher_model is not None:
-                break
-        except Exception as e:
-            logger.warning(f"diffusers loading failed from {candidate_dir}: {e}")
+        # A declared dual pipeline failing to load must not fall through to a
+        # single-expert subdirectory and silently lose its low-noise teacher.
+        teacher_model = load_diffusers_training_model(candidate_dir, dtype=teacher_dtype)
+        break
 
     # --- Strategy 2: Direct state_dict loading ---
     if teacher_model is None:
@@ -543,7 +566,7 @@ def _load_models(
                     candidate_dir,
                     weight_files,
                     model_cls,
-                    device,
+                    torch.device("cpu"),
                     teacher_dtype,
                 )
                 if teacher_model is not None:
@@ -554,31 +577,18 @@ def _load_models(
                 os.path.dirname(teacher_path),
                 [teacher_path],
                 model_cls,
-                device,
+                torch.device("cpu"),
                 teacher_dtype,
             )
-
-    # --- Strategy 3: Runner mechanism (fallback) ---
-    if teacher_model is None:
-        try:
-            from inference.lightx2v.utils.registry_factory import RUNNER_REGISTER
-            runner_cls = RUNNER_REGISTER.get(model_cls)
-            if runner_cls is not None:
-                logger.info(f"Attempting Runner-based loading: {model_cls}")
-                # NOTE: Runner integration requires inference engine setup.
-                # This is a placeholder — in production, Runner handles full init.
-                logger.warning("Runner integration not fully implemented for training. "
-                               "Please use diffusers format or provide safetensors.")
-        except ImportError:
-            pass
 
     if teacher_model is None:
         raise RuntimeError(
             f"Failed to load teacher model from '{teacher_path}'. "
             "Supported formats:\n"
             "  1. diffusers directory (with model_index.json or config.json)\n"
-            "  2. Directory with .safetensors / .bin / .pt files\n"
-            "Hint: For diffusers models, use `huggingface-cli download <repo> --local-dir <path>`"
+            "  2. Exact Diffusers architecture config plus its weights\n"
+            "Inference-only tensor runners are not differentiable training adapters. "
+            "Convert the original checkpoint with the model author's converter first."
         )
 
     # --- Build student model ---
@@ -586,9 +596,14 @@ def _load_models(
         from training.utils.checkpoint_io import load_model_state_file
 
         logger.info(f"Loading separate student model from {student_path}")
-        student_model = copy.deepcopy(teacher_model)
-        student_state = load_model_state_file(student_path, map_location=device)
-        student_model.load_state_dict(student_state, strict=True)
+        if os.path.isdir(student_path):
+            student_model = load_diffusers_training_model(student_path, dtype=torch.float32)
+            if type(student_model) is not type(teacher_model):
+                raise ValueError("Teacher/student expert topology differs; supply a matching student architecture")
+        else:
+            student_model = copy.deepcopy(teacher_model)
+            student_state = load_model_state_file(student_path, map_location="cpu")
+            student_model.load_state_dict(student_state, strict=True)
     else:
         logger.info("No student_model_path supplied; cloning teacher as the student model.")
         student_model = copy.deepcopy(teacher_model)
@@ -597,7 +612,10 @@ def _load_models(
     # distributed mixed-precision policy controls compute dtype; cloning the
     # reduced-precision teacher directly would otherwise update BF16/FP16
     # parameters in place.
-    student_model = student_model.to(device=device, dtype=torch.float32)
+    # FSDP/ZeRO consume CPU-staged parameters, avoiding a full FP32 student on
+    # each GPU before wrapping/sharding. Teacher weights remain replicated.
+    student_model = student_model.to(device=student_device or device, dtype=torch.float32)
+    teacher_model = teacher_model.to(device)
 
     # Ensure student requires grad, teacher does not
     for p in teacher_model.parameters():
@@ -633,14 +651,11 @@ def _construct_model_from_weights(
             with open(config_path) as f:
                 config = json.load(f)
 
-            # Determine model class from config
-            model_type = config.get("_class_name", "")
-            if "Transformer" in model_type or "DiT" in model_type:
-                from diffusers.models import Transformer2DModel
-                model = Transformer2DModel.from_pretrained(model_dir, torch_dtype=teacher_dtype)
-                return model.to(device)
+            if config.get("_class_name"):
+                from training.model_adapter import load_diffusers_training_model
+                return load_diffusers_training_model(model_dir, dtype=teacher_dtype).to(device)
         except Exception as e:
-            logger.warning(f"Config-based model construction failed: {e}")
+            raise RuntimeError(f"Exact architecture loading failed from {model_dir}: {e}") from e
 
     # Try loading safetensors directly
     if any(f.endswith(".safetensors") for f in weight_files):

@@ -290,4 +290,4 @@ class OptimizerContractTests(unittest.TestCase):
         )
 
         self.assertTrue(trainer.use_gan)
-        self.assertFalse(trainer.enable_fake_score)
+        self.assertTrue(trainer.enable_fake_score)

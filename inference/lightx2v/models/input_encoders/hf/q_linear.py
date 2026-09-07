@@ -1,40 +1,59 @@
 import torch
 import torch.nn as nn
+from quant_compat import fp8_per_token_quantize, optional_attr
 
 try:
     from vllm import _custom_ops as ops
-except ImportError:
+except (ImportError, OSError, RuntimeError):
     ops = None
 
 try:
     import sgl_kernel
-except ImportError:
+except (ImportError, OSError, RuntimeError):
     sgl_kernel = None
 
 try:
     from torchao.quantization.utils import quant_int8_per_token_matmul as torchao_int8_gemm
     from torchao.quantization.utils import quantize_activation_per_token_absmax as torchao_int8_quant
-except ImportError:
+except (ImportError, OSError, RuntimeError):
     try:
         from torchao.quantization.utils import _quant_int8_per_token_matmul as torchao_int8_gemm
         from torchao.quantization.utils import _quantize_activation_per_token_absmax as torchao_int8_quant
-    except ImportError:
+    except (ImportError, OSError, RuntimeError):
         torchao_int8_gemm, torchao_int8_quant = None, None
 
 try:
     from q8_kernels.functional.linear import q8_linear
-except ImportError:
+except (ImportError, OSError, RuntimeError):
     q8_linear = None
 
 try:
     from q8_kernels.functional.linear import fp8_linear
-except ImportError:
+except (ImportError, OSError, RuntimeError):
     fp8_linear = None
 
 from lightx2v.common.ops.mm.triton_kernels import fp8_gemm_bias_triton, fp8_gemm_triton, fp8_quantize_triton, int8_gemm_bias_triton, int8_gemm_triton, int8_quantize_triton
+from lightx2v.common.ops.mm.mm_weight import _require_registered_quant_backend
 
 
-class TritonQuantLinearInt8(nn.Module):
+class _CheckedQuantLinear(nn.Module):
+    QUANT_BACKEND = None
+
+    def __init__(self):
+        super().__init__()
+        _require_registered_quant_backend(self.QUANT_BACKEND)
+        self._validated_quant_devices = set()
+        self.register_forward_pre_hook(self._check_quant_device)
+
+    def _check_quant_device(self, module, inputs):
+        device = inputs[0].device
+        if str(device) not in self._validated_quant_devices:
+            _require_registered_quant_backend(self.QUANT_BACKEND, device)
+            self._validated_quant_devices.add(str(device))
+
+
+class TritonQuantLinearInt8(_CheckedQuantLinear):
+    QUANT_BACKEND = "int8-triton"
     def __init__(self, in_features, out_features, bias=True, dtype=torch.bfloat16):
         super().__init__()
         self.in_features = in_features
@@ -94,7 +113,8 @@ class TritonQuantLinearInt8(nn.Module):
         return self
 
 
-class TritonQuantLinearFp8(nn.Module):
+class TritonQuantLinearFp8(_CheckedQuantLinear):
+    QUANT_BACKEND = "fp8-triton"
     def __init__(self, in_features, out_features, bias=True, dtype=torch.bfloat16):
         super().__init__()
         self.in_features = in_features
@@ -154,7 +174,8 @@ class TritonQuantLinearFp8(nn.Module):
         return self
 
 
-class VllmQuantLinearInt8(nn.Module):
+class VllmQuantLinearInt8(_CheckedQuantLinear):
+    QUANT_BACKEND = "int8-vllm"
     def __init__(self, in_features, out_features, bias=True, dtype=torch.bfloat16):
         super().__init__()
         self.in_features = in_features
@@ -205,7 +226,8 @@ class VllmQuantLinearInt8(nn.Module):
         return self
 
 
-class VllmQuantLinearFp8(nn.Module):
+class VllmQuantLinearFp8(_CheckedQuantLinear):
+    QUANT_BACKEND = "fp8-vllm"
     def __init__(self, in_features, out_features, bias=True, dtype=torch.bfloat16):
         super().__init__()
         self.in_features = in_features
@@ -254,7 +276,8 @@ class VllmQuantLinearFp8(nn.Module):
         return self
 
 
-class SglQuantLinearFp8(nn.Module):
+class SglQuantLinearFp8(_CheckedQuantLinear):
+    QUANT_BACKEND = "fp8-sgl"
     def __init__(self, in_features, out_features, bias=True, dtype=torch.bfloat16):
         super().__init__()
         self.in_features = in_features
@@ -268,8 +291,8 @@ class SglQuantLinearFp8(nn.Module):
 
     def act_quant_func(self, x):
         m, k = x.shape
-        input_tensor_quant = torch.empty((m, k), dtype=torch.float8_e4m3fn, device="cuda", requires_grad=False)
-        input_tensor_scale = torch.empty((m, 1), dtype=torch.float32, device="cuda", requires_grad=False)
+        input_tensor_quant = torch.empty((m, k), dtype=torch.float8_e4m3fn, device=x.device, requires_grad=False)
+        input_tensor_scale = torch.empty((m, 1), dtype=torch.float32, device=x.device, requires_grad=False)
         sgl_kernel.sgl_per_token_quant_fp8(x, input_tensor_quant, input_tensor_scale)
         return input_tensor_quant, input_tensor_scale
 
@@ -306,7 +329,8 @@ class SglQuantLinearFp8(nn.Module):
         return self
 
 
-class TorchaoQuantLinearInt8(nn.Module):
+class TorchaoQuantLinearInt8(_CheckedQuantLinear):
+    QUANT_BACKEND = "int8-torchao"
     def __init__(self, in_features, out_features, bias=True, dtype=torch.bfloat16):
         super().__init__()
         self.in_features = in_features
@@ -348,7 +372,8 @@ class TorchaoQuantLinearInt8(nn.Module):
         return self
 
 
-class TorchaoQuantLinearFp8(nn.Module):
+class TorchaoQuantLinearFp8(_CheckedQuantLinear):
+    QUANT_BACKEND = "fp8-torchao"
     def __init__(self, in_features, out_features, bias=True, dtype=torch.bfloat16):
         super().__init__()
         self.in_features = in_features
@@ -363,11 +388,7 @@ class TorchaoQuantLinearFp8(nn.Module):
             self.register_buffer("bias", None)
 
     def act_quant_func(self, x):
-        abs_max = x.abs().max(dim=-1, keepdim=True)[0]
-        abs_max = torch.clamp(abs_max, min=1e-8)
-        scale = abs_max / 448.0
-        quantized = torch.clamp(x / scale, -448, 448).to(torch.float8_e4m3fn)
-        return quantized, scale.float()
+        return fp8_per_token_quantize(x)
 
     def forward(self, input_tensor):
         input_tensor = input_tensor.squeeze(0)
@@ -398,7 +419,8 @@ class TorchaoQuantLinearFp8(nn.Module):
         return self
 
 
-class Q8FQuantLinearInt8(nn.Module):
+class Q8FQuantLinearInt8(_CheckedQuantLinear):
+    QUANT_BACKEND = "int8-q8f"
     def __init__(self, in_features, out_features, bias=True, dtype=torch.float32):
         super().__init__()
         self.in_features = in_features
@@ -413,7 +435,7 @@ class Q8FQuantLinearInt8(nn.Module):
             self.register_buffer("bias", None)
 
     def act_quant_func(self, x):
-        if ops is not None:
+        if callable(optional_attr(ops, "scaled_int8_quant")):
             input_tensor_quant, input_tensor_scale, _ = ops.scaled_int8_quant(x, scale=None, azp=None, symmetric=True)
         else:
             input_tensor_quant, input_tensor_scale = int8_quantize_triton(x)
@@ -447,7 +469,8 @@ class Q8FQuantLinearInt8(nn.Module):
         return self
 
 
-class Q8FQuantLinearFp8(nn.Module):
+class Q8FQuantLinearFp8(_CheckedQuantLinear):
+    QUANT_BACKEND = "fp8-q8f"
     def __init__(self, in_features, out_features, bias=True, dtype=torch.float32):
         super().__init__()
         self.in_features = in_features
@@ -462,7 +485,7 @@ class Q8FQuantLinearFp8(nn.Module):
             self.register_buffer("bias", None)
 
     def act_quant_func(self, x):
-        if ops is not None:
+        if callable(optional_attr(ops, "scaled_fp8_quant")):
             input_tensor_quant, input_tensor_scale = ops.scaled_fp8_quant(x.squeeze(0), None, scale_ub=None, use_per_token_if_dynamic=True)
         else:
             input_tensor_quant, input_tensor_scale = fp8_quantize_triton(x)

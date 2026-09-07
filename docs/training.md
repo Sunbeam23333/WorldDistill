@@ -6,13 +6,13 @@ states the current evidence.
 
 | Method | Implemented surface | Current evidence |
 |---|---|---|
-| Step | Fixed timetable, single/dual student routing, target loss | Two-step CPU loop and exact single-rank checkpoint resume; real adapter pending |
-| Stream | Per-frame schedule, temporal window/overlap, aligned action/camera slicing | CPU schedule/window contracts; `denoising_steps_per_frame` is not yet an inner solver |
-| Progressive | Adjacent schedule pairs, two teacher substeps to one student target | CPU schedule/checkpoint contracts; real-model run pending |
-| Consistency | EMA target and Huber/MSE options | Implementation/registry checks |
+| Step | Fixed timetable, native high/low-noise teacher AND student routing | Tiny real Wan optimizer, export/reload and CPU restart tests |
+| Stream | Differentiable per-frame Euler unroll; generated overlap passed to the next window | CPU multi-window/solver and restart tests; requires a causal/per-frame model adapter |
+| Progressive | All schedule intervals including the final interval to zero | Sampling regression, real tiny Wan update and restart tests |
+| Consistency | EMA target and Huber/MSE options | Real tiny Wan update and CPU restart tests |
 | Context Forcing | Teacher context, hybrid memory, action/camera passthrough, target mask | CPU selector/chunk tests; closed-loop rollout evaluation pending |
 | Adversarial | Latent projection discriminator plus distillation term | Experimental serial/DDP scaffold; GAS=1; not separate certified ADD and LADD paths |
-| DMD-style | Fake-score and DMD2 GAN auxiliaries | Experimental serial/DDP scaffold; GAS=1; reverse-KL/objective parity is not yet established |
+| DMD-style | Fake-distribution DSM; teacher-minus-fake distribution gradient; DMD online teacher regression, DMD2 GAN without regression | Numerical target tests, tiny real Wan DMD/DMD2 updates and CPU/Gloo restart; pretrained reproduction pending |
 
 The shared target-supervision path supports MSE and Huber loss. The optional
 Triton fusion applies only to masked MSE; Huber always uses the PyTorch path.
@@ -102,8 +102,10 @@ training adapter. Test the exact model forward signature before a long run.
   full-history Hybrid-Sparse Memory.
 - `world_model_runtime.json`: more explicit cache/memory research knobs.
 
-Asynchronous prefetch and heterogeneous offload are planning metadata today,
-not a background transfer executor.
+Cold-cache prefetch now runs in a bounded background CPU worker. It preserves
+the original production step through promotion and validates freshness again
+at consumption. It never runs the teacher or CUDA kernels in that worker.
+Teacher-parameter heterogeneous offload is still not implemented.
 
 Muon and the dual high/low-noise student mode are supported in serial or DDP
 training. They fail fast under FSDP or DeepSpeed until sharded optimizer and
@@ -129,8 +131,74 @@ batch. Exact restart requires the same dataset, batch size, sampler, and world
 size; legacy checkpoints without this metadata fall back to weights/optimizer
 resume with an explicit warning.
 
-FSDP and DeepSpeed are currently initialized only after the loader has placed a
-full teacher and a cloned FP32 student on each GPU. Their sharding reduces
-steady-state training memory, but it is not a load-time out-of-core path: the
-unsharded construction peak must fit. Models that require CPU/meta
-initialization plus sharded checkpoint loading are not supported yet.
+Multi-rank FSDP and DeepSpeed receive CPU-staged student parameters. The loader
+does not first create a full FP32 student on every GPU. Teachers remain
+replicated; this is not an out-of-core teacher or fully sharded file reader.
+GPU initialization peaks and FSDP/ZeRO restarts still require hardware runs.
+
+## Exact architecture and conditioning
+
+The loader instantiates the checkpoint's actual Diffusers `_class_name` rather
+than substituting `Transformer2DModel`. A Wan2.2 pipeline with `transformer_2`
+must provide its boundary; both teacher and student retain both experts.
+Encoded I2V `image_cond` is concatenated only after shape checks. Text embeddings,
+pooled embeddings, a second text encoder, masks, and image embeddings remain
+distinct inputs. Unsupported action/camera or temporal-attention inputs raise
+instead of being dropped. An inference-only runner is not made differentiable
+merely by wrapping its name in a training adapter.
+
+Cached samples may provide `conditioning_path`, a trusted tensor-only `.pt`
+dictionary with the model's named conditioning tensors. Raw video controls
+must provide one entry per original source frame (`action_temporal_axis` and
+`camera_temporal_axis` default to zero). Video sampling and repeat padding use
+the same indices for controls; causal VAE compression selects corresponding
+latent anchor frames. Timestamped or interval-integrated actions require an
+explicit upstream conversion, not guessed interpolation. Wan VAE channel-wise
+mean/std and multi-encoder prompt outputs are preserved. This is not universal
+raw I2V preprocessing: the HunyuanVideo 1.5 image/mask channels and vision
+embeddings (including its T2V zero conditions) must be explicitly supplied;
+LTX-family raw VAE normalization requires a native adapter. Non-1000 declared
+scheduler time scales are rejected by the current training schedules. Stock
+CogVideoX uses variance-preserving diffusion, not this trainer's linear flow
+noise process; its layout adapter does not make those objectives equivalent,
+and it is explicitly rejected until a matching training objective is provided.
+
+## Train → export → sample
+
+```bash
+python tools/export_student.py --base_model /models/teacher-diffusers \
+  --checkpoint results/step --output_dir results/step/student_export --num_steps 4
+python tools/sample_student.py --bundle results/step/student_export \
+  --prompt "A paper boat crosses the rain." --save_path results/step/student.mp4
+```
+
+The bundle contains trained denoisers and checkpoint provenance. Sampling loads
+them into the original Diffusers pipeline, reusing its licensed VAE/text assets.
+It does not sample an unrelated catalog student. Native runner conversion,
+legacy separately saved dual students and unmerged PEFT weights are not silently
+treated as full Diffusers exports. The base pipeline must support every supplied
+control. This sampling bridge is single-device and separate from LightX2V's
+optimized runner. The paper scripts reject `INFER_NUM_GPUS` other than one for
+this student bridge. JSON conditions retain their frame count and resolution
+unless explicitly overridden by command-line flags.
+
+Bundle schema 2 verifies the complete denoiser configuration/weight inventory.
+It supports a distinct student architecture and declared `torch.compile`
+checkpoint prefixes, but does not promise sampling-objective parity: the
+training timetable/shift is recorded, while the base pipeline still supplies
+its scheduler and default guidance. Validate these model-specific settings
+before reporting a few-step quality result. Checkpoint identity alone does not
+establish that equivalence.
+
+Export derives a default step count only from an unambiguous method/checkpoint
+record (including the current trained progressive stage). Otherwise supply
+`--num_steps`. The world-model paper script consequently requires
+`STUDENT_NUM_STEPS` and `STUDENT_PIPELINE_CONDITIONS` for a genuinely compatible
+pipeline; its stock native WorldPlay path is not a completed training adapter.
+
+Every training run records local `metrics.jsonl`, `host_manifest.json`,
+`config_snapshot.json` and `run_card.md`, even without W&B/TensorBoard. Use
+`tools/summarize_run.py RUN_DIR --warmup 50 --measured 200` with `log_every=1`
+to aggregate observed step timings. `profile_warmup_steps` and
+`profile_active_steps` enable per-rank Chrome traces; tracing itself adds overhead.
+Neither these records nor tiny-model tests establish pretrained quality.

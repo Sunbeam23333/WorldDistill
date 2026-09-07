@@ -4,6 +4,9 @@ This document records the repository-to-README audit performed for the 0.2.0
 release candidate. It distinguishes fixed execution contracts from claims that
 still need hardware or model evidence.
 
+The subsequent [operator/training audit](operator-training-audit.md) supersedes
+the older implementation boundaries below where explicitly stated.
+
 ## Release-blocking contracts fixed
 
 | Area | Prior failure | Current behavior | Evidence |
@@ -33,8 +36,8 @@ still need hardware or model evidence.
   and audio-video families currently belong primarily to inference.
 - CUDA-stream overlap is an implemented event dependency, but no profiler trace
   or throughput claim is published yet.
-- Asynchronous prefetch and heterogeneous placement remain plans/metadata, not a
-  background transfer executor.
+- Bounded asynchronous CPU cache prefetch is now implemented; heterogeneous
+  teacher-parameter placement still has no transfer executor.
 - Adversarial and DMD-style trainers remain research scaffolds until objective
   parity and real-model results are established.
 - No WorldDistill speedup, memory, or quality number is presented without a

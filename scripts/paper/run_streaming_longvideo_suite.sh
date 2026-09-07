@@ -38,15 +38,19 @@ run_train_phase() {
 }
 
 run_infer_phase() {
+    if [[ "${INFER_NUM_GPUS}" != "1" ]]; then
+        echo "ERROR: the exported-student Diffusers sampler currently supports INFER_NUM_GPUS=1 only." >&2
+        exit 1
+    fi
     mkdir -p "${OUTPUT_ROOT}/samples"
+    run_cmd python3 "${PROJECT_ROOT}/tools/export_student.py" \
+        --base_model "${TEACHER_MODEL}" --checkpoint "${OUTPUT_ROOT}/train" \
+        --output_dir "${OUTPUT_ROOT}/student_export"
     print_header "Streaming long-video inference"
-    run_cmd bash "${PROJECT_ROOT}/scripts/run_infer.sh" \
-        --model_cls wan2.1_sf \
-        --task t2v \
-        --model_path "${MODEL_ROOT:-${PROJECT_ROOT}/models}" \
-        --config_json "${PROJECT_ROOT}/inference/configs/self_forcing/wan_t2v_sf.json" \
+    run_cmd python3 "${PROJECT_ROOT}/tools/sample_student.py" \
+        --bundle "${OUTPUT_ROOT}/student_export" \
+        --num_frames 129 \
         --prompt "${LONG_PROMPT}" \
-        --gpus "${INFER_NUM_GPUS}" \
         --save_path "${OUTPUT_ROOT}/samples/streaming.mp4"
 }
 
