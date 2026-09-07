@@ -9,6 +9,7 @@ SageAttention, or project-specific CUDA extensions.
 
 import importlib
 import re
+from copy import deepcopy
 from dataclasses import asdict, dataclass
 from typing import Any, Iterable, MutableMapping
 
@@ -42,26 +43,59 @@ class CudaDeviceProfile:
     supports_fp8: bool
     supports_fp4: bool
     attention_preference: tuple[str, ...]
+    supports_fp16: bool = True
+    known_architecture: bool = True
+    maximum_cuda_major: int | None = None
+    installation_note: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
 
 
 def profile_cuda_device(name: str, capability: Capability) -> CudaDeviceProfile:
+    capability = tuple(capability)
     major, minor = capability
     normalized_name = str(name or "Unknown NVIDIA GPU")
 
-    if (major, minor) == (8, 0):
+    legacy = {
+        (5, 0): ("maxwell", "6.5"), (5, 2): ("maxwell", "6.5"),
+        (5, 3): ("maxwell-jetson", "7.0"),
+        (6, 0): ("pascal", "8.0"), (6, 1): ("pascal", "8.0"),
+        (6, 2): ("pascal-jetson", "8.0"),
+        (7, 0): ("volta", "9.0"), (7, 2): ("volta-jetson", "9.0"),
+        (7, 5): ("turing", "10.0"),
+    }
+    if capability in legacy:
+        architecture, minimum = legacy[capability]
+        return CudaDeviceProfile(
+            name=normalized_name, capability=capability, architecture=architecture,
+            minimum_cuda=minimum, supports_bf16=False, supports_tf32=False,
+            supports_fp8=False, supports_fp4=False, attention_preference=("torch_sdpa",),
+            supports_fp16=capability >= (5, 3),
+            maximum_cuda_major=12 if capability < (7, 5) else None,
+            installation_note=(
+                "Legacy CUDA <=12.x libraries/build required; PyTorch 2.11 cu128+ "
+                "wheels exclude pre-Turing. Check a compatible legacy wheel and its "
+                "cuDNN/architecture list; Jetson also requires its JetPack-specific build."
+                if capability < (7, 5) else
+                "Use Torch SDPA (math fallback allowed); FA2 and native BF16/TF32 are not enabled."
+            ),
+        )
+    if capability in {(8, 0), (8, 6), (8, 7)}:
         return CudaDeviceProfile(
             name=normalized_name,
             capability=capability,
-            architecture="ampere",
-            minimum_cuda="11.0",
+            architecture="ampere-jetson" if minor == 7 else "ampere",
+            minimum_cuda={(8, 0): "11.0", (8, 6): "11.1", (8, 7): "11.4"}[capability],
             supports_bf16=True,
             supports_tf32=True,
             supports_fp8=False,
             supports_fp4=False,
-            attention_preference=("flash_attn2", "sage_attn2", "torch_sdpa"),
+            attention_preference=(("torch_sdpa",) if minor == 7 else
+                                  ("flash_attn2", "sage_attn2", "torch_sdpa")),
+            installation_note=("Jetson Orin requires a matching JetPack/aarch64 PyTorch build; "
+                               "optional kernels are not enabled by the desktop Ampere policy."
+                               if minor == 7 else ""),
         )
     if (major, minor) == (8, 9):
         return CudaDeviceProfile(
@@ -118,12 +152,22 @@ def profile_cuda_device(name: str, capability: Capability) -> CudaDeviceProfile:
             # until an architecture-specific backend has a real device probe.
             attention_preference=("torch_sdpa",),
         )
+    if capability == (11, 0):
+        # CUDA 13 renamed Thor's former sm_101 target to sm_110. Do not map
+        # arbitrary SM101 devices or authorize desktop Blackwell extensions.
+        return CudaDeviceProfile(
+            name=normalized_name, capability=capability, architecture="blackwell-jetson",
+            minimum_cuda="13.0", supports_bf16=True, supports_tf32=True,
+            supports_fp8=True, supports_fp4=True, attention_preference=("torch_sdpa",),
+            installation_note="Thor SM110 requires the CUDA 13 / JetPack 7 platform stack; "
+                              "the former SM101 name and optional kernels are not auto-qualified.",
+        )
     if (major, minor) in {(12, 0), (12, 1)}:
         return CudaDeviceProfile(
             name=normalized_name,
             capability=capability,
             architecture="blackwell",
-            minimum_cuda="12.8",
+            minimum_cuda="12.9" if minor == 1 else "12.8",
             supports_bf16=True,
             supports_tf32=True,
             supports_fp8=True,
@@ -150,6 +194,10 @@ def profile_cuda_device(name: str, capability: Capability) -> CudaDeviceProfile:
         supports_fp8=False,
         supports_fp4=False,
         attention_preference=("torch_sdpa",),
+        supports_fp16=False,
+        known_architecture=False,
+        installation_note="Unverified architecture: only a conservative FP32/SDPA smoke is attempted; "
+                          "no hardware support or optional-kernel qualification is implied.",
     )
 
 
@@ -251,7 +299,7 @@ def probe_flash_attention4(torch_module: Any, profile: CudaDeviceProfile) -> dic
     """
     cuda = torch_module.cuda
     fn = import_attention_callable("flash_attn4")
-    if not cuda.is_available() or not callable(fn) or profile.capability not in {(9, 0), (10, 0), (10, 3)}:
+    if not cuda.is_available() or not getattr(torch_module.version, "cuda", None) or not callable(fn) or profile.capability not in {(9, 0), (10, 0), (10, 3)}:
         return {"passed": False, "reason": "FA4 requires a supported CUDA device and callable"}
     index = cuda.current_device()
     key = (str(torch_module.__version__), str(torch_module.version.cuda), index, profile.capability, id(fn))
@@ -340,7 +388,7 @@ def resolve_attention_config(
         torch_module = importlib.import_module("torch")
     if profile is None:
         cuda = torch_module.cuda
-        if cuda.is_available():
+        if cuda.is_available() and getattr(getattr(torch_module, "version", None), "cuda", None):
             device_index = cuda.current_device() if hasattr(cuda, "current_device") else 0
             profile = profile_cuda_device(
                 cuda.get_device_name(device_index),
@@ -357,6 +405,8 @@ def resolve_attention_config(
                 supports_fp8=False,
                 supports_fp4=False,
                 attention_preference=("torch_sdpa",),
+                supports_fp16=False,
+                known_architecture=False,
             )
 
     available = set(available_backends) if available_backends is not None else detect_attention_backends(torch_module)
@@ -427,6 +477,13 @@ def minimum_cuda_issue(profile: CudaDeviceProfile, cuda_version: str | None) -> 
             f"{profile.name} requires CUDA >= {profile.minimum_cuda} for native "
             f"{profile.architecture} support; PyTorch reports CUDA {cuda_version}."
         )
+    if profile.maximum_cuda_major is not None and current[0] > profile.maximum_cuda_major:
+        return (
+            f"{profile.name} ({profile.architecture}) requires a legacy CUDA <= "
+            f"{profile.maximum_cuda_major}.x build; CUDA 13 removed pre-Turing "
+            "offline compilation and library support. Use a compatible legacy "
+            "PyTorch/CUDA/cuDNN package, not just a newer NVIDIA driver."
+        )
     return None
 
 
@@ -434,15 +491,19 @@ def inspect_torch_cuda(torch_module: Any) -> dict[str, Any]:
     """Return a JSON-serializable report without importing optional kernels."""
     cuda = torch_module.cuda
     report: dict[str, Any] = {
-        "cuda_available": bool(cuda.is_available()),
+        "cuda_available": bool(cuda.is_available() and getattr(getattr(torch_module, "version", None), "cuda", None)),
         "torch_version": str(getattr(torch_module, "__version__", "unknown")),
         "cuda_runtime": getattr(getattr(torch_module, "version", None), "cuda", None),
         "compiled_arches": list(cuda.get_arch_list()) if hasattr(cuda, "get_arch_list") else [],
         "devices": [],
         "issues": [],
+        "warnings": [],
+        "native_arch_issues": [],
+        "qualified": False,
+        "scope": "metadata-only; no CUDA kernel execution",
     }
     if not report["cuda_available"]:
-        report["issues"].append("CUDA is not available in this PyTorch runtime.")
+        report["issues"].append("NVIDIA CUDA is not available in this PyTorch runtime (CPU/ROCm is not CUDA qualification).")
         return report
 
     for index in range(cuda.device_count()):
@@ -454,13 +515,190 @@ def inspect_torch_cuda(torch_module: Any) -> dict[str, Any]:
         compiled_arches = set(report["compiled_arches"])
         device["native_arch"] = native_arch
         device["native_arch_compiled"] = native_arch in compiled_arches if compiled_arches else None
+        device["qualified"] = False
+        device["compatibility_evidence"] = "metadata-only"
         report["devices"].append(device)
         if issue is not None:
             report["issues"].append(issue)
         if compiled_arches and native_arch not in compiled_arches:
-            report["issues"].append(
+            report["native_arch_issues"].append(
                 f"PyTorch does not list a native {native_arch} target for {profile.name}; "
-                "a PTX JIT path may exist, but it is not native-architecture validation."
+                "compatible cubin or PTX JIT may still run. Use a kernel probe; "
+                "missing native SASS alone is not proof of runtime failure."
             )
+        if not profile.known_architecture:
+            report["warnings"].append(f"{profile.name}: {profile.installation_note}")
+        elif profile.installation_note:
+            report["warnings"].append(f"{profile.name}: {profile.installation_note}")
 
+    return report
+
+
+def policy_supported_precisions(profile: CudaDeviceProfile) -> tuple[str, ...]:
+    """Candidates only; neither a dtype object nor BF16 emulation proves native support."""
+    candidates = ["no"]
+    if profile.supports_fp16:
+        candidates.append("fp16")
+    if profile.supports_bf16:
+        candidates.append("bf16")
+    return tuple(candidates)
+
+
+def select_mixed_precision(requested: str, supported_precisions: Iterable[str]) -> str:
+    """Choose from observed support. Explicit requests never silently downgrade."""
+    if requested not in {"auto", "no", "fp16", "bf16"}:
+        raise ValueError(f"Unknown mixed precision {requested!r}; use auto, no, fp16, or bf16")
+    supported = set(supported_precisions).intersection({"no", "fp16", "bf16"})
+    if requested != "auto":
+        if requested not in supported:
+            raise RuntimeError(f"Explicit mixed precision {requested!r} did not pass on every device; "
+                               f"common supported precisions: {sorted(supported)}. No automatic downgrade was made.")
+        return requested
+    for candidate in ("bf16", "fp16", "no"):
+        if candidate in supported:
+            return candidate
+    raise RuntimeError("No common runnable precision was observed. Check each rank's CUDA precision probe report.")
+
+
+def common_supported_precisions(reports: Iterable[dict[str, Any]]) -> tuple[str, ...]:
+    """Intersect live per-rank reports before constructing models/collectives.
+
+    Gathering reports is the distributed caller's responsibility. This helper
+    performs no collectives and is not a signed hardware-attestation mechanism.
+    """
+    reports = list(reports)
+    if not reports:
+        return ()
+    supported = {"no", "fp16", "bf16"}
+    for report in reports:
+        if report.get("status") in {"unavailable", "failed"}:
+            return ()
+        supported.intersection_update(report.get("supported_precisions", ()))
+    return tuple(p for p in ("no", "fp16", "bf16") if p in supported)
+
+
+def validate_tf32_request(enabled: bool, reports_or_single) -> bool:
+    """Validate an explicit TF32 toggle without mutating Torch global settings."""
+    if not enabled:
+        return False
+    reports = [reports_or_single] if isinstance(reports_or_single, dict) else list(reports_or_single)
+    if not reports or any(not report.get("tf32_available", False) or
+                          report.get("status") in {"failed", "unavailable"} for report in reports):
+        raise RuntimeError("TF32 was explicitly enabled, but is not available on every actual device. "
+                           "Volta/Turing, CPU, unverified devices, and failed CUDA probes cannot enable TF32.")
+    return True
+
+
+_PRECISION_PROBE_RESULTS: dict[tuple, dict[str, Any]] = {}
+
+
+def _run_precision_case(torch_module: Any, device, precision: str) -> dict[str, Any]:
+    """Small real-device GEMM + math-SDPA fwd/bwd, independent of global RNG.
+
+    CPU FP32 references avoid accidentally using the same CUDA kernel as the
+    oracle. Math SDPA deliberately remains usable on Volta/Turing. This does
+    not attest to fused attention, convolution, AMP scaling or a whole model.
+    """
+    torch = torch_module
+    dtype = {"no": torch.float32, "fp16": torch.float16, "bf16": torch.bfloat16}[precision]
+    generator = torch.Generator(device="cpu").manual_seed(7321)
+    tolerance = {"no": 0.005, "fp16": 0.015, "bf16": 0.06}[precision]
+    errors = {}
+
+    def check(name, actual, reference):
+        actual = actual.detach().float().cpu()
+        reference = reference.detach().float().cpu()
+        if not bool(torch.isfinite(actual).all()) or not bool(torch.isfinite(reference).all()):
+            raise RuntimeError(f"{name} contains non-finite values")
+        error = float(torch.linalg.vector_norm(actual - reference) /
+                      torch.linalg.vector_norm(reference).clamp_min(1e-7))
+        errors[name] = error
+        if error > tolerance:
+            raise RuntimeError(f"{name} relative L2 {error:.6g} exceeds {tolerance}")
+
+    # Quantize the reference inputs identically, without requiring low-precision
+    # CPU matmul support. Local generators preserve the training seed/state.
+    with torch.inference_mode(False), torch.enable_grad(), \
+            torch.autocast(device_type="cuda", enabled=False), torch.autocast(device_type="cpu", enabled=False):
+        for operation, shapes in (("gemm", ((31, 32), (32, 23))),
+                                  ("sdpa", ((2, 2, 16, 32),) * 3)):
+            source = [torch.randn(shape, generator=generator).to(dtype).float() for shape in shapes]
+            reference_inputs = [x.detach().requires_grad_() for x in source]
+            device_inputs = [x.to(device=device, dtype=dtype).detach().requires_grad_() for x in source]
+            if operation == "gemm":
+                reference = reference_inputs[0] @ reference_inputs[1]
+                actual = device_inputs[0] @ device_inputs[1]
+            else:
+                # Force the portable math implementation, not an optimized
+                # kernel that happens to be selected on the current GPU.
+                from torch.nn.attention import SDPBackend, sdpa_kernel
+                with sdpa_kernel(SDPBackend.MATH):
+                    reference = torch.nn.functional.scaled_dot_product_attention(*reference_inputs, is_causal=True)
+                    actual = torch.nn.functional.scaled_dot_product_attention(*device_inputs, is_causal=True)
+            upstream = torch.randn(reference.shape, generator=generator).to(dtype).float()
+            if actual.dtype != dtype:
+                raise RuntimeError(f"{operation} returned {actual.dtype}, but {dtype} was requested")
+            reference_grads = torch.autograd.grad(reference, reference_inputs, upstream)
+            actual_grads = torch.autograd.grad(actual, device_inputs, upstream.to(device=device, dtype=dtype))
+            torch.cuda.synchronize(device)
+            check(f"{operation}_forward", actual, reference)
+            for index, (actual_grad, expected_grad) in enumerate(zip(actual_grads, reference_grads)):
+                check(f"{operation}_backward_{index}", actual_grad, expected_grad)
+    return {"status": "passed", "relative_l2": errors, "relative_l2_limit": tolerance}
+
+
+def probe_cuda_precision(torch_module: Any, device=None) -> dict[str, Any]:
+    """Memoized exact-device precision smoke, not full GPU/model qualification.
+
+    Missing native SASS is only metadata: compatible cubin/PTX execution can
+    pass. Missing binary/library support, invalid numerics or launch failures
+    cannot. A CPU/ROCm host never runs the probe and never reports a pass.
+    """
+    torch = torch_module
+    cuda = torch.cuda
+    runtime = getattr(getattr(torch, "version", None), "cuda", None)
+    report = {"status": "unavailable", "qualified": False,
+              "scope": "small GEMM + math SDPA forward/backward precision smoke; not full-model/optional-kernel qualification",
+              "torch_version": str(getattr(torch, "__version__", "unknown")),
+              "cuda_runtime": runtime, "supported_precisions": [], "tf32_available": False, "cases": {}}
+    if not runtime or not cuda.is_available():
+        report["reason"] = "An available NVIDIA CUDA runtime is required; CPU/ROCm is not GPU validation."
+        return report
+    resolved = torch.device("cuda", device) if isinstance(device, int) else torch.device(device or "cuda")
+    if resolved.type != "cuda":
+        report["reason"] = f"Requested device {resolved} is not NVIDIA CUDA."
+        return report
+    index = resolved.index if resolved.index is not None else cuda.current_device()
+    resolved = torch.device("cuda", index)
+    try:
+        with cuda.device(index):
+            profile = profile_cuda_device(cuda.get_device_name(index), tuple(cuda.get_device_capability(index)))
+            arches = tuple(cuda.get_arch_list())
+            key = (str(torch.__version__), str(runtime), index, profile.name, profile.capability, arches)
+            if key in _PRECISION_PROBE_RESULTS:
+                return deepcopy(_PRECISION_PROBE_RESULTS[key])
+            report.update(device_index=index, profile=profile.to_dict(), compiled_arches=list(arches),
+                          policy_precisions=list(policy_supported_precisions(profile)))
+            issue = minimum_cuda_issue(profile, runtime)
+            if issue:
+                report.update(status="failed", reason=issue)
+            else:
+                for precision in report["policy_precisions"]:
+                    try:
+                        result = _run_precision_case(torch, resolved, precision)
+                        report["cases"][precision] = result
+                        if result["status"] == "passed":
+                            report["supported_precisions"].append(precision)
+                    except (RuntimeError, ValueError, TypeError, AttributeError, ImportError, OSError) as exc:
+                        report["cases"][precision] = {"status": "failed", "reason": f"{type(exc).__name__}: {exc}"}
+                report["tf32_available"] = profile.supports_tf32 and "no" in report["supported_precisions"]
+                report["tf32_evidence"] = "known actual-device capability + FP32 launch; TF32 kernel use/performance not measured"
+                all_passed = len(report["supported_precisions"]) == len(report["policy_precisions"])
+                report["qualified"] = all_passed and profile.known_architecture
+                report["status"] = ("passed" if report["qualified"] else
+                                    "unverified" if all_passed else
+                                    "partial" if report["supported_precisions"] else "failed")
+            _PRECISION_PROBE_RESULTS[key] = deepcopy(report)
+    except (RuntimeError, ValueError, TypeError, AttributeError, ImportError, OSError) as exc:
+        report.update(status="failed", reason=f"{type(exc).__name__}: {exc}")
     return report

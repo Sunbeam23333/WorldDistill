@@ -31,7 +31,26 @@ EVAL_EVERY=""
 EVAL_BATCHES=""
 OUTPUT_DIR="${RESULT_ROOT:-${PROJECT_ROOT}/results/training}"
 CONFIG=""
-NUM_GPUS=8
+NUM_GPUS="${NPROC_PER_NODE:-8}"
+NNODES_DECLARED=0
+NODE_RANK_DECLARED=0
+if [[ -n "${NNODES+x}" ]]; then NNODES_DECLARED=1; fi
+if [[ -n "${NODE_RANK:-}" ]]; then NODE_RANK_DECLARED=1; fi
+NNODES="${NNODES:-1}"
+NODE_RANK="${NODE_RANK:-}"
+LAUNCHER="manual"
+RDZV_BACKEND="static"
+RDZV_ENDPOINT="${RDZV_ENDPOINT:-}"
+RDZV_ID="${RDZV_ID:-}"
+LOCAL_ADDR="${LOCAL_ADDR:-}"
+RDZV_TIMEOUT=600
+DIST_TIMEOUT=600
+DIST_BACKEND="auto"
+MAX_RESTARTS=0
+DRY_RUN=0
+MIXED_PRECISION="auto"
+REQUIRED_TRANSFORMERS_VERSION="4.57.1"
+RESUME_FROM=""
 NUM_STEPS=4
 BATCH_SIZE=1
 LR=1e-5
@@ -114,7 +133,22 @@ while [[ $# -gt 0 ]]; do
         --eval_batches) EVAL_BATCHES="$2"; shift 2 ;;
         --output_dir) OUTPUT_DIR="$2"; shift 2 ;;
         --config) CONFIG="$2"; shift 2 ;;
-        --gpus) NUM_GPUS="$2"; shift 2 ;;
+        --gpus|--nproc_per_node|--nproc-per-node) NUM_GPUS="$2"; shift 2 ;;
+        --nnodes) NNODES="$2"; NNODES_DECLARED=1; shift 2 ;;
+        --node_rank|--node-rank) NODE_RANK="$2"; NODE_RANK_DECLARED=1; shift 2 ;;
+        --launcher) LAUNCHER="$2"; shift 2 ;;
+        --rdzv_backend|--rdzv-backend) RDZV_BACKEND="$2"; shift 2 ;;
+        --rdzv_endpoint|--rdzv-endpoint) RDZV_ENDPOINT="$2"; shift 2 ;;
+        --rdzv_id|--rdzv-id) RDZV_ID="$2"; shift 2 ;;
+        --local_addr|--local-addr) LOCAL_ADDR="$2"; shift 2 ;;
+        --rdzv_timeout) RDZV_TIMEOUT="$2"; shift 2 ;;
+        --dist_timeout) DIST_TIMEOUT="$2"; shift 2 ;;
+        --dist_backend) DIST_BACKEND="$2"; shift 2 ;;
+        --max_restarts|--max-restarts) MAX_RESTARTS="$2"; shift 2 ;;
+        --dry_run|--dry-run) DRY_RUN=1; shift ;;
+        --mixed_precision) MIXED_PRECISION="$2"; shift 2 ;;
+        --required_transformers_version) REQUIRED_TRANSFORMERS_VERSION="$2"; shift 2 ;;
+        --resume_from) RESUME_FROM="$2"; shift 2 ;;
         --steps) NUM_STEPS="$2"; shift 2 ;;
         --batch_size) BATCH_SIZE="$2"; shift 2 ;;
         --lr) LR="$2"; shift 2 ;;
@@ -175,7 +209,22 @@ while [[ $# -gt 0 ]]; do
             echo "  --eval_batches        Validation batches per eval (optional)"
             echo "  --output_dir          Output directory for checkpoints and logs"
             echo "  --config              Path to distill preset config"
-            echo "  --gpus                Number of GPUs (default: 8)"
+            echo "  --gpus/--nproc_per_node Workers per node, identical on every node (default: 8)"
+            echo "  --nnodes              Fixed node count; elastic MIN:MAX is unsupported (default: 1)"
+            echo "  --node_rank           Node index, required for manual multi-node launch"
+            echo "  --launcher            manual | slurm (one torchrun agent per Slurm node)"
+            echo "  --rdzv_backend        static | c10d (default: static)"
+            echo "  --rdzv_endpoint       Rendezvous host:port; required for multi-node"
+            echo "  --rdzv_id             Shared, unique job ID; required for multi-node"
+            echo "  --local_addr          This node's reachable advertised host/IP (optional; c10d otherwise uses hostname)"
+            echo "  --rdzv_timeout        Rendezvous timeout seconds (default: 600)"
+            echo "  --dist_timeout        Process-group/collective timeout seconds (default: 600)"
+            echo "  --dist_backend        auto | nccl | gloo; Gloo is CPU-only validation"
+            echo "  --max_restarts        Fixed-size torchrun worker retries (default: 0)"
+            echo "  --resume_from         Explicit checkpoint used on start/restart; no automatic discovery"
+            echo "  --mixed_precision     auto | bf16 | fp16 | no (default: auto)"
+            echo "  --required_transformers_version Version used by preflight AND training (default: 4.57.1)"
+            echo "  --dry_run             Validate and print launch command without importing models or torch"
             echo "  --steps               Target inference steps (default: 4)"
             echo "  --batch_size          Batch size per GPU (default: 1)"
             echo "  --lr                  Learning rate (default: 1e-5)"
@@ -183,6 +232,7 @@ while [[ $# -gt 0 ]]; do
             echo "  --save_every          Save checkpoint every N steps (default: 1000)"
             echo "  --parallel            Parallel mode: ddp | fsdp | deepspeed (default: ddp)"
             echo "  --sp_size             Adapter-gated sequence parallel size (default: 1)"
+            echo "                        No generic TP/PP or stock-model SP implementation; uneven local workers are unsupported."
             echo "  --ds_stage            DeepSpeed ZeRO stage: 1 | 2 | 3 (default: 2)"
             echo "  --fsdp_strategy       FSDP strategy: full | hybrid (default: full)"
             echo "  --report_to           console,tensorboard,wandb,all,none (default: console)"
@@ -212,6 +262,56 @@ while [[ $# -gt 0 ]]; do
         *) echo "Unknown option: $1"; exit 1 ;;
     esac
 done
+
+fail_launch() { echo "ERROR: $*" >&2; exit 1; }
+[[ -z "${RANK+x}" ]] || fail_launch "run_train.sh launches torchrun; do not invoke it inside an existing torchrun worker."
+case "${LAUNCHER}" in
+    manual) ;;
+    slurm)
+        [[ -n "${SLURM_NNODES:-}" && -n "${SLURM_PROCID:-}" && -n "${SLURM_LOCALID:-}" ]] || \
+            fail_launch "--launcher slurm requires srun with exactly one agent task per node."
+        [[ "${SLURM_LOCALID}" = "0" && "${SLURM_NTASKS:-}" = "${SLURM_NNODES}" ]] || \
+            fail_launch "Use srun --ntasks-per-node=1, not one srun task per GPU."
+        if [[ "${NNODES_DECLARED}" = "1" && "${NNODES}" != "${SLURM_NNODES}" ]]; then
+            fail_launch "--nnodes/NNODES conflicts with SLURM_NNODES."
+        fi
+        if [[ "${NODE_RANK_DECLARED}" = "1" && "${NODE_RANK}" != "${SLURM_PROCID}" ]]; then
+            fail_launch "--node_rank/NODE_RANK conflicts with SLURM_PROCID."
+        fi
+        [[ -z "${SLURM_NODEID:-}" || "${SLURM_NODEID}" = "${SLURM_PROCID}" ]] || \
+            fail_launch "Slurm task/node ranks disagree with one-agent-per-node placement."
+        NNODES="${SLURM_NNODES}"
+        NODE_RANK="${SLURM_PROCID}"
+        RDZV_ID="${RDZV_ID:-${SLURM_JOB_ID:-}}"
+        ;;
+    *) fail_launch "--launcher must be manual or slurm" ;;
+esac
+for value in "${NNODES}" "${NUM_GPUS}" "${RDZV_TIMEOUT}" "${DIST_TIMEOUT}"; do
+    [[ "${value}" =~ ^[1-9][0-9]*$ ]] || fail_launch "Node/worker counts and timeouts must be positive integers; elastic MIN:MAX is unsupported."
+done
+[[ "${MAX_RESTARTS}" =~ ^(0|[1-9][0-9]*)$ ]] || fail_launch "--max_restarts must be a non-negative integer."
+if [[ -z "${NODE_RANK}" ]]; then
+    [[ "${NNODES}" = "1" ]] || fail_launch "--node_rank is required for manual multi-node launch."
+    NODE_RANK=0
+fi
+[[ "${NODE_RANK}" =~ ^(0|[1-9][0-9]*)$ ]] || fail_launch "--node_rank must be a non-negative integer."
+(( NODE_RANK < NNODES )) || fail_launch "--node_rank must be smaller than --nnodes."
+case "${RDZV_BACKEND}" in static|c10d) ;; *) fail_launch "--rdzv_backend must be static or c10d." ;; esac
+case "${DIST_BACKEND}" in auto|nccl|gloo) ;; *) fail_launch "--dist_backend must be auto, nccl or gloo." ;; esac
+case "${PARALLEL_MODE}" in ddp|fsdp|deepspeed) ;; *) fail_launch "--parallel must be ddp, fsdp or deepspeed; generic TP/PP is not implemented." ;; esac
+[[ "${SP_SIZE}" =~ ^[1-9][0-9]*$ ]] || fail_launch "--sp_size must be a positive integer; model-specific SP support is still required."
+case "${MIXED_PRECISION}" in auto|bf16|fp16|no) ;; *) fail_launch "Invalid --mixed_precision." ;; esac
+if (( NNODES > 1 )); then
+    [[ -n "${RDZV_ENDPOINT}" && -n "${RDZV_ID}" ]] || fail_launch "Multi-node launch needs shared --rdzv_endpoint and --rdzv_id on every node."
+fi
+if [[ -n "${RDZV_ENDPOINT}" ]]; then
+    [[ "${RDZV_ENDPOINT}" =~ ^[^[:space:]]+:[0-9]+$ ]] || fail_launch "--rdzv_endpoint must be host:port."
+    rendezvous_port="${RDZV_ENDPOINT##*:}"
+    (( 10#${rendezvous_port} > 0 && 10#${rendezvous_port} <= 65535 )) || fail_launch "Rendezvous port must be 1..65535."
+fi
+if [[ "${FSDP_STRATEGY}" = "hybrid" && "${PARALLEL_MODE}" = "fsdp" ]]; then
+    (( NNODES >= 2 && NUM_GPUS >= 2 )) || fail_launch "Hybrid FSDP needs >=2 nodes and >=2 workers per node; use full otherwise."
+fi
 
 if [ -z "${TEACHER_MODEL}" ]; then
     echo "ERROR: --teacher_model is required"
@@ -248,11 +348,13 @@ if [ "${METHOD}" = "step_distill" ] && [ "${PARALLEL_MODE}" != "ddp" ]; then
     echo ">>> Disabling dual-student routing for ${PARALLEL_MODE}; serial/DDP is required for dual mode."
 fi
 
-export CUDA_VISIBLE_DEVICES=$(seq -s, 0 $((NUM_GPUS-1)))
-mkdir -p "${OUTPUT_DIR}"
-
-echo ">>> Checking dependency compatibility..."
-python3 -m training.env_compat --mode train
+# CUDA_VISIBLE_DEVICES (including UUID/MIG masks and an intentionally empty
+# CPU mask) belongs to the scheduler/user. LOCAL_RANK indexes this visible set.
+export WORLD_DISTILL_DIST_BACKEND="${DIST_BACKEND}"
+export WORLD_DISTILL_DIST_TIMEOUT="${DIST_TIMEOUT}"
+export WORLD_DISTILL_EXPECTED_WORLD_SIZE="$((NNODES * NUM_GPUS))"
+export WORLD_DISTILL_EXPECTED_LOCAL_WORLD_SIZE="${NUM_GPUS}"
+export WORLD_DISTILL_FIXED_WORLD_SIZE=1
 
 echo "============================================"
 echo "WorldDistill Training"
@@ -261,7 +363,9 @@ echo "  Model CLS:   ${MODEL_CLS}"
 echo "  Teacher:     ${TEACHER_MODEL}"
 echo "  Student:     ${STUDENT_MODEL:-'(init from teacher)'}"
 echo "  Steps:       ${NUM_STEPS}"
-echo "  GPUs:        ${NUM_GPUS}"
+echo "  Topology:    ${NNODES} nodes x ${NUM_GPUS} workers; node rank ${NODE_RANK}"
+echo "  GPU mask:    ${CUDA_VISIBLE_DEVICES-'<inherited unrestricted visibility>'}"
+echo "  Backend:     ${DIST_BACKEND}"
 echo "  LR:          ${LR}"
 echo "  Parallel:    ${PARALLEL_MODE}"
 echo "  Report To:   ${REPORT_TO}"
@@ -283,9 +387,28 @@ fi
 echo "  Config:      ${CONFIG}"
 echo "============================================"
 
-train_cmd=(
-    torchrun
+launch_cmd=(torchrun
+    "--nnodes=${NNODES}"
     "--nproc_per_node=${NUM_GPUS}"
+    "--node_rank=${NODE_RANK}"
+    "--max_restarts=${MAX_RESTARTS}"
+)
+if [[ -n "${LOCAL_ADDR}" ]]; then
+    launch_cmd+=("--local_addr=${LOCAL_ADDR}")
+fi
+if [[ -z "${RDZV_ENDPOINT}" && "${NNODES}" = "1" ]]; then
+    # Separate local jobs get separate ephemeral rendezvous endpoints.
+    launch_cmd+=(--standalone)
+else
+    launch_cmd+=("--rdzv_backend=${RDZV_BACKEND}" "--rdzv_endpoint=${RDZV_ENDPOINT}" "--rdzv_id=${RDZV_ID:-worlddistill}")
+fi
+if [[ "${RDZV_BACKEND}" = "static" && -n "${RDZV_ENDPOINT}" ]]; then
+    launch_cmd+=("--rdzv_conf=timeout=${RDZV_TIMEOUT}")
+else
+    launch_cmd+=("--rdzv_conf=join_timeout=${RDZV_TIMEOUT},read_timeout=${RDZV_TIMEOUT}")
+fi
+train_cmd=(
+    "${launch_cmd[@]}"
     -m training.train_distill
     --distill_method "${METHOD}"
     --teacher_model_path "${TEACHER_MODEL}"
@@ -312,7 +435,13 @@ train_cmd=(
     --torch_compile_mode "${TORCH_COMPILE_MODE}"
     --torch_compile_backend "${TORCH_COMPILE_BACKEND}"
     --config "${CONFIG}"
+    --mixed_precision "${MIXED_PRECISION}"
+    --required_transformers_version "${REQUIRED_TRANSFORMERS_VERSION}"
 )
+
+if [ -n "${RESUME_FROM}" ]; then
+    train_cmd+=(--resume_from "${RESUME_FROM}")
+fi
 
 if [ -n "${STUDENT_MODEL}" ]; then
     train_cmd+=(--student_model_path "${STUDENT_MODEL}")
@@ -369,6 +498,18 @@ if [ -n "${TORCH_COMPILE_DYNAMIC}" ]; then
     train_cmd+=("${TORCH_COMPILE_DYNAMIC}")
 fi
 
+if [[ "${DRY_RUN}" = "1" ]]; then
+    printf 'WORLD_DISTILL_DIST_BACKEND=%q WORLD_DISTILL_DIST_TIMEOUT=%q WORLD_DISTILL_EXPECTED_WORLD_SIZE=%q WORLD_DISTILL_EXPECTED_LOCAL_WORLD_SIZE=%q WORLD_DISTILL_FIXED_WORLD_SIZE=1 ' \
+        "${DIST_BACKEND}" "${DIST_TIMEOUT}" "${WORLD_DISTILL_EXPECTED_WORLD_SIZE}" "${NUM_GPUS}"
+    printf '%q ' "${train_cmd[@]}"
+    printf '\n'
+    exit 0
+fi
+mkdir -p "${OUTPUT_DIR}"
+cd "${PROJECT_ROOT}"
+echo ">>> Checking dependency and local device compatibility..."
+python3 -m training.env_compat --mode train --required_transformers_version "${REQUIRED_TRANSFORMERS_VERSION}" \
+    --dist_backend "${DIST_BACKEND}" --nproc_per_node "${NUM_GPUS}"
 "${train_cmd[@]}"
 
 echo ""

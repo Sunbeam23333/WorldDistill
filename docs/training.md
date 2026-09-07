@@ -118,6 +118,12 @@ silent mathematical error, not valid sequence parallelism.
 
 ## Distributed checkpoints
 
+Use the [multi-node guide](distributed-launch.md) for manual, Slurm or
+containerized launch. `--mixed_precision auto` runs real per-device precision
+probes, intersects their supported modes across ranks and applies method/scaler
+constraints before model loading. Explicit unsupported precision/TF32 requests
+fail. Small probe success is not full-model or optional-kernel certification.
+
 DeepSpeed and FSDP initialization now precede resume. All ranks participate in
 collective saves; DeepSpeed stores client step/epoch state and FSDP gathers model
 plus optimizer state on rank zero. These paths still require the multi-rank GPU
@@ -135,6 +141,90 @@ Multi-rank FSDP and DeepSpeed receive CPU-staged student parameters. The loader
 does not first create a full FP32 student on every GPU. Teachers remain
 replicated; this is not an out-of-core teacher or fully sharded file reader.
 GPU initialization peaks and FSDP/ZeRO restarts still require hardware runs.
+
+Native noise-routed experts are collective leaves: FSDP must not split their
+conditionally executed descendants, and ZeRO-3 registers the routed group with
+DeepSpeed's leaf-module API. Otherwise ranks choosing different experts can
+enter different all-gather sequences. A leaf gathers **all of its experts** as
+one unit; budget that peak in addition to the replicated teacher. This protection
+is not a claim that an A14B workload fits an A100 or that GPU routing is qualified.
+
+DeepSpeed mixed precision uses its supported Torch AMP path (0.19.6+), with the
+engine owning backward/loss scaling. The outer AMP context also covers the
+frozen teacher and consistency target. Native low-precision conversion is not
+combined with outer AMP: newer DeepSpeed disables that outer context inside the
+student engine, which would otherwise leave FP32 keyword latents incompatible
+with converted weights. Base and consistency EMA shadows follow CPU-staged
+students onto the execution device. CPU optimizer offload uses CPUAdam with
+preserved optimizer groups and scheduler association, not a silent discarded
+optimizer state. Every stage/precision/offload combination still needs its gate.
+
+## Hardware qualification commands
+
+Run the following on the allocated NVIDIA host, preserving its assigned GPU
+visibility. These commands neither allocate remote resources nor download
+pretrained models:
+
+```bash
+python tools/check_cuda_compat.py --probe-precision --json --output results/device-probe.json
+python tools/check_attention_kernels.py
+python tools/check_quant_kernels.py
+python tools/check_runtime_streams.py --precision all --output results/runtime-streams.json
+python tools/check_runtime_streams.py --precision all --profile results/runtime-trace.json
+compute-sanitizer --tool memcheck python tools/check_quant_kernels.py
+compute-sanitizer --tool memcheck python tools/check_runtime_streams.py --precision all
+```
+
+The stream check compares serial/DPP teacher outputs, student loss and gradients,
+checks real streams/events and exercises input/output allocator lifetimes on a
+separate consumer stream. Its trace is evidence for inspection, **not** a speedup
+or overlap assertion. `all` means all locally probe-supported precisions, not
+every theoretical dtype. Never count an unavailable/skipped backend as a pass.
+
+Run an actual two-rank training/restart gate on a single GPU node:
+
+```bash
+torchrun --standalone --nproc-per-node=2 -m tools.check_distributed_training \
+  --device cuda --parallel ddp --methods all --mixed-precision auto \
+  --output-dir /shared/qualification/ddp-unique-run
+```
+
+For two nodes with four GPUs each, run once per node, changing `--node-rank`
+to 1 on the second node. The output must be the **same new empty shared path**:
+
+```bash
+torchrun --nnodes=2 --nproc-per-node=4 --node-rank=0 \
+  --rdzv-backend=static --master-addr=node0.example --master-port=29500 \
+  -m tools.check_distributed_training --device cuda --parallel ddp \
+  --methods all --mixed-precision auto --timeout 600 \
+  --output-dir /shared/qualification/multinode-ddp-unique-run
+```
+
+Use the same launch topology and a **different empty output path** per case:
+
+| Strategy | Additional/replacement checker arguments | Explicit coverage boundary |
+|---|---|---|
+| DDP | `--parallel ddp --methods all` | All seven registered methods; auxiliary methods require GAS=1 |
+| FSDP full | `--parallel fsdp --fsdp-strategy full --methods step_distill,stream_distill,context_forcing` | BF16 or FP32; no sharded FP16 scaler/EMA/auxiliary method claim |
+| FSDP hybrid | `--parallel fsdp --fsdp-strategy hybrid --methods step_distill,stream_distill,context_forcing` | At least two agents with at least two workers each; verify distinct physical hosts |
+| ZeRO-1 / ZeRO-2 | `--parallel deepspeed --zero-stage 1 --methods step_distill,stream_distill,consistency_distill,context_forcing` | Run stages 1 and 2 separately, then separately with `--cpu-offload` |
+| ZeRO-3 | `--parallel deepspeed --zero-stage 3 --methods step_distill,stream_distill,context_forcing` | No sharded EMA/auxiliary method claim; also test offload separately |
+| Accumulation | `--gradient-accumulation-steps 2` with a supported method subset | DMD/adversarial require 1; do not hide unsupported cases |
+
+This gate uses small synthetic Conv3d denoisers and actual optimizers. It checks
+collectives, rank replicas and continuous four-step training against a two-step
+checkpoint plus resumed next two steps, including optimizer/RNG/cursor and
+method sidecars. Progressive runs cross a stage boundary. Its strict update
+comparison rejects a run that never updates after resume. JSON records commit,
+dirty state, devices, ranks and exact checked scope. An unsupported requested
+combination remains `partial` with nonzero exit; single-rank or CPU control
+success is never distributed GPU qualification.
+
+FSDP/ZeRO and every GPU case above remain **pending until executed on that
+hardware**. These are correctness gates, not pretrained-model quality,
+full-size memory, NCCL bandwidth or multi-node scaling benchmarks. Follow with
+the real-model stability, export, quality and performance matrix in
+[hardware expectations](hardware-expectations.md).
 
 ## Exact architecture and conditioning
 

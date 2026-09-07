@@ -41,6 +41,13 @@ by:
 Unrun cells remain “pending”; they are not silently inferred from a neighboring
 GPU architecture.
 
+Executable single-device stream/lifetime and multi-rank optimizer/restart
+commands are in [training qualification](training.md#hardware-qualification-commands).
+The complete [expected-results matrix](hardware-expectations.md) separates
+acceptance criteria, theoretical resource accounting and upstream published
+numbers from actual WorldDistill measurements. Its topology coverage must not
+be inferred from local multi-agent CPU controls.
+
 ## Benchmark manifest minimum fields
 
 ```json

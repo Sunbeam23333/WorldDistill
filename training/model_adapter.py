@@ -130,6 +130,9 @@ class NoiseRoutedDenoiser(nn.Module):
     """Wan2.2 high/low-noise teachers AND students, with per-example routing."""
 
     requires_unused_parameter_detection = True
+    # Every rank must gather the same expert group before per-example routing.
+    # FSDP/ZeRO-3 must not place independent collective hooks inside this leaf.
+    requires_worlddistill_collective_leaf = True
 
     def __init__(self, high: nn.Module, low: nn.Module, boundary_ratio: float, num_train_timesteps: int = 1000):
         super().__init__()

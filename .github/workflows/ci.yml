@@ -38,6 +38,8 @@ jobs:
           git ls-files --error-unmatch quant_compat.py
           git ls-files --error-unmatch training/model_adapter.py training/student_export.py
           git ls-files --error-unmatch inference/lightx2v/utils/attention.py
+          git ls-files --error-unmatch training/distributed_config.py training/utils/precision.py
+          git ls-files --error-unmatch tools/check_distributed_training.py tools/check_runtime_streams.py
 
       - name: Run contract and training-loop tests
         run: python -m pytest -q training/tests

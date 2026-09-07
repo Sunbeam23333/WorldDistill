@@ -4,7 +4,9 @@ This module provides a Triton-accelerated masked MSE reduction tailored for
 teacher-student supervision in diffusion / world-model distillation. The fused
 kernel avoids materializing the full squared-difference tensor during the
 forward loss reduction path and falls back to vanilla PyTorch when Triton or
-CUDA is unavailable.
+NVIDIA CUDA is unavailable, or the actual tensor device is legacy/unverified.
+Supported-target compiler/launch errors still propagate; in particular, device
+asserts and illegal accesses are never hidden by a fallback.
 """
 
 from __future__ import annotations
@@ -12,6 +14,7 @@ from __future__ import annotations
 from typing import Optional
 
 import torch
+from cuda_compat import profile_cuda_device
 
 try:
     import triton
@@ -163,8 +166,26 @@ def fused_masked_mse_loss(
     return _FusedMaskedMSEFunction.apply(prediction, target, prepared_mask)
 
 
-def fused_supervision_available() -> bool:
-    return _HAS_TRITON
+def fused_supervision_available(device: Optional[torch.device] = None) -> bool:
+    """Import availability, or conservative target eligibility when given a device.
+
+    An eligible target still needs numerical validation of the installed Triton
+    compiler/runtime; this is not a qualification result.
+    """
+    if device is None:
+        return _HAS_TRITON
+    if not _HAS_TRITON or not torch.version.cuda or getattr(torch.version, "hip", None):
+        return False
+    device = torch.device(device)
+    if device.type != "cuda":
+        return False
+    # HIP reuses CUDA tensor names; importability and dtype alone do not prove
+    # NVIDIA support. Triton's current upstream support starts at SM80, and a
+    # future/intermediate unknown capability must not be accepted just for
+    # being numerically larger. Query THIS tensor's device, never current_device.
+    capability = tuple(torch.cuda.get_device_capability(device))
+    profile = profile_cuda_device("fused supervision target", capability)
+    return profile.known_architecture and capability >= (8, 0)
 
 
 def _torch_masked_mse(
@@ -194,6 +215,8 @@ def _can_use_fused_kernel(
     if not _HAS_TRITON:
         return False
     if not prediction.is_cuda or not target.is_cuda:
+        return False
+    if not fused_supervision_available(prediction.device):
         return False
     if prediction.numel() == 0:
         return False

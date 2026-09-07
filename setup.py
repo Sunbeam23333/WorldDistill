@@ -69,7 +69,7 @@ setup(
             "flash-attn>=2.5.0",
             "sgl-kernel",
         ],
-        "distributed": ["deepspeed>=0.14.0"],
+        "distributed": ["deepspeed>=0.19.6"],
         "dev": [
             "pytest",
             "ruff",

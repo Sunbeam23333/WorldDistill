@@ -70,7 +70,12 @@ class ConsistencyDistillTrainer(BaseDistillTrainer):
             warmup_steps=getattr(self.args, "ema_warmup_steps", 0),
         )
         # We also need a model instance to load EMA weights into for forward pass
-        self.ema_model = copy.deepcopy(raw_student)
+        # ZeRO-1/2 may receive a CPU-staged student. The frozen full EMA target
+        # is outside that engine and must live on its actual forward device.
+        self.ema_model = copy.deepcopy(raw_student).to(self.device)
+        self.consistency_ema.shadow = {
+            name: value.to(self.device) for name, value in self.consistency_ema.shadow.items()
+        }
         self.ema_model.eval()
         for p in self.ema_model.parameters():
             p.requires_grad = False
