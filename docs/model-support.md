@@ -40,7 +40,7 @@ Use the training guide for objective-specific input contracts.
 
 | Catalog family | Tasks | Runner/config | Unified training |
 |---|---|---|---|
-| HY-WorldPlay distilled / AR / BI | I2V, Game; selected T2V metadata | Runner/config integrated; external licensed pose provider required; game CLI contract-tested | Context-forcing research path |
+| HY-WorldPlay distilled / AR / BI | I2V, Game; selected T2V metadata | Runner/config integrated; external licensed pose provider required; game CLI contract-tested | Generic Context Forcing via author-supplied native adapter; no bundled native WorldPlay training adapter |
 | Matrix-Game 2.0 | Game | Integrated; game routing/CLI contract | Not integrated |
 | LingBot-CAM | Camera-controlled I2V | Integrated; external checkpoint mapping | Not integrated |
 | GameFactory, GameCraft, Infinite-World, Genie, GameGen-X, V-Mem, SPMem, CAM, Mirage | Catalogued tasks | Stub/interface only | Not integrated |

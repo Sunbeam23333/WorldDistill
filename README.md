@@ -226,7 +226,7 @@ Training entries refer to the exact architecture and conditioning contract.
 | Wan MeanFlow | Runner + config | Teacher-guided `mean_flow_distill` | Explicit two-time student and exact JVP target |
 | Wan VACE / Animate / Self-Forcing variants | Runner + config | No dedicated native training integration | Inference variants do not imply a Self-Forcing training algorithm or causal adapter |
 | HunyuanVideo 1.5 | Runner + config | Diffusers T2V/I2V adapter | VAE, reference-frame and image-encoder conditioning |
-| HY-WorldPlay | Runner + config; external licensed pose adapter required | Context-forcing research path | Game CLI is contract-tested |
+| HY-WorldPlay | Runner + config; external licensed pose adapter required | Author-supplied native training adapter required | Generic Context Forcing is available; no bundled native WorldPlay training adapter |
 | Matrix-Game 2.0 | Runner + config; game CLI contract | Not integrated | Image-conditioned game routing is wired |
 | LingBot-CAM | Runner + config | Not integrated | Checkpoint location is external to the catalog |
 | Wan 2.2 Audio | S2V runner + public config; CLI contract | Not integrated | Requires image and audio inputs |
