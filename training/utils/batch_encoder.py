@@ -104,13 +104,22 @@ class DiffusersRawBatchEncoder:
             # A VAE may preserve time (e.g. an explicitly frame-wise encoder)
             # even if its enclosing pipeline advertises a compression factor.
             anchors = torch.arange(latent_t, device=self.device) * (1 if latent_t == raw_t else ratio)
-            for key in ("actions", "camera_poses"):
+            for key in ("actions", "camera_poses", "camera_intrinsics"):
                 if key not in batch:
                     continue
                 value = batch[key]
                 if value.ndim < 2 or value.shape[1] != raw_t:
                     raise ValueError(f"Raw {key} must have layout B,T,... aligned to sampled video frames")
                 batch[key] = value.index_select(1, anchors.to(value.device))
+            for key in ("keyboard_actions", "mouse_actions"):
+                if key in batch:
+                    value = batch[key]
+                    if value.ndim != 3 or value.shape[1] != raw_t:
+                        raise ValueError(f"Raw {key} must retain pixel-rate B,T,D controls")
+                    # Matrix's action encoder consumes complete causal windows
+                    # at pixel rate. Do NOT downsample them like generic actions.
+                    if raw_t != (latent_t - 1) * ratio + 1:
+                        raise ValueError("Matrix pixel-rate controls require exact causal VAE frame alignment")
 
         if "encoder_hidden_states" not in batch and "text" in batch:
             prompt_embeds = self._encode_text(batch["text"])

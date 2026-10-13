@@ -234,6 +234,7 @@ class StepDistillTrainer(BaseDistillTrainer):
         if self.use_dual_model:
             path = os.path.join(output_dir, f"checkpoint-{step}", "dual_student_state.pt")
             self._atomic_save_rank0(path, self._dual_checkpoint_metadata, "Write unified dual-student layout")
+        self._publish_elastic_checkpoint(step, output_dir)
 
     def _validate_standard_checkpoint_state(self, state):
         super()._validate_standard_checkpoint_state(state)

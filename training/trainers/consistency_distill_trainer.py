@@ -75,7 +75,8 @@ class ConsistencyDistillTrainer(BaseDistillTrainer):
         # We also need a model instance to load EMA weights into for forward pass
         # ZeRO-1/2 may receive a CPU-staged student. The frozen full EMA target
         # is outside that engine and must live on its actual forward device.
-        target_device = torch.device("cpu") if self._parameters_are_sharded() else self.device
+        model_partitioned = getattr(self.args, "tp_size", 1) * getattr(self.args, "pp_size", 1) > 1
+        target_device = torch.device("cpu") if self._parameters_are_sharded() or model_partitioned else self.device
         self.ema_model = copy.deepcopy(raw_student).to(target_device)
         if self.consistency_ema is not None:
             self.consistency_ema.shadow = {
@@ -312,7 +313,29 @@ class ConsistencyDistillTrainer(BaseDistillTrainer):
         ckpt_dir = os.path.join(output_dir, f"checkpoint-{step}")
         if self._ema_offloader is not None:
             self._ema_offloader.synchronize()
+        if getattr(self, "model_parallel", None) is not None:
+            from training.parallel.checkpoint import collect_ema_state
+            from training.parallel.state import collect_full_model_state
+            state = {
+                "ema_model": collect_full_model_state(self.ema_model, group=self.model_parallel.checkpoint_group),
+                "consistency_ema": collect_ema_state(self._unwrap_model(self.student_model),
+                                                     self.consistency_ema, self.model_parallel.checkpoint_group),
+                "model_parallel": True,
+            }
+            self._atomic_save_rank0(os.path.join(ckpt_dir, "ema_state.pt"), lambda: state,
+                                    "Save canonical model-parallel consistency target")
+            self._publish_elastic_checkpoint(step, output_dir)
+            return
         if isinstance(self.consistency_ema, ShardedEMA):
+            if getattr(self.args, "elastic_resume", False):
+                from torch.distributed.checkpoint.state_dict import StateDictOptions, get_model_state_dict
+                state = self._run_all_ranks_or_raise(lambda: {
+                    "consistency_ema": self.consistency_ema.portable_state_dict(self.student_model),
+                    "target": {name: value.detach().cpu() for name, value in get_model_state_dict(
+                        self.ema_model, options=StateDictOptions(full_state_dict=True, cpu_offload=False)).items()},
+                }, "Collect portable consistency target")
+                self._atomic_save_rank0(os.path.join(ckpt_dir, "consistency_portable.pt"), lambda: state,
+                                        "Save portable consistency target")
             ema_path = os.path.join(ckpt_dir, f"consistency_ema_rank_{self.rank:05d}.pt")
             def _save_local():
                 temporary = f"{ema_path}.tmp-{os.getpid()}"
@@ -323,6 +346,7 @@ class ConsistencyDistillTrainer(BaseDistillTrainer):
                     if os.path.exists(temporary):
                         os.remove(temporary)
             self._run_all_ranks_or_raise(_save_local, "Save sharded consistency target")
+            self._publish_elastic_checkpoint(step, output_dir)
             return
         ema_path = os.path.join(ckpt_dir, "ema_state.pt")
         self._atomic_save_rank0(
@@ -333,12 +357,23 @@ class ConsistencyDistillTrainer(BaseDistillTrainer):
             },
             f"Write consistency EMA checkpoint {ema_path}",
         )
+        self._publish_elastic_checkpoint(step, output_dir)
 
     def load_checkpoint(self, path: str):
         """Load checkpoint including EMA model."""
         super().load_checkpoint(path)
         ckpt_dir = path if os.path.isdir(path) else os.path.dirname(path)
         if isinstance(self.consistency_ema, ShardedEMA):
+            if getattr(self.args, "elastic_resume", False):
+                from torch.distributed.checkpoint.state_dict import StateDictOptions, set_model_state_dict
+                state = self._load_checkpoint_file_all_ranks(os.path.join(ckpt_dir, "consistency_portable.pt"),
+                    description="Load portable consistency target", weights_only=True, map_location="cpu")
+                def _restore_portable():
+                    self.consistency_ema.load_portable_state_dict(self.student_model, state["consistency_ema"])
+                    set_model_state_dict(self.ema_model, state["target"],
+                                         options=StateDictOptions(full_state_dict=True, strict=True))
+                self._run_all_ranks_or_raise(_restore_portable, "Reshard portable consistency target")
+                return
             ema_path = os.path.join(ckpt_dir, f"consistency_ema_rank_{self.rank:05d}.pt")
             def _restore_local():
                 state = torch.load(ema_path, map_location="cpu", weights_only=True)
@@ -364,8 +399,17 @@ class ConsistencyDistillTrainer(BaseDistillTrainer):
             missing = sorted({"ema_model", "consistency_ema"}.difference(ema_state))
             if missing:
                 raise KeyError(f"Consistency EMA checkpoint is missing required keys: {missing}")
-            self.ema_model.load_state_dict(ema_state["ema_model"], strict=True)
-            self.consistency_ema.load_state_dict(ema_state["consistency_ema"])
+            if getattr(self, "model_parallel", None) is not None:
+                from training.parallel.checkpoint import restore_ema_state
+                from training.parallel.state import load_full_model_state
+                if not ema_state.get("model_parallel"):
+                    raise ValueError("Model-parallel consistency requires canonical target/EMA state")
+                load_full_model_state(self.ema_model, ema_state["ema_model"])
+                restore_ema_state(self._unwrap_model(self.student_model), self.consistency_ema,
+                                  ema_state["consistency_ema"])
+            else:
+                self.ema_model.load_state_dict(ema_state["ema_model"], strict=True)
+                self.consistency_ema.load_state_dict(ema_state["consistency_ema"])
 
         self._run_all_ranks_or_raise(
             _restore_consistency_ema,

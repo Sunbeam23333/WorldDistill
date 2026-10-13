@@ -51,7 +51,9 @@ paths, together with teacher-guided MeanFlow and joint audio-video distillation.
 | Fused target-only MSE | Triton kernel with PyTorch reference path | PyTorch numerical reference and CUDA JIT checker |
 | DDP / FSDP / DeepSpeed | Wrapper and collective checkpoint control flow | Collective train/resume and optimizer-state checks |
 | Wan context parallelism | Model-layer Ulysses token/head exchange, DP×CP sampling and synchronized conditions | Real tiny-Wan forward, chained-rollout gradients and optimizer-update parity |
-| Multi-node launch | Manual/Slurm, fixed-size static/c10d rendezvous, node-aware hybrid FSDP groups | Collective launch, node-aware groups and restart checks |
+| Tensor / pipeline parallelism | Wan TP×PP×DP, actual stage-owned layers, native declarative plans and Matrix/LingBot PP | Full/partitioned forward, gradients, updates, LoRA and canonical checkpoint tests |
+| Multi-node and elastic recovery | Manual/Slurm launch, opt-in c10d node ranges, portable optimizer/EMA and committed global data cursor | Collective launch, node-aware groups, changed-DP-size restore and next-update checks |
+| Native world/control training | Matrix-Game2, LingBot-CAM, Diffusers VACE/Animate/SkyReels adapters | Real tiny architecture backward, strict export/reload and condition contracts |
 | Automatic precision | Real GEMM/math-attention probes and all-rank common dtype selection; explicit unsupported requests fail | Local precision probes and cross-rank dtype agreement |
 | Adversarial / DMD-style paths | Latent discriminator; fake-distribution DSM and detached teacher-minus-fake generator gradients | Tiny-model updates and numerical contracts |
 
@@ -124,7 +126,7 @@ checks. This does not qualify optional attention/quantization kernels. Older
 NVIDIA cards may require an archived software stack; unknown architectures are
 not certified by extrapolation.
 
-For multi-node manual/Slurm launch and fixed-size restarts, see the
+For multi-node manual/Slurm launch, fixed-size retries and elastic recovery, see the
 [launch guide](docs/distributed-launch.md). For executable GPU gates, feature
 acceptance targets, memory formulas and carefully scoped published reference
 numbers, see [qualification and expected results](docs/hardware-expectations.md)
@@ -212,7 +214,7 @@ torchrun --nproc_per_node=8 training/train_distill.py \
   --output_dir results/step_distill
 ```
 
-Native differentiable models use a strict `worlddistill_model.json` adapter with explicit action/camera inputs. Loading its installed factory requires `--allow_native_model_code`. Method contracts and data schemas are documented in [docs/training.md](docs/training.md).
+Native differentiable models use a strict `worlddistill_model.json` adapter with explicit action/camera inputs. Matrix-Game2 and LingBot-CAM include concrete author architectures; external installed factories require `--allow_native_model_code`. See [training contracts](docs/training.md) and [TP/PP, elastic recovery and native models](docs/parallel-elastic-native.md).
 
 ## Model integration status
 
@@ -224,16 +226,18 @@ Training entries refer to the exact architecture and conditioning contract.
 |---|---|---|---|
 | Wan 2.1 / 2.2 and compatible distilled checkpoints | Runner + config | Exact Diffusers adapter, native dual experts | Wan Ulysses context parallelism; method-specific objective contracts |
 | Wan MeanFlow | Runner + config | Teacher-guided `mean_flow_distill` | Explicit two-time student and exact JVP target |
-| Wan VACE / Animate / Self-Forcing variants | Runner + config | No dedicated native training integration | Inference variants do not imply a Self-Forcing training algorithm or causal adapter |
+| Wan VACE / Animate | Runner + config | Dedicated Diffusers control adapters | Encoded VACE context; Animate reference/pose/face protocol |
+| Wan Self-Forcing variants | Runner + config | No dedicated Self-Forcing architecture adapter | Generic Stream is not a substitute for the author's causal model |
 | HunyuanVideo 1.5 | Runner + config | Diffusers T2V/I2V adapter | VAE, reference-frame and image-encoder conditioning |
-| HY-WorldPlay | Runner + config; external licensed pose adapter required | Author-supplied native training adapter required | Generic Context Forcing is available; no bundled native WorldPlay training adapter |
-| Matrix-Game 2.0 | Runner + config; game CLI contract | Not integrated | Image-conditioned game routing is wired |
-| LingBot-CAM | Runner + config | Not integrated | Checkpoint location is external to the catalog |
+| HY-WorldPlay | Runner + config; external licensed pose adapter required | Explicit official training-class bridge | Separately installed licensed source and native distributed/shape requirements |
+| Matrix-Game 2.0 | Runner + config; game CLI contract | Native causal/foundation architecture, PP | CLIP/image latents and pixel-rate keyboard/mouse controls |
+| LingBot-CAM | Runner + config | Native camera-conditioned architecture, PP | Camera ray features or C2W poses with pixel intrinsics |
 | Wan 2.2 Audio | S2V runner + public config; CLI contract | Not integrated | Requires image and audio inputs |
 | SekoTalk | S2V runner; stateful shot-based RS2V wrapper | Not integrated | RS2V reuses overlap latents across clips |
 | LTX-Video 2 | Runner + config | Joint audio-video adapter | Packed audio latents and both output heads |
 | Qwen Image / LongCat / Z-Image / BAGEL | Runner + config; image CLI contract | Not integrated | Inference only in WorldDistill today |
-| SkyReels-V2 and nine catalogued world-model families | Stub/interface only | Not integrated | Ten stub families in total; contributions require a concrete runner, config, and smoke evidence |
+| SkyReels-V2 | LightX2V runner remains a stub | Dedicated Diffusers training adapter | Framewise diffusion forcing and checkpoint-native FPS conditioning |
+| Nine other catalogued world-model families | Stub/interface only | Not integrated | Each requires its concrete author architecture and licensed checkpoint |
 
 The detailed per-model/task table and checkpoint availability are in
 [docs/model-support.md](docs/model-support.md). The downloader intentionally does
@@ -261,12 +265,13 @@ native validation. The vendored low-bit CUTLASS extension is explicitly
 
 ## Known limitations
 
-- Fixed-size homogeneous worker counts are supported by the launcher. Uneven
-  workers, changed-world-size elastic recovery and generic model-layer TP/PP
-  are not implemented; a working rendezvous is not a claim of universal topology support.
+- Fixed-size launch is the default; opt-in elastic recovery can change the DP
+  degree. Workers per node remain homogeneous and SP/TP/PP degrees stay fixed.
+  TP/PP requires a supported architecture plan, eager AdamW, and DP reduction;
+  it is not combined with FSDP/ZeRO, Ulysses, or higher-order MeanFlow.
 - Native adapters require the model author's differentiable architecture and licensed weights. Catalog-only entries do not substitute for those assets.
 - Multi-rank FSDP/DeepSpeed now receive CPU-staged student parameters instead of
-  an already materialized full GPU student. Teacher weights can stay on CPU or file-backed storage; a complete teacher forward must fit the execution device.
+  an already materialized full GPU student. Teacher weights can stay on CPU or file-backed storage; the resident model partition and its forward workspace must fit the execution device.
 - Adversarial training uses a latent projection discriminator; DMD/DMD2 use
   trained fake-score DSM and their separately selected regression/GAN terms.
   FSDP/ZeRO partition the student; auxiliary models remain full replicas with

@@ -207,6 +207,10 @@ class TrainerArgs:
     # --- Distributed / Parallelism ---
     parallel_mode: str = "ddp"  # ddp | fsdp | deepspeed
     sp_size: int = 1  # Sequence parallel size (1 = disabled)
+    tp_size: int = 1  # Tensor-parallel parameter/compute partitions
+    pp_size: int = 1  # Pipeline stage count
+    elastic_resume: bool = False  # Portable state and global-batch data cursor
+    elastic_auto_resume: bool = False  # Discover completed checkpoints on torchrun restart
     use_fsdp: bool = False  # Legacy flag (use parallel_mode instead)
     fsdp_shard_strategy: str = "full"  # full | hybrid
     deepspeed_stage: int = 2  # ZeRO stage (1, 2, or 3) when parallel_mode=deepspeed
@@ -311,6 +315,23 @@ class TrainerArgs:
         # Legacy compat: if use_fsdp is True, set parallel_mode to fsdp
         if self.use_fsdp and self.parallel_mode == "ddp":
             self.parallel_mode = "fsdp"
+        for name in ("sp_size", "tp_size", "pp_size"):
+            value = getattr(self, name)
+            if type(value) is not int or value < 1:
+                raise ValueError(f"{name} must be a positive integer")
+        if self.elastic_auto_resume and not self.elastic_resume:
+            raise ValueError("elastic_auto_resume requires elastic_resume")
+        if self.tp_size * self.pp_size > 1:
+            if self.parallel_mode != "ddp":
+                raise ValueError("TP/PP plans compose with DP gradient reduction; select parallel_mode=ddp")
+            if self.sp_size > 1:
+                raise ValueError("TP/PP model plans use sp_size=1; Ulysses is a separate plan")
+            if self.distill_method == "mean_flow_distill":
+                raise ValueError("MeanFlow higher-order JVP requires tp_size=pp_size=1")
+            if self.enable_torch_compile:
+                raise ValueError("TP/PP communication plans require eager execution")
+            if self.optimizer != "adamw":
+                raise ValueError("TP/PP parameter partitions require AdamW")
         self.report_to = self._normalize_report_to(self.report_to, use_wandb=self.use_wandb)
         _ = _apply_model_metadata(self)
 
@@ -512,6 +533,10 @@ def build_training_arg_parser() -> argparse.ArgumentParser:
         help="Parallelism strategy: ddp (default), fsdp, or deepspeed",
     )
     parser.add_argument("--sp_size", type=int, default=1, help="Sequence parallel group size (1 = disabled)")
+    parser.add_argument("--tp_size", type=int, default=1, help="Tensor-parallel group size")
+    parser.add_argument("--pp_size", type=int, default=1, help="Pipeline stage count")
+    parser.add_argument("--elastic_resume", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--elastic_auto_resume", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--fsdp_shard_strategy", type=str, default="full", choices=["full", "hybrid"], help="FSDP sharding strategy")
     parser.add_argument("--deepspeed_stage", type=int, default=2, choices=[1, 2, 3], help="DeepSpeed ZeRO stage")
     parser.add_argument("--gradient_checkpointing", action=argparse.BooleanOptionalAction, default=True)

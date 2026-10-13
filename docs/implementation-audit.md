@@ -15,7 +15,10 @@ reference; historical fixes below retain their original context.
 | Parallel state | FSDP/ZeRO EMA, collective FP16 overflow handling, full-state progressive teacher handoff; replicated auxiliary optimizers and true GAS | Continuous/resumed optimizer, scaler, RNG and target state |
 | Progressive LoRA | Full CPU snapshot and safe merge into existing teacher parameter objects | LoRA/DoRA/rsLoRA, stage transitions and resume |
 | Context parallelism | Wan Ulysses model-layer token/head exchange, DP×CP data/RNG semantics and chained-rollout input gradients | Two/four-process full-model gradient and training-update comparisons |
+| Tensor/pipeline parallelism | Wan TP×PP×DP, real stage ownership, native declarative plans and Matrix/LingBot PP; canonical Adam/EMA and LoRA handoff | Full-model numerical comparisons, seven first-order trainers, accumulation and restart |
+| Elastic recovery | Committed global batch cursor, complete-checkpoint discovery, portable DDP/FSDP/TP-PP state and DeepSpeed Universal conversion | DDP/FSDP 2→1→2; fixed-TP DP resizing; corruption and publication checks |
 | Model interfaces | Hunyuan1.5 T2V/I2V raw conditions, LTX statistics, LTX2 AV heads, trusted installed native factories | Exact forward inputs, condition preservation and frame alignment |
+| Native/control models | Concrete Matrix-Game2 and LingBot-CAM architectures; dedicated Diffusers VACE/Animate/SkyReels; licensed WorldPlay installed-source bridge | Actual tiny architecture backward, strict reload and native condition contracts; WorldPlay bridge uses the external author runtime |
 | Export and sampling | LoRA merge, native/dual experts, MeanFlow and AV; strict reload; pipeline or recorded-timetable adapter sampling | Parameter inventory, prediction parity and full CLI train/resume/export |
 | Data and evaluation | Raw→cached encoding with provenance; official VBench bridge, matched-I3D FVD, recovered-action/trajectory metrics | Cache round-trip, invalid-input tests and numerical references |
 

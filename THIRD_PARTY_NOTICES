@@ -16,8 +16,11 @@ Optional Tencent HY-WorldPlay integration
 -----------------------------------------
 
 WorldDistill does not bundle Tencent HY-WorldPlay source code or model weights.
-Its Apache-licensed provider interface can load a user-supplied HY-WorldPlay
-integration. Users who obtain or enable that optional integration must review
+The concrete training bridge in training/native_adapters/worldplay.py binds the
+official installed ARHunyuanVideo_1_5_DiffusionTransformer training class at
+Tencent-Hunyuan/HY-WorldPlay revision 1588e1336e842b03b0a7860c654ebd7c46bb065e.
+It does not copy Tencent's architecture implementation. Users who obtain or
+enable that optional integration must review
 and comply with the Tencent HY-WorldPlay Community License Agreement, including
 its Territory, distribution, use, and commercial terms. A verbatim copy is
 provided for reference at:
@@ -27,3 +30,42 @@ provided for reference at:
 The Tencent HY-WorldPlay notice is also reproduced in the repository-root
 NOTICE file. This summary does not replace or modify the license agreement and
 does not grant any rights to Tencent HY-WorldPlay materials.
+
+Matrix-Game 2 native training architecture
+-----------------------------------------
+
+Files under training/native_adapters/matrix_game2 (except __init__.py and the
+WorldDistill attention binding) are adapted from Matrix-Game-2/wan/modules in:
+https://github.com/SkyworkAI/Matrix-Game
+Revision: 756776d516233027631008761d4d40ddaea3e23a
+Copyright (c) 2025 SkyworkAI and contributors.
+License: MIT, reproduced verbatim in training/native_adapters/matrix_game2/LICENSE.
+
+WorldDistill modifications: package-relative imports; differentiable SDPA and
+FlexAttention backend binding; device-portable rotary metadata; configurable
+action rotary head size; full-clip mouse-window reshaping; correct batched
+keyboard expansion; removal of fixed 880-token training assumptions; zero-pad
+length handling; exclusion of padding keys from final partial causal chunks.
+The parameterized architecture and native parameter/state names are preserved.
+Inference-only KV-cache branches are not exposed by the training adapter.
+
+LingBot-World camera-conditioned native architecture
+---------------------------------------------------
+
+training/native_adapters/lingbot/model.py is adapted from wan/modules/model.py:
+https://github.com/Robbyant/lingbot-world
+Revision: a43bec7f8091c83e9b30b16b912f6fc906236fa6
+License: Apache License, Version 2.0, reproduced verbatim in
+training/native_adapters/lingbot/LICENSE.
+
+WorldDistill modifications: package-relative attention binding; differentiable
+SDPA fallback; device-portable rotary metadata; activation checkpoint execution;
+differentiable FP32 modulation/output linear arithmetic under BF16/FP16 storage.
+The parameterized camera architecture and native parameter/state names are
+preserved. The wrapper independently executes batch members to preserve the
+author camera branch's per-sample semantics, and implements the published
+relative-pose/origin-and-direction camera conditioning protocol.
+
+Both architecture licenses are included in source and wheel distributions.
+No pretrained weights, dataset media, or third-party training results are
+redistributed with these architecture implementations.

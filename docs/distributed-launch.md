@@ -1,4 +1,4 @@
-# Fixed-size multi-node launch
+# Multi-node launch and elastic recovery
 
 WorldDistill launches one `torchrun` agent per node, with the same integer
 worker count on every node. `--gpus` remains an alias for
@@ -6,13 +6,11 @@ worker count on every node. `--gpus` remains an alias for
 The launcher never rewrites `CUDA_VISIBLE_DEVICES`, GPU UUIDs, or MIG masks.
 `LOCAL_RANK` indexes the scheduler-visible device set.
 
-This implements launch, initialization and node-aware grouping contracts.
-CPU/Gloo tests exercise local multi-agent rendezvous, collective communication
-and tiny-model DDP training. They do not certify multiple physical machines,
-NCCL, GPU FSDP/ZeRO, InfiniBand/RoCE, or any A100/H20/B200/B300 topology.
 All participating nodes need compatible software, their licensed model assets,
-the training data, and a consistent checkpoint path. No SSH launcher or remote
-command execution is provided.
+the training data, and a consistent checkpoint path. Elastic recovery requires
+shared checkpoint storage accessible under the same path on every node.
+No SSH launcher or remote command execution is provided. Fixed-size execution
+is the default; data-parallel membership changes require explicit opt-in.
 
 ### Dynamic expert collective boundaries
 
@@ -127,15 +125,13 @@ connectivity, or the legality of a particular MIG/NCCL configuration.
 - `--rdzv_timeout` bounds rendezvous joining/store operations. `--dist_timeout`
   bounds process-group initialization and collectives. A process that cannot
   join or a failed collective exits rather than falling back to another backend.
-- `--max_restarts N` enables fixed-size torchrun retries, default zero.
+- `--max_restarts N` enables torchrun retries, default zero.
   `--resume_from /shared/run/checkpoint-K` explicitly chooses the checkpoint
-  used on each invocation. Retrying does **not** automatically discover the
-  newest checkpoint; without a resume path the command starts from its initial
-  state. Do not describe retries as automatic latest-checkpoint recovery.
-- `--nnodes MIN:MAX`, heterogeneous workers per node, and world-size changes
-  are rejected. The launcher exports expected global/local worker counts and
-  every restarted worker checks them. No elastic membership or resharding claim
-  is made.
+  used on each invocation. Automatic latest-checkpoint selection additionally
+  requires `--elastic_resume --elastic_auto_resume`, described below.
+- Fixed-size launch exports expected global/local worker counts and every
+  restarted worker checks them. Elastic launch replaces the fixed global count
+  with an allowed node range. Unequal worker counts across nodes are rejected.
 
 Direct `torchrun -m training.train_distill` users can retain that interface.
 For restart safety, declare the fixed worker counts explicitly, for example:
@@ -150,11 +146,80 @@ torchrun --nnodes=2 --nproc_per_node=4 --node_rank=0 \
   --teacher_model_path /models/teacher-diffusers --data_json /data/train.json
 ```
 
-The direct API cannot inspect the parent torchrun command's node-range flags.
-Using an elastic parent launcher is unsupported; a restarted worker without
-the expected-world-size declaration fails instead of assuming unchanged size.
-DDP, FSDP and ZeRO checkpoint compatibility also depends on the training
-checkpoint contract, not just successful rendezvous.
+Without explicit elastic opt-in, a restarted worker without the expected
+world-size declaration fails instead of assuming unchanged size.
+
+## Elastic DP membership: explicit opt-in
+
+Run one manual agent per node with the same command and shared rendezvous ID:
+
+```bash
+bash scripts/run_train.sh --teacher_model /models/teacher-diffusers \
+  --data_json /data/train.json --output_dir /shared/runs/elastic \
+  --nnodes 1:2 --nproc_per_node 4 --rdzv_backend c10d \
+  --rdzv_endpoint rendezvous.example:29500 --rdzv_id unique-elastic-job \
+  --max_restarts 5 --elastic_resume --elastic_auto_resume --parallel fsdp
+```
+
+`--elastic_resume` enables portable training checkpoints and the global data
+cursor. It must already be enabled when the source checkpoint is saved.
+`--elastic_auto_resume` selects the latest complete checkpoint on restart;
+an explicit `--resume_from` takes precedence on the first launch. A restarted
+job with neither a complete checkpoint nor an explicit resume path fails
+instead of silently beginning a new run. A checkpoint is published only after
+model, optimizer and all method-specific sidecars have finished writing;
+partial checkpoint directories are not automatic recovery candidates.
+
+The sampler records consumed global batches, not DataLoader-prefetched batches.
+On resize, it distributes the unconsumed suffix across the new DP replicas.
+The last incomplete replica group pads only from that remaining suffix.
+Dataset manifest/bucket identity, seed, batch size and sampler settings must
+match. Resizing creates deterministic generation-specific RNG streams and
+changes the effective global batch size; it does not promise the bitwise
+trajectory of an unchanged-size run. Same-topology recovery retains per-rank
+RNG and the saved optimizer/EMA state.
+
+Portable state paths are backend-specific:
+
+| Backend | Resized restore |
+|---|---|
+| DDP | Full model, Adam state, scheduler, scaler and EMA on each new replica |
+| FSDP | PyTorch canonical full model/optimizer state reshards onto new workers; portable EMA and consistency target states |
+| TP/PP with DDP | Canonical model, Adam and EMA state restores the same model plan with a new DP degree |
+| DeepSpeed ZeRO-1/2/3 | Official Universal Checkpoint conversion/loading, plus preserved optimizer-group options/steps, frozen weights, persistent buffers and AMP/EMA state |
+
+DeepSpeed Universal resizing uses DeepSpeed ≥0.19.6 and initialized Adam state
+at an optimizer-step boundary. CPU offload is allowed; rank-local ZeRO
+optimizer/parameter NVMe swapping is rejected for this path. This restriction
+does not apply to frozen teacher NVMe storage. Full-state serialization and
+Universal conversion require sufficient host memory and shared disk capacity.
+The ZeRO-1/2 load compatibility layer handles padding-only shards and restores
+master/moment inspection views while retaining the official Universal format,
+engine metadata, scheduler restoration and low-precision synchronization.
+
+Only the DP degree may change: `--sp_size`, `--tp_size` and `--pp_size` must
+remain fixed, and every allowed membership must contain whole model groups.
+For a variable node range the launcher therefore requires workers per node to
+be divisible by the product of these degrees. `MIN:MAX` requires c10d and
+manual agents; the Slurm adapter remains fixed-allocation. Hybrid FSDP's range
+must keep at least two nodes. See [model-parallel ownership and native plans](parallel-elastic-native.md).
+
+For a direct `torchrun` invocation, pass the same training flags and declare
+the node-range bounds explicitly (the child cannot read its parent's flags):
+
+```bash
+WORLD_DISTILL_MIN_NODES=1 WORLD_DISTILL_MAX_NODES=2 \
+WORLD_DISTILL_EXPECTED_LOCAL_WORLD_SIZE=4 \
+torchrun --nnodes=1:2 --nproc_per_node=4 --rdzv_backend=c10d \
+  --rdzv_endpoint=rendezvous.example:29500 --rdzv_id=unique-elastic-job \
+  --max_restarts=5 -m training.train_distill \
+  --teacher_model_path /models/teacher-diffusers --data_json /data/train.json \
+  --output_dir /shared/runs/elastic --elastic_resume --elastic_auto_resume
+```
+
+Do not retain `WORLD_DISTILL_EXPECTED_WORLD_SIZE` from a fixed-size job when
+enabling elastic membership. The entry point enables the elastic environment
+contract only when `--elastic_resume` is explicit.
 
 ## Hybrid FSDP is explicitly node-aware
 
@@ -171,17 +236,47 @@ This is post-load wrapping. It is not distributed/meta checkpoint loading,
 teacher sharding, or proof that a large model fits during initialization.
 Sequence parallelism still requires a model-specific adapter; increasing
 node count does not implement missing sequence-parallel model collectives.
-Stock training adapters do not provide generic SP, tensor parallelism (TP),
-or pipeline parallelism (PP). TP/PP are not launch modes; setting a larger
-world size does not partition model layers or tensors automatically. A custom
-SP adapter must implement the full model-side communication contract before
-`--sp_size > 1` can be used; a dry run does not validate that implementation.
+Wan has a concrete Ulysses context-parallel adapter and separate tensor/
+pipeline partition plans. Native architectures require a declared valid plan;
+setting a larger world size alone does not partition layers or tensors.
+TP/PP use `--tp_size` / `--pp_size` with DDP; they are not interchangeable
+with FSDP/ZeRO wrapping or with `--sp_size`. See the
+[supported plans and combination constraints](parallel-elastic-native.md).
+
+## Reproducible recovery checks
+
+```bash
+python -m pytest training/tests/test_elastic_resume.py training/tests/test_elastic_entry.py -q
+```
+
+The recovery suite launches real Gloo process groups through a 2 → 1 → 2
+sequence and checks model weights, optimizer moments, EMA/target/auxiliary
+state, data cursor and continued training. It also launches a real c10d agent
+with a `1:2` range. FSDP's CPU-device cases exercise checkpoint resharding;
+normal training retains its CUDA placement requirements.
+
+The optional DeepSpeed cases instantiate actual ZeRO engines and run the
+official Universal converter. A CI lane can install DeepSpeed ≥0.19.6 in its
+own environment and run them with the official CPU accelerator; no CUDA
+extension build is needed for these CPU/AdamW checkpoint tests:
+
+```bash
+DS_BUILD_OPS=0 python -m pip install 'deepspeed==0.19.6'
+DS_ACCELERATOR=cpu python -m pytest training/tests/test_elastic_resume.py \
+  -k real_cpu_zero -q
+```
+
+When DeepSpeed is absent those three optional cases are skipped; the ordinary
+DDP/FSDP recovery suite still runs. GPU collective/kernel tests remain separate
+from the restart protocol tests.
 
 ## Upstream contracts
 
-The launch shape and fixed-size restart policy follow the official
+The launch shape and membership/restart policy follow the official
 [torchrun documentation](https://docs.pytorch.org/docs/stable/elastic/run.html).
 Hybrid group ordering follows the official
 [FSDP process-group contract](https://docs.pytorch.org/docs/stable/fsdp.html).
 Timeout handling follows the official
 [distributed initialization and collective documentation](https://docs.pytorch.org/docs/stable/distributed.html).
+Portable sharded state follows [PyTorch distributed checkpoint APIs](https://docs.pytorch.org/docs/stable/distributed.checkpoint.html)
+and [DeepSpeed Universal Checkpointing](https://github.com/deepspeedai/DeepSpeed/blob/master/docs/_tutorials/universal-checkpointing.md).

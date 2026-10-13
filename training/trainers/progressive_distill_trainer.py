@@ -116,6 +116,9 @@ class ProgressiveDistillTrainer(BaseDistillTrainer):
 
     def _full_student_state_for_teacher(self):
         """Collect full parameters on every rank before the frozen handoff."""
+        if getattr(self, "model_parallel", None) is not None:
+            from training.parallel.state import collect_full_model_state
+            return collect_full_model_state(self._unwrap_model(self.student_model), group=self.model_parallel.checkpoint_group)
         if self._is_fsdp_wrapped(self.student_model):
             from torch.distributed.fsdp import (
                 FullyShardedDataParallel as FSDP, StateDictType, FullStateDictConfig,
@@ -149,6 +152,13 @@ class ProgressiveDistillTrainer(BaseDistillTrainer):
             model = model._orig_mod
         return model
 
+    def _load_teacher_state(self, state):
+        if getattr(self, "model_parallel", None) is not None:
+            from training.parallel.state import load_full_model_state
+            load_full_model_state(self._teacher_state_model(), state)
+        else:
+            self._teacher_state_model().load_state_dict(state, strict=True)
+
     def _eager_student(self):
         model = self._unwrap_model(self.student_model)
         while getattr(model, "_orig_mod", None) is not None:
@@ -159,7 +169,8 @@ class ProgressiveDistillTrainer(BaseDistillTrainer):
         state = self._full_student_state_for_teacher()
         if self._lora_teacher_handoff:
             from training.utils.peft_handoff import merge_lora_student_state
-            state = merge_lora_student_state(self._teacher_state_model(), self._eager_student(), state)
+            template = getattr(self, "_unpartitioned_teacher_meta", self._teacher_state_model())
+            state = merge_lora_student_state(template, self._eager_student(), state)
         return state
 
     def _get_teacher_timesteps(self, num_steps: int) -> torch.Tensor:
@@ -303,7 +314,7 @@ class ProgressiveDistillTrainer(BaseDistillTrainer):
                 src_state = self._teacher_handoff_state()
                 if self.runtime is not None:
                     self.runtime.synchronize_teacher()
-                self._teacher_state_model().load_state_dict(src_state)
+                self._load_teacher_state(src_state)
                 if self.runtime is not None:
                     self.runtime.advance_teacher_revision(f"progressive-stage-{self.current_stage}")
                 self.teacher_model.eval()
@@ -331,16 +342,23 @@ class ProgressiveDistillTrainer(BaseDistillTrainer):
         super().save_checkpoint(step, output_dir)
         ckpt_dir = os.path.join(output_dir, f"checkpoint-{step}")
         progressive_path = os.path.join(ckpt_dir, "progressive_state.pt")
+        if getattr(self, "model_parallel", None) is not None:
+            from training.parallel.state import collect_full_model_state
+            teacher_state = collect_full_model_state(self._teacher_state_model(),
+                group=self._model_parallel_roles["teacher"].checkpoint_group)
+        else:
+            teacher_state = self._teacher_state_model().state_dict()
         self._atomic_save_rank0(
             progressive_path,
             lambda: {
-                "teacher_model": self._teacher_state_model().state_dict(),
+                "teacher_model": teacher_state,
                 "current_stage": self.current_stage,
                 "current_teacher_steps": self.current_teacher_steps,
                 "current_student_steps": self.current_student_steps,
             },
             f"Write progressive checkpoint {progressive_path}",
         )
+        self._publish_elastic_checkpoint(step, output_dir)
 
     def load_checkpoint(self, path: str):
         """Restore the exact progressive stage and its teacher."""
@@ -400,7 +418,7 @@ class ProgressiveDistillTrainer(BaseDistillTrainer):
         def _restore_progressive_teacher():
             if self.runtime is not None:
                 self.runtime.synchronize_teacher()
-            self._teacher_state_model().load_state_dict(self._canonical_state(state["teacher_model"]), strict=True)
+            self._load_teacher_state(self._canonical_state(state["teacher_model"]))
             if self.runtime is not None and self.current_stage > 0:
                 self.runtime.advance_teacher_revision(f"progressive-stage-{self.current_stage}")
 

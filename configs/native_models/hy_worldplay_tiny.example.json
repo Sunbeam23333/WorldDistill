@@ -1,0 +1,18 @@
+{
+  "schema_version": 1,
+  "architecture": "hy_worldplay",
+  "source_revision": "1588e1336e842b03b0a7860c654ebd7c46bb065e",
+  "weights": "model.safetensors",
+  "num_train_timesteps": 1000,
+  "noise_process": "flow",
+  "prediction_type": "velocity",
+  "model_config": {
+    "patch_size": [1,2,2], "in_channels": 2, "out_channels": 2,
+    "concat_condition": true, "hidden_size": 24, "heads_num": 2,
+    "mlp_width_ratio": 2, "mm_double_blocks_depth": 1,
+    "mm_single_blocks_depth": 1, "rope_dim_list": [4,4,4],
+    "text_projection": "linear", "text_states_dim": 8,
+    "text_states_dim_2": 8, "attn_mode": "torch",
+    "vision_projection": "none", "glyph_byT5_v2": false
+  }
+}

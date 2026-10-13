@@ -24,6 +24,15 @@ import torch
 from torch import nn
 
 
+def _preserve_partition_metadata(original, replacement):
+    """Storage replacement must not erase canonical PP/TP buffer ownership."""
+    for name in ("_worlddistill_name", "_worlddistill_pp_owner", "_worlddistill_partition"):
+        if hasattr(original, name):
+            value = getattr(original, name)
+            setattr(replacement, name, dict(value) if isinstance(value, dict) else value)
+    return replacement
+
+
 @dataclass
 class TeacherParameterLease:
     """Track allocator-safe weight release and completion of host writeback."""
@@ -164,7 +173,7 @@ class TeacherParameterOffloader:
             else:
                 parent_name, _, local_name = name.rpartition(".")
                 parent = self.model.get_submodule(parent_name) if parent_name else self.model
-                parent._buffers[local_name] = value
+                parent._buffers[local_name] = _preserve_partition_metadata(original, value)
 
     def _host_buffer(self, name, value):
         # Cache buffers may be allocated lazily or resized by a model's forward.
@@ -175,7 +184,8 @@ class TeacherParameterOffloader:
             host = host.pin_memory()
         parent_name, _, local_name = name.rpartition(".")
         parent = self.model.get_submodule(parent_name) if parent_name else self.model
-        parent._buffers[local_name] = host
+        original = parent._buffers.get(local_name)
+        parent._buffers[local_name] = _preserve_partition_metadata(original, host)
         return host
 
     def synchronize(self) -> None:

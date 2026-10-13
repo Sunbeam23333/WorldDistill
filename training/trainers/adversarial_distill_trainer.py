@@ -389,6 +389,7 @@ class AdversarialDistillTrainer(AuxiliaryTrainingMixin, BaseDistillTrainer):
             _discriminator_state,
             f"Write discriminator checkpoint {disc_path}",
         )
+        self._publish_elastic_checkpoint(step, output_dir)
 
     def load_checkpoint(self, path: str):
         """Load checkpoint including discriminator."""

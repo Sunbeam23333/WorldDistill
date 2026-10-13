@@ -214,11 +214,38 @@ def _build_dataset(
     raise ValueError(f"Unsupported data_mode: {data_mode}")
 
 
-def _data_parallel_coordinates(rank: int, world_size: int, sp_size: int) -> tuple[int, int]:
-    """Contiguous context ranks consume the same samples, not disjoint data."""
-    if sp_size < 1 or world_size < 1 or world_size % sp_size or not 0 <= rank < world_size:
-        raise ValueError("sp_size must divide world_size and rank must identify an allocated worker")
-    return rank // sp_size, world_size // sp_size
+def _data_parallel_coordinates(rank: int, world_size: int, sp_size: int,
+                               tp_size: int = 1, pp_size: int = 1) -> tuple[int, int]:
+    """All ranks cooperating on one model consume the same data replica."""
+    model_size = sp_size * tp_size * pp_size
+    if (any(type(size) is not int or size < 1 for size in (sp_size, tp_size, pp_size))
+            or world_size < 1 or world_size % model_size or not 0 <= rank < world_size):
+        raise ValueError("sp_size * tp_size * pp_size must divide world_size and rank must identify an allocated worker")
+    return rank // model_size, world_size // model_size
+
+
+def _resolve_elastic_auto_resume(args):
+    if not args.elastic_auto_resume:
+        return
+    from training.utils.elastic import latest_elastic_checkpoint
+    import torch.distributed as dist
+
+    status = [None, None]
+    if not dist.is_initialized() or dist.get_rank() == 0:
+        try:
+            status[0] = latest_elastic_checkpoint(args.output_dir)
+            if not status[0] and not args.resume_from and int(os.environ.get("TORCHELASTIC_RESTART_COUNT", "0")) > 0:
+                raise ValueError("Elastic restart found no fully published checkpoint; supply resume_from or restart explicitly")
+        except Exception as error:
+            status[1] = f"{type(error).__name__}: {error}"
+    if dist.is_initialized():
+        dist.broadcast_object_list(status, src=0)
+    if status[1]:
+        raise RuntimeError(f"Elastic checkpoint discovery failed: {status[1]}")
+    # A new generation uses the newest completed state; an explicit initial
+    # resume still wins before torchrun has restarted this job.
+    if status[0] and (not args.resume_from or int(os.environ.get("TORCHELASTIC_RESTART_COUNT", "0")) > 0):
+        args.resume_from = status[0]
 
 
 def _build_training_optimizer(model, args):
@@ -267,7 +294,14 @@ def main():
     args = parse_training_args()
     validate_runtime_dependency_versions(strict=getattr(args, "strict_env_check", True),
                                          required_transformers_version=args.required_transformers_version)
+    if args.elastic_resume:
+        os.environ["WORLD_DISTILL_ELASTIC_RESUME"] = "1"
+        os.environ["WORLD_DISTILL_FIXED_WORLD_SIZE"] = "0"
+        os.environ.setdefault("WORLD_DISTILL_MIN_NODES", "1")
+        local_workers = max(1, int(os.environ.get("LOCAL_WORLD_SIZE", "1")))
+        os.environ.setdefault("WORLD_DISTILL_MAX_NODES", str(max(1, int(os.environ.get("WORLD_SIZE", "1")) // local_workers)))
     rank, world_size = setup_distributed()
+    _resolve_elastic_auto_resume(args)
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
     device = torch.device(f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu")
     from training.utils.precision import resolve_training_precision
@@ -298,7 +332,8 @@ def main():
         Path(args.output_dir, "precision_preflight.json").write_text(json.dumps(precision_report, indent=2) + "\n")
 
     # --- Build Dataset & DataLoader ---
-    data_rank, data_world_size = _data_parallel_coordinates(rank, world_size, args.sp_size)
+    data_rank, data_world_size = _data_parallel_coordinates(
+        rank, world_size, args.sp_size, args.tp_size, args.pp_size)
     train_data_mode = _resolve_data_mode(args.data_json, args.data_mode)
     dataset = _build_dataset(
         data_json=args.data_json,
@@ -309,7 +344,16 @@ def main():
         num_frames=args.num_frames,
     )
 
-    if args.use_bucket_sampler:
+    if args.elastic_resume:
+        from training.utils.elastic import ElasticBatchSampler
+        base_sampler = (BucketSampler(dataset, batch_size=args.batch_size, shuffle=True,
+            drop_last=True, seed=args.seed, rank=0, world_size=1) if args.use_bucket_sampler else None)
+        sampler = ElasticBatchSampler(dataset, batch_size=args.batch_size, rank=data_rank,
+            world_size=data_world_size, seed=args.seed, shuffle=True, drop_last=True,
+            bucket_sampler=base_sampler)
+        dataloader = torch.utils.data.DataLoader(dataset, batch_sampler=sampler,
+            num_workers=args.num_workers, pin_memory=True)
+    elif args.use_bucket_sampler:
         sampler = BucketSampler(
             dataset, batch_size=args.batch_size, shuffle=True,
             drop_last=_bucket_sampler_drop_last(data_world_size),
@@ -368,8 +412,9 @@ def main():
         args.config_json,
         device,
         teacher_dtype,
-        student_device=torch.device("cpu") if world_size > 1 and args.parallel_mode in {"fsdp", "deepspeed"} else device,
-        teacher_device=torch.device("cpu") if args.runtime_teacher_offload != "none" else device,
+        student_device=torch.device("cpu") if args.tp_size * args.pp_size > 1 or
+            (world_size > 1 and args.parallel_mode in {"fsdp", "deepspeed"}) else device,
+        teacher_device=torch.device("cpu") if args.runtime_teacher_offload != "none" or args.tp_size * args.pp_size > 1 else device,
         allow_native_code=args.allow_native_model_code,
     )
     _resolve_native_dual_args(args, student_model)

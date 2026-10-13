@@ -17,15 +17,15 @@ Use the training guide for objective-specific input contracts.
 | Wan 2.1 distilled | T2V, I2V as catalogued | Integrated inference variants | Compatible Diffusers checkpoints use the matching training objective |
 | Wan 2.1 MeanFlow | T2V as catalogued | Integrated inference variant | Teacher-guided `mean_flow_distill`; explicit dual-time conditioning |
 | Wan Self-Forcing | T2V as catalogued | Integrated inference variant | No dedicated native Self-Forcing training integration; Stream requires a causal/per-frame adapter |
-| Wan 2.1 VACE | VACE | Integrated | Not integrated |
+| Wan 2.1 VACE | VACE | Integrated | Exact Diffusers VACE control adapter |
 | Wan 2.2 MoE / distilled | T2V, I2V, selected FLF2V configs | Integrated | Diffusers adapter |
-| Wan 2.2 VACE / Animate | VACE, Animate | Integrated | Not integrated |
+| Wan 2.2 VACE / Animate | VACE, Animate | Integrated | VACE context/scales and Animate reference/pose/face adapters |
 | Wan 2.2 Audio | S2V | Integrated; internal LoRA defaults removed; CLI contract-tested | Not integrated |
 | SekoTalk | S2V; stateful RS2V | Integrated; RS2V uses the shot wrapper and overlap-latent path | Not integrated |
 | HunyuanVideo 1.5 | T2V, I2V | Integrated | Diffusers adapter |
 | HunyuanVideo 1.5 distilled | T2V | Integrated; no distilled I2V default is advertised | Diffusers adapter |
 | LTX-Video 2 | T2V, I2V, T2AV, I2AV | Integrated | `joint_av_distill`; native two-stream LTX2 adapter |
-| SkyReels-V2 | T2V, I2V | Stub runner | Stream trainer is generic, not a SkyReels adapter |
+| SkyReels-V2 | T2V, I2V | Stub LightX2V runner | Exact Diffusers adapter; framewise diffusion forcing and FPS |
 
 ## Image inference
 
@@ -40,9 +40,9 @@ Use the training guide for objective-specific input contracts.
 
 | Catalog family | Tasks | Runner/config | Unified training |
 |---|---|---|---|
-| HY-WorldPlay distilled / AR / BI | I2V, Game; selected T2V metadata | Runner/config integrated; external licensed pose provider required; game CLI contract-tested | Generic Context Forcing via author-supplied native adapter; no bundled native WorldPlay training adapter |
-| Matrix-Game 2.0 | Game | Integrated; game routing/CLI contract | Not integrated |
-| LingBot-CAM | Camera-controlled I2V | Integrated; external checkpoint mapping | Not integrated |
+| HY-WorldPlay distilled / AR / BI | I2V, Game; selected T2V metadata | Runner/config integrated; external licensed pose provider required; game CLI contract-tested | Explicit bridge to the separately installed official training class; licensed source, distributed runtime and native shape restrictions apply |
+| Matrix-Game 2.0 | Game | Integrated; game routing/CLI contract | Built-in author causal/foundation architectures, pixel-rate controls, strict checkpoint loading and PP |
+| LingBot-CAM | Camera-controlled I2V | Integrated; external checkpoint mapping | Built-in author camera architecture, relative camera/ray features and PP |
 | GameFactory, GameCraft, Infinite-World, Genie, GameGen-X, V-Mem, SPMem, CAM, Mirage | Catalogued tasks | Stub/interface only | Not integrated |
 
 ## Checkpoint availability
@@ -55,7 +55,22 @@ separate facts.
 
 ## Native differentiable model adapter
 
-A local `worlddistill_model.json` descriptor names an installed `module:factory`, constructor arguments, canonical-to-native `input_map`, required conditions, latent layout, and noise process. Weights use an in-directory safetensors file and strict key loading. Author-supplied architectures run with `--allow_native_model_code`; no catalog name substitutes for a real model implementation. Actions and camera poses are frame-aligned and passed to explicit native forward arguments. Export preserves this descriptor and the trained weights.
+A local `worlddistill_model.json` can select the concrete `matrix_game2`,
+`lingbot_cam`, or externally installed `hy_worldplay` architecture. The Matrix
+and LingBot implementations retain their original licenses and pinned source
+revisions. See [native setup and descriptors](native-world-models.md).
+
+External custom models may instead name an installed `module:factory`,
+constructor arguments, canonical-to-native `input_map`, required conditions,
+latent layout, and noise process. Installed external code requires
+`--allow_native_model_code`. Safetensors loading is strict; export preserves
+the descriptor and trained weights. Pixel-rate actions and latent-rate camera
+features have distinct temporal contracts, not a shared guessed layout.
+
+[Parallel and elastic training](parallel-elastic-native.md) documents the
+audited Wan TP/PP plans, native PP plans, explicit custom plans and portable
+training state. New Diffusers control adapters use the exact public model
+classes and consume checkpoint-compatible encoded features.
 
 ## Adding or upgrading an integration
 

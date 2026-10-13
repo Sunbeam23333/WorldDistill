@@ -11,21 +11,21 @@ import torch.distributed as dist
 
 
 @torch.no_grad()
-def broadcast_replicated_model(model, src=0):
+def broadcast_replicated_model(model, src=0, group=None):
     if not dist.is_initialized():
         return
     for tensor in list(model.parameters()) + list(model.buffers()):
-        dist.broadcast(tensor, src=src)
+        dist.broadcast(tensor, src=src, group=group)
 
 
 @torch.no_grad()
-def synchronize_replicated_gradients(model, bucket_bytes=25 * 1024 * 1024):
+def synchronize_replicated_gradients(model, bucket_bytes=25 * 1024 * 1024, group=None):
     """Average local gradients, including locally absent but globally used ones.
 
     Call before GradScaler.unscale_: all ranks must see the same scaled Inf/NaN
     values before deciding whether to skip the optimizer step.
     """
-    if not dist.is_initialized() or dist.get_world_size() == 1:
+    if not dist.is_initialized() or dist.get_world_size(group) == 1:
         return
     parameters = [parameter for parameter in model.parameters() if parameter.requires_grad]
     if not parameters:
@@ -34,20 +34,20 @@ def synchronize_replicated_gradients(model, bucket_bytes=25 * 1024 * 1024):
         raise ValueError("bucket_bytes must be positive")
     has_sparse = torch.tensor(int(any(p.grad is not None and p.grad.is_sparse for p in parameters)),
                               dtype=torch.int32, device=parameters[0].device)
-    dist.all_reduce(has_sparse, op=dist.ReduceOp.MAX)
+    dist.all_reduce(has_sparse, op=dist.ReduceOp.MAX, group=group)
     if has_sparse.item():
         raise ValueError("Replicated routed-gradient synchronization requires dense gradients on every rank")
     usage = torch.tensor([int(p.grad is not None) for p in parameters],
                          dtype=torch.int32, device=parameters[0].device)
-    dist.all_reduce(usage, op=dist.ReduceOp.MAX)
-    world_size = dist.get_world_size()
+    dist.all_reduce(usage, op=dist.ReduceOp.MAX, group=group)
+    world_size = dist.get_world_size(group)
     bucket, size, signature = [], 0, None
 
     def flush():
         if not bucket:
             return
         packed = torch.cat([gradient.reshape(-1) for gradient in bucket])
-        dist.all_reduce(packed)
+        dist.all_reduce(packed, group=group)
         packed.div_(world_size)
         offset = 0
         for gradient in bucket:
@@ -74,7 +74,7 @@ def synchronize_replicated_gradients(model, bucket_bytes=25 * 1024 * 1024):
             elements = max(1, bucket_bytes // gradient.element_size())
             for offset in range(0, flattened.numel(), elements):
                 shard = flattened[offset:offset + elements]
-                dist.all_reduce(shard)
+                dist.all_reduce(shard, group=group)
                 shard.div_(world_size)
             gradient.copy_(flattened.reshape(gradient.shape))
         else:

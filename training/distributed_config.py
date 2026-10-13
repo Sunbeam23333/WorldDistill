@@ -1,4 +1,4 @@
-"""Fixed-size torchrun environment contract (stdlib-only, no model imports)."""
+"""Fixed and explicitly enabled elastic torchrun environment contracts."""
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
@@ -53,14 +53,22 @@ def rank_environment(env: Mapping[str, str] | None = None) -> RankEnvironment | 
     local_world = _integer(env, "LOCAL_WORLD_SIZE", 1 if world == 1 else None, minimum=1)
     if rank >= world or local_rank >= local_world or world % local_world:
         raise ValueError("Inconsistent RANK/WORLD_SIZE/LOCAL_RANK/LOCAL_WORLD_SIZE")
+    elastic = env.get("WORLD_DISTILL_ELASTIC_RESUME", "0") == "1"
     for key, actual in (("WORLD_DISTILL_EXPECTED_WORLD_SIZE", world),
                         ("WORLD_DISTILL_EXPECTED_LOCAL_WORLD_SIZE", local_world),
                         ("GROUP_WORLD_SIZE", world // local_world)):
         if key in env and _integer(env, key, minimum=1) != actual:
-            raise ValueError(f"{key} disagrees with the fixed-size worker topology; elastic world-size changes are unsupported")
-    if env.get("WORLD_DISTILL_FIXED_WORLD_SIZE", "1") != "1":
-        raise ValueError("Elastic world-size changes are unsupported")
-    if _integer(env, "TORCHELASTIC_RESTART_COUNT", 0) and "WORLD_DISTILL_EXPECTED_WORLD_SIZE" not in env:
+            raise ValueError(f"{key} disagrees with the current worker topology")
+    if elastic:
+        if env.get("WORLD_DISTILL_FIXED_WORLD_SIZE") != "0" or "WORLD_DISTILL_EXPECTED_WORLD_SIZE" in env:
+            raise ValueError("Elastic workers require FIXED_WORLD_SIZE=0 and no fixed expected global world size")
+        minimum = _integer(env, "WORLD_DISTILL_MIN_NODES", minimum=1)
+        maximum = _integer(env, "WORLD_DISTILL_MAX_NODES", minimum=1)
+        if not minimum <= world // local_world <= maximum:
+            raise ValueError("Current node count is outside the elastic MIN:MAX range")
+    elif env.get("WORLD_DISTILL_FIXED_WORLD_SIZE", "1") != "1":
+        raise ValueError("Elastic world-size changes require explicit WORLD_DISTILL_ELASTIC_RESUME=1")
+    if not elastic and _integer(env, "TORCHELASTIC_RESTART_COUNT", 0) and "WORLD_DISTILL_EXPECTED_WORLD_SIZE" not in env:
         raise ValueError("Restarted torchrun requires WORLD_DISTILL_EXPECTED_WORLD_SIZE to reject world-size changes")
     if "GROUP_RANK" in env:
         node_rank = _integer(env, "GROUP_RANK")

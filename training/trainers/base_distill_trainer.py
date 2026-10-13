@@ -244,8 +244,10 @@ class BaseDistillTrainer(ABC):
             self.is_distributed and self.parallel_mode == "ddp"
             and getattr(self.student_model, "requires_unused_parameter_detection", False)
         )
-        if self._manual_replicated_sync:
+        if self._manual_replicated_sync and getattr(args, "tp_size", 1) * getattr(args, "pp_size", 1) == 1:
             # Initialize all future EMA copies from the same expert weights.
+            # CPU-staged MP models are broadcast by their initializer, one
+            # tensor at a time on the NCCL device, before rebuilding local EMA.
             broadcast_replicated_model(self.student_model)
 
         # Sequence Parallelism
@@ -253,6 +255,8 @@ class BaseDistillTrainer(ABC):
         self.sp_group = None
         self._managed_context_parallel = False
         self._context_parallel_initialized = False
+        self.model_parallel = None
+        self._model_parallel_initialized = False
         if self.sp_size > 1:
             unsupported_roles = [
                 role
@@ -386,6 +390,9 @@ class BaseDistillTrainer(ABC):
         self._context_parallel_initialized = True
 
     def _prepare_sequence_parallel_batch(self, batch):
+        if getattr(self, "model_parallel", None) is not None:
+            from training.parallel.trainer import synchronize_model_parallel_batch
+            batch = synchronize_model_parallel_batch(self, batch)
         if self.sp_group is None:
             return batch
         if getattr(self, "_managed_context_parallel", False):
@@ -479,6 +486,7 @@ class BaseDistillTrainer(ABC):
             result = action()
         except Exception as exc:
             local_error = self._format_checkpoint_error(description, exc, rank=rank)
+            logger.error(local_error)
 
         errors = [local_error]
         if self._checkpoint_distributed():
@@ -525,7 +533,10 @@ class BaseDistillTrainer(ABC):
     ) -> Any:
         """Preflight a checkpoint on rank zero, then load it strictly everywhere."""
 
-        location = self.device if map_location is None else map_location
+        # Canonical MP snapshots contain the whole model and Adam/EMA state.
+        # Keep them on the host; only the receiving local slices move to CUDA.
+        default_location = "cpu" if getattr(self, "model_parallel", None) is not None else self.device
+        location = default_location if map_location is None else map_location
 
         def _load() -> Any:
             if not os.path.isfile(path):
@@ -576,15 +587,30 @@ class BaseDistillTrainer(ABC):
             "batches_in_epoch": int(getattr(self, "_batches_in_epoch", 0)),
             "rng": self._capture_rng_state(),
         }
+        if getattr(self.args, "elastic_resume", False):
+            from training.utils.elastic import ElasticBatchSampler
+            sampler = getattr(self.train_dataloader, "batch_sampler", None)
+            if not isinstance(sampler, ElasticBatchSampler):
+                raise ValueError("elastic_resume requires ElasticBatchSampler and its committed global cursor")
+            local_state["elastic_sampler"] = sampler.state_dict()
         rank_states = [local_state]
         if self._checkpoint_distributed():
             rank_states = [None for _ in range(dist.get_world_size())]
             dist.all_gather_object(rank_states, local_state)
-        return {
+        result = {
             "schema_version": 1,
             "world_size": len(rank_states),
             "rank_states": rank_states,
         }
+        if getattr(self.args, "elastic_resume", False):
+            if any(row["elastic_sampler"] != local_state["elastic_sampler"] for row in rank_states):
+                raise ValueError("Elastic global data cursor/manifest differs across worker ranks")
+            result["elastic"] = {
+                "sampler": sampler.state_dict(),
+                "parallel_degrees": {name: int(getattr(self.args, name, 1)) for name in ("sp_size", "tp_size", "pp_size")},
+                "generation": int(getattr(self, "_elastic_generation", 0)),
+            }
+        return result
 
     def _restore_rng_state(self, state: Dict[str, Any]) -> None:
         required = {"python", "numpy", "torch_cpu"}
@@ -619,6 +645,43 @@ class BaseDistillTrainer(ABC):
         )
         current_rank = self._checkpoint_rank()
         saved_world_size = int(resume_state.get("world_size", -1))
+        if type(resume_state.get("world_size")) is not int or saved_world_size < 1:
+            raise ValueError("Checkpoint resume_state world_size must be positive")
+        rows = resume_state.get("rank_states")
+        if (not isinstance(rows, list) or len(rows) != saved_world_size
+                or any(not isinstance(row, dict) or row.get("rank") != rank for rank, row in enumerate(rows))):
+            raise ValueError("Checkpoint resume_state has malformed or missing rank states")
+        elastic = resume_state.get("elastic")
+        if getattr(self.args, "elastic_resume", False):
+            from training.utils.elastic import ElasticBatchSampler, elastic_seed
+            if not isinstance(elastic, dict):
+                raise ValueError("Elastic restore requires a checkpoint saved with elastic_resume enabled")
+            degrees = {name: int(getattr(self.args, name, 1)) for name in ("sp_size", "tp_size", "pp_size")}
+            if elastic.get("parallel_degrees") != degrees:
+                raise ValueError("Elastic restore may change the DP degree, not SP/TP/PP degrees")
+            sampler = getattr(self.train_dataloader, "batch_sampler", None)
+            if not isinstance(sampler, ElasticBatchSampler):
+                raise ValueError("Elastic restore requires ElasticBatchSampler")
+            sampler.load_state_dict(elastic["sampler"])
+            if sampler.epoch != self.epoch:
+                raise ValueError("Elastic sampler epoch disagrees with trainer checkpoint")
+            if type(elastic.get("generation")) is not int or elastic["generation"] < 0:
+                raise ValueError("Invalid elastic RNG generation")
+            self._elastic_generation = elastic["generation"]
+            if saved_world_size != current_world_size:
+                self._elastic_generation += 1
+                seed = elastic_seed(int(getattr(self.args, "seed", 42)), self.global_step,
+                                    sampler.rank, self._elastic_generation)
+                random.seed(seed)
+                np.random.seed(seed)
+                torch.manual_seed(seed)
+                if self.device.type == "cuda":
+                    torch.cuda.manual_seed(seed)
+                self._pending_rng_state = self._capture_rng_state()
+                self._batches_in_epoch = 0
+                logger.info("Elastic DP resize {} -> {}: restored global batch cursor {}; RNG generation {} (new stochastic trajectory)",
+                            saved_world_size, current_world_size, sampler.global_cursor, self._elastic_generation)
+                return
         if saved_world_size != current_world_size:
             raise ValueError(
                 "Exact resume requires the same world size: "
@@ -707,6 +770,8 @@ class BaseDistillTrainer(ABC):
             self._tracker.log_config(vars(self.args))
 
         self._initialize_context_parallel()
+        from training.parallel.trainer import initialize_model_parallel
+        initialize_model_parallel(self)
 
         # ---- Wrap model with chosen parallel strategy ----
         if self.parallel_mode == "deepspeed":
@@ -829,6 +894,8 @@ class BaseDistillTrainer(ABC):
             max_grad_norm=self.args.max_grad_norm,
             cpu_offload=self.args.cpu_offload,
         )
+        from training.utils.elastic_deepspeed import configure_elastic_deepspeed
+        configure_elastic_deepspeed(ds_config, enabled=getattr(self.args, "elastic_resume", False))
 
         self.student_model, self.optimizer, self.lr_scheduler = init_deepspeed(
             model=self.student_model,
@@ -939,6 +1006,8 @@ class BaseDistillTrainer(ABC):
             self._data_iter = iter(self.train_dataloader)
             batch = next(self._data_iter)
             self._batches_in_epoch = 1
+        if getattr(self.args, "elastic_resume", False):
+            self.train_dataloader.batch_sampler.commit_batch()
         return batch
 
     def _initialize_data_iterator(self, *, resuming: bool) -> None:
@@ -952,7 +1021,7 @@ class BaseDistillTrainer(ABC):
                 sampler.set_epoch(self.epoch)
 
         self._data_iter = iter(self.train_dataloader)
-        if resuming:
+        if resuming and not getattr(self.args, "elastic_resume", False):
             for consumed in range(self._batches_in_epoch):
                 try:
                     next(self._data_iter)
@@ -1003,7 +1072,8 @@ class BaseDistillTrainer(ABC):
             total_loss += loss.item()
 
         if self._manual_replicated_sync:
-            synchronize_replicated_gradients(self.student_model)
+            synchronize_replicated_gradients(self.student_model,
+                group=self.model_parallel.dp_group if self.model_parallel is not None else None)
 
         # FP16 must always complete an unscale/inf-check cycle, even when
         # clipping is disabled. Disabled scalers do not need this call.
@@ -1011,7 +1081,10 @@ class BaseDistillTrainer(ABC):
             self.scaler.unscale_(self.optimizer)
 
         # Gradient clipping
-        if self.args.max_grad_norm > 0:
+        if self.model_parallel is not None:
+            from training.parallel.trainer import model_parallel_grad_norm
+            grad_norm = model_parallel_grad_norm(self, self.args.max_grad_norm if self.args.max_grad_norm > 0 else float("inf"))
+        elif self.args.max_grad_norm > 0:
             if self._is_fsdp_wrapped(self.student_model):
                 # FSDP requires using its own clip_grad_norm_
                 grad_norm = self.student_model.clip_grad_norm_(self.args.max_grad_norm)
@@ -1113,7 +1186,8 @@ class BaseDistillTrainer(ABC):
         effective_batch_size = (
             self._infer_batch_size(batch)
             * self.args.gradient_accumulation_steps
-            * (self.world_size // getattr(self.args, "sp_size", 1))
+            * (self.world_size // (getattr(self.args, "sp_size", 1) *
+                getattr(self.args, "tp_size", 1) * getattr(self.args, "pp_size", 1)))
         )
         self._optimizer_skipped_steps += int(enriched.get("optimizer_skipped", 0.0))
 
@@ -1206,7 +1280,11 @@ class BaseDistillTrainer(ABC):
                     "encoder_hidden_states_image", "image_cond", "camera_poses", "actions",
                     "guidance", "timestep_r", "image_rotary_emb", "rope_interpolation_scale",
                     "audio_hidden_states", "audio_timestep", "audio_encoder_hidden_states",
-                    "audio_encoder_attention_mask"):
+                    "audio_encoder_attention_mask", "vace_context", "vace_scale",
+                    "pose_latents", "face_pixels", "fps_condition", "camera_intrinsics",
+                    "mouse_actions", "keyboard_actions", "camera_features",
+                    "worldplay_actions", "camera_view_matrices", "camera_intrinsics_normalized",
+                    "byt5_text_states", "byt5_text_mask"):
             if key in batch and batch[key] is not None:
                 input_kwargs[key] = batch[key]
         return input_kwargs
@@ -1224,7 +1302,8 @@ class BaseDistillTrainer(ABC):
         wrong video frames.
         """
 
-        selected = dict(batch)
+        from training.native_adapters.temporal_conditions import slice_native_temporal_conditions
+        selected = slice_native_temporal_conditions(batch, frame_indices, total_frames)
         image_cond = batch.get("image_cond")
         if isinstance(image_cond, torch.Tensor):
             if image_cond.ndim != 5 or image_cond.shape[2] != total_frames:
@@ -1237,6 +1316,9 @@ class BaseDistillTrainer(ABC):
                 2, frame_indices.to(device=image_cond.device, dtype=torch.long)
             )
         for key in ("camera_poses", "actions"):
+            if key == "camera_poses" and batch.get("camera_intrinsics") is not None:
+                # Native camera helper owns this explicit B,T,4,4 layout.
+                continue
             value = batch.get(key)
             if not isinstance(value, torch.Tensor) or value.ndim < 2:
                 continue
@@ -1559,10 +1641,21 @@ class BaseDistillTrainer(ABC):
             lambda: os.makedirs(ckpt_dir, exist_ok=True),
             f"Create checkpoint directory {ckpt_dir}",
         )
+        if getattr(self.args, "elastic_resume", False):
+            def _invalidate_completion():
+                marker = os.path.join(ckpt_dir, "elastic_complete.json")
+                if os.path.exists(marker):
+                    os.remove(marker)
+            self._run_rank0_or_raise(_invalidate_completion, "Begin elastic checkpoint transaction")
         if self.runtime is not None:
             self.runtime.synchronize_teacher()
         if isinstance(self.ema, ShardedEMA):
             self._run_all_ranks_or_raise(lambda: self.ema.save(ckpt_dir), "Save rank-local EMA shards")
+            if getattr(self.args, "elastic_resume", False):
+                portable_ema = self._run_all_ranks_or_raise(
+                    lambda: self.ema.portable_state_dict(self.student_model), "Collect portable EMA")
+                self._atomic_save_rank0(os.path.join(ckpt_dir, "ema_portable.pt"), lambda: portable_ema,
+                                        "Save portable EMA")
 
         if self._deepspeed_engine is not None:
             self._save_checkpoint_deepspeed(step, ckpt_dir)
@@ -1573,6 +1666,15 @@ class BaseDistillTrainer(ABC):
 
         if self._checkpoint_distributed():
             dist.barrier()
+        if type(self).save_checkpoint is BaseDistillTrainer.save_checkpoint:
+            self._publish_elastic_checkpoint(step, output_dir)
+
+    def _publish_elastic_checkpoint(self, step: int, output_dir: str) -> None:
+        if getattr(self.args, "elastic_resume", False):
+            from training.utils.elastic import publish_elastic_checkpoint
+            self._run_rank0_or_raise(
+                lambda: publish_elastic_checkpoint(os.path.join(output_dir, f"checkpoint-{step}"), step),
+                "Publish complete elastic checkpoint")
 
     def _save_checkpoint_deepspeed(self, step: int, ckpt_dir: str) -> None:
         """Save a DeepSpeed checkpoint collectively with strict client state."""
@@ -1603,6 +1705,14 @@ class BaseDistillTrainer(ABC):
             return result
 
         self._run_all_ranks_or_raise(_save, f"Save DeepSpeed checkpoint {ckpt_dir}")
+        if getattr(self.args, "elastic_resume", False):
+            from training.utils.elastic_deepspeed import convert_deepspeed_checkpoint, capture_deepspeed_supplement
+            supplement = self._run_all_ranks_or_raise(lambda: capture_deepspeed_supplement(self._deepspeed_engine),
+                                                     "Capture portable ZeRO optimizer groups and frozen state")
+            self._atomic_save_rank0(os.path.join(ckpt_dir, "deepspeed_portable.pt"), lambda: supplement,
+                                    "Save portable ZeRO supplemental state")
+            self._run_rank0_or_raise(lambda: convert_deepspeed_checkpoint(ckpt_dir, f"step-{step}"),
+                                     "Convert full DeepSpeed optimizer/model Universal Checkpoint")
         if self._checkpoint_is_main_process():
             logger.info(f"DeepSpeed checkpoint saved to {ckpt_dir}")
 
@@ -1679,7 +1789,11 @@ class BaseDistillTrainer(ABC):
                 get_state_dict,
             )
 
-            options = StateDictOptions(full_state_dict=True, cpu_offload=True)
+            # CPU FSDP diagnostic runs already own host tensors. Asking FSDP
+            # to CPU-offload them can reuse temporary collective storage for
+            # distinct Adam moments on some PyTorch versions.
+            cpu_offload = not (getattr(self.args, "elastic_resume", False) and self.device.type == "cpu")
+            options = StateDictOptions(full_state_dict=True, cpu_offload=cpu_offload)
             return get_state_dict(self.student_model, self.optimizer, options=options)
 
         model_state, optimizer_state = self._run_all_ranks_or_raise(
@@ -1708,6 +1822,13 @@ class BaseDistillTrainer(ABC):
 
     def _save_checkpoint_ddp(self, step: int, ckpt_dir: str):
         """Standard DDP checkpoint save."""
+        if getattr(self, "model_parallel", None) is not None:
+            from training.parallel.checkpoint import collect_model_parallel_checkpoint
+            state = self._run_all_ranks_or_raise(lambda: collect_model_parallel_checkpoint(self, step),
+                                                  "Collect canonical TP/PP checkpoint")
+            self._atomic_save_rank0(os.path.join(ckpt_dir, "trainer_state.pt"), lambda: state,
+                                   "Write canonical TP/PP checkpoint")
+            return
         checkpoint_path = os.path.join(ckpt_dir, "trainer_state.pt")
         resume_state = self._collect_resume_state()
 
@@ -1762,10 +1883,20 @@ class BaseDistillTrainer(ABC):
     def _restore_sharded_ema(self, path: str) -> None:
         if isinstance(self.ema, ShardedEMA):
             directory = path if os.path.isdir(path) else os.path.dirname(path)
+            if getattr(self.args, "elastic_resume", False):
+                state = self._load_checkpoint_file_all_ranks(
+                    os.path.join(directory, "ema_portable.pt"), description="Load portable EMA", map_location="cpu", weights_only=True)
+                self._run_all_ranks_or_raise(lambda: self.ema.load_portable_state_dict(self.student_model, state),
+                                             "Reshard portable EMA")
+                return
             self._run_all_ranks_or_raise(lambda: self.ema.load(directory), "Restore rank-local EMA shards")
 
     def _restore_standard_checkpoint_state(self, state: dict[str, Any]) -> None:
         """Strictly restore a replicated model checkpoint on the local rank."""
+        if getattr(self, "model_parallel", None) is not None:
+            from training.parallel.checkpoint import restore_model_parallel_checkpoint
+            restore_model_parallel_checkpoint(self, state)
+            return
 
         self._validate_standard_checkpoint_state(state)
         self._unwrap_model(self.student_model).load_state_dict(state["student_model"], strict=True)
@@ -1783,7 +1914,14 @@ class BaseDistillTrainer(ABC):
         """Collectively restore DeepSpeed state and validate client metadata."""
 
         def _load_and_restore() -> str:
-            load_path, client_state = self._deepspeed_engine.load_checkpoint(path)
+            if getattr(self.args, "elastic_resume", False):
+                if not self._deepspeed_engine.load_universal_checkpoint():
+                    raise ValueError("Elastic DeepSpeed restore requires the Universal Checkpoint loader")
+                from training.utils.elastic_deepspeed import deepspeed_universal_load_context
+                with deepspeed_universal_load_context(self._deepspeed_engine):
+                    load_path, client_state = self._deepspeed_engine.load_checkpoint(path, tag="universal")
+            else:
+                load_path, client_state = self._deepspeed_engine.load_checkpoint(path)
             if load_path is None:
                 raise FileNotFoundError(f"DeepSpeed could not load a checkpoint from {path}")
             if not isinstance(client_state, dict):
@@ -1801,7 +1939,11 @@ class BaseDistillTrainer(ABC):
             self.epoch = client_state["epoch"]
             self.best_loss = client_state["best_loss"]
             self._restore_resume_state(client_state.get("resume_state"))
-            self._restore_deepspeed_amp_scaler_state(client_state.get("torch_amp_scaler_by_rank"))
+            amp_state = client_state.get("torch_amp_scaler_by_rank")
+            if getattr(self.args, "elastic_resume", False):
+                from training.utils.elastic_deepspeed import resize_amp_scaler_state
+                amp_state = resize_amp_scaler_state(amp_state, self.world_size)
+            self._restore_deepspeed_amp_scaler_state(amp_state)
             if self.ema is not None and not isinstance(self.ema, ShardedEMA):
                 self.ema.load_state_dict(client_state["ema"])
             return str(load_path)
@@ -1810,6 +1952,12 @@ class BaseDistillTrainer(ABC):
             _load_and_restore,
             f"Restore DeepSpeed checkpoint {path}",
         )
+        if getattr(self.args, "elastic_resume", False):
+            from training.utils.elastic_deepspeed import restore_deepspeed_supplement
+            supplement = self._load_checkpoint_file_all_ranks(os.path.join(path, "deepspeed_portable.pt"),
+                description="Read portable ZeRO supplemental state", map_location="cpu", weights_only=False)
+            self._run_all_ranks_or_raise(lambda: restore_deepspeed_supplement(self._deepspeed_engine, supplement),
+                                         "Restore ZeRO optimizer groups, steps, frozen parameters and buffers")
         if self._checkpoint_is_main_process():
             logger.info(f"DeepSpeed checkpoint resumed from {load_path}")
 
@@ -1843,6 +1991,16 @@ class BaseDistillTrainer(ABC):
 
         model_state = rank0_state["student_model"] if self._checkpoint_is_main_process() else {}
         optimizer_state = rank0_state["optimizer"] if self._checkpoint_is_main_process() else {}
+        elastic = getattr(self.args, "elastic_resume", False)
+        if elastic:
+            # Every current rank reads the canonical CPU state from shared
+            # storage; FSDP's public state-dict API shards it for the new mesh.
+            # This also supports NO_SHARD -> FULL_SHARD transitions at DP=1.
+            local_state = self._run_all_ranks_or_raise(
+                lambda: rank0_state if self._checkpoint_is_main_process()
+                else torch.load(ckpt_path, map_location="cpu", weights_only=False),
+                "Read canonical elastic FSDP state")
+            model_state, optimizer_state = local_state["student_model"], local_state["optimizer"]
 
         def _restore_distributed_state() -> None:
             from torch.distributed.checkpoint.state_dict import (
@@ -1852,7 +2010,7 @@ class BaseDistillTrainer(ABC):
 
             options = StateDictOptions(
                 full_state_dict=True,
-                broadcast_from_rank0=True,
+                broadcast_from_rank0=not elastic,
                 strict=True,
             )
             set_state_dict(
@@ -1905,6 +2063,9 @@ class BaseDistillTrainer(ABC):
 
     def _compute_grad_norm(self) -> torch.Tensor:
         """Compute the global L2 gradient norm for replicated or sharded params."""
+        if getattr(self, "model_parallel", None) is not None:
+            from training.parallel.trainer import model_parallel_grad_norm
+            return model_parallel_grad_norm(self)
         if self._is_fsdp_wrapped(self.student_model):
             # FSDP understands both shard and replica axes, unlike a WORLD sum
             # which would count hybrid replicas more than once.

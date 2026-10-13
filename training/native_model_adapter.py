@@ -131,6 +131,14 @@ def load_native_training_model(path, *, dtype=torch.float32, weights=True, allow
     config = json.loads((root / "worlddistill_model.json").read_text())
     if config.get("schema_version") != 1:
         raise ValueError("Native model descriptor requires schema_version=1")
+    if "architecture" in config:
+        if "factory" in config:
+            raise ValueError("Choose a built-in native architecture or an installed factory, not both")
+        if config["architecture"] == "hy_worldplay":
+            from training.native_adapters.worldplay import load_hy_worldplay
+            return load_hy_worldplay(root, config, dtype=dtype, weights=weights, allow_native_code=allow_native_code)
+        from training.native_adapters.world_models import load_builtin_world_model
+        return load_builtin_world_model(root, config, dtype=dtype, weights=weights)
     if not allow_native_code:
         raise ValueError("Native model factory executes installed Python code; set allow_native_model_code explicitly")
     factory = config.get("factory", "")
