@@ -51,6 +51,8 @@ DRY_RUN=0
 MIXED_PRECISION="auto"
 REQUIRED_TRANSFORMERS_VERSION="4.57.1"
 RESUME_FROM=""
+ELASTIC_RESUME=0
+ELASTIC_AUTO_RESUME=0
 NUM_STEPS=4
 BATCH_SIZE=1
 LR=1e-5
@@ -58,6 +60,8 @@ MAX_TRAIN_STEPS=10000
 SAVE_EVERY=1000
 PARALLEL_MODE="ddp"
 SP_SIZE=1
+TP_SIZE=1
+PP_SIZE=1
 DS_STAGE=2
 FSDP_STRATEGY="full"
 GRADIENT_CHECKPOINTING=""
@@ -151,6 +155,8 @@ while [[ $# -gt 0 ]]; do
         --mixed_precision) MIXED_PRECISION="$2"; shift 2 ;;
         --required_transformers_version) REQUIRED_TRANSFORMERS_VERSION="$2"; shift 2 ;;
         --resume_from) RESUME_FROM="$2"; shift 2 ;;
+        --elastic_resume) ELASTIC_RESUME=1; shift ;;
+        --elastic_auto_resume) ELASTIC_AUTO_RESUME=1; shift ;;
         --steps) NUM_STEPS="$2"; shift 2 ;;
         --batch_size) BATCH_SIZE="$2"; shift 2 ;;
         --lr) LR="$2"; shift 2 ;;
@@ -158,6 +164,8 @@ while [[ $# -gt 0 ]]; do
         --save_every) SAVE_EVERY="$2"; shift 2 ;;
         --parallel) PARALLEL_MODE="$2"; shift 2 ;;
         --sp_size) SP_SIZE="$2"; shift 2 ;;
+        --tp_size) TP_SIZE="$2"; shift 2 ;;
+        --pp_size) PP_SIZE="$2"; shift 2 ;;
         --ds_stage) DS_STAGE="$2"; shift 2 ;;
         --fsdp_strategy) FSDP_STRATEGY="$2"; shift 2 ;;
         --report_to) REPORT_TO="$2"; shift 2 ;;
@@ -215,7 +223,7 @@ while [[ $# -gt 0 ]]; do
             echo "  --output_dir          Output directory for checkpoints and logs"
             echo "  --config              Path to distill preset config"
             echo "  --gpus/--nproc_per_node Workers per node, identical on every node (default: 8)"
-            echo "  --nnodes              Fixed node count; elastic MIN:MAX is unsupported (default: 1)"
+            echo "  --nnodes              Fixed count, or MIN:MAX with --elastic_resume and c10d"
             echo "  --node_rank           Node index, required for manual multi-node launch"
             echo "  --launcher            manual | slurm (one torchrun agent per Slurm node)"
             echo "  --rdzv_backend        static | c10d (default: static)"
@@ -227,6 +235,8 @@ while [[ $# -gt 0 ]]; do
             echo "  --dist_backend        auto | nccl | gloo; Gloo is CPU-only validation"
             echo "  --max_restarts        Fixed-size torchrun worker retries (default: 0)"
             echo "  --resume_from         Explicit checkpoint used on start/restart; no automatic discovery"
+            echo "  --elastic_resume      Save portable states and resume with a changed DP world size"
+            echo "  --elastic_auto_resume Discover latest complete checkpoint in shared output_dir"
             echo "  --mixed_precision     auto | bf16 | fp16 | no (default: auto)"
             echo "  --required_transformers_version Version used by preflight AND training (default: 4.57.1)"
             echo "  --dry_run             Validate and print launch command without importing models or torch"
@@ -237,7 +247,8 @@ while [[ $# -gt 0 ]]; do
             echo "  --save_every          Save checkpoint every N steps (default: 1000)"
             echo "  --parallel            Parallel mode: ddp | fsdp | deepspeed (default: ddp)"
             echo "  --sp_size             Adapter-gated sequence parallel size (default: 1)"
-            echo "                        No generic TP/PP or stock-model SP implementation; uneven local workers are unsupported."
+            echo "  --tp_size/--pp_size   Model-specific tensor/pipeline parallel degrees (default: 1)"
+            echo "                        Parallel capabilities are validated for the selected model and method."
             echo "  --ds_stage            DeepSpeed ZeRO stage: 1 | 2 | 3 (default: 2)"
             echo "  --fsdp_strategy       FSDP strategy: full | hybrid (default: full)"
             echo "  --report_to           console,tensorboard,wandb,all,none (default: console)"
@@ -291,22 +302,38 @@ case "${LAUNCHER}" in
         ;;
     *) fail_launch "--launcher must be manual or slurm" ;;
 esac
-for value in "${NNODES}" "${NUM_GPUS}" "${RDZV_TIMEOUT}" "${DIST_TIMEOUT}"; do
-    [[ "${value}" =~ ^[1-9][0-9]*$ ]] || fail_launch "Node/worker counts and timeouts must be positive integers; elastic MIN:MAX is unsupported."
+if [[ "${NNODES}" =~ ^([1-9][0-9]*):([1-9][0-9]*)$ ]]; then
+    MIN_NODES="${BASH_REMATCH[1]}"
+    MAX_NODES="${BASH_REMATCH[2]}"
+    [[ "${ELASTIC_RESUME}" = "1" && "${RDZV_BACKEND}" = "c10d" && "${LAUNCHER}" = "manual" ]] || \
+        fail_launch "Elastic MIN:MAX requires --elastic_resume, --rdzv_backend c10d and manual agents."
+    (( MIN_NODES <= MAX_NODES )) || fail_launch "Elastic minimum node count exceeds maximum."
+else
+    [[ "${NNODES}" =~ ^[1-9][0-9]*$ ]] || fail_launch "--nnodes must be a positive count or MIN:MAX."
+    MIN_NODES="${NNODES}"
+    MAX_NODES="${NNODES}"
+fi
+[[ "${ELASTIC_AUTO_RESUME}" = "0" || "${ELASTIC_RESUME}" = "1" ]] || fail_launch "--elastic_auto_resume requires --elastic_resume."
+for value in "${NUM_GPUS}" "${RDZV_TIMEOUT}" "${DIST_TIMEOUT}"; do
+    [[ "${value}" =~ ^[1-9][0-9]*$ ]] || fail_launch "Worker counts and timeouts must be positive integers."
 done
 [[ "${MAX_RESTARTS}" =~ ^(0|[1-9][0-9]*)$ ]] || fail_launch "--max_restarts must be a non-negative integer."
 if [[ -z "${NODE_RANK}" ]]; then
-    [[ "${NNODES}" = "1" ]] || fail_launch "--node_rank is required for manual multi-node launch."
+    [[ "${NNODES}" = "1" || "${ELASTIC_RESUME}" = "1" ]] || fail_launch "--node_rank is required for manual multi-node launch."
     NODE_RANK=0
 fi
 [[ "${NODE_RANK}" =~ ^(0|[1-9][0-9]*)$ ]] || fail_launch "--node_rank must be a non-negative integer."
-(( NODE_RANK < NNODES )) || fail_launch "--node_rank must be smaller than --nnodes."
+(( NODE_RANK < MAX_NODES )) || fail_launch "--node_rank must be smaller than --nnodes maximum."
 case "${RDZV_BACKEND}" in static|c10d) ;; *) fail_launch "--rdzv_backend must be static or c10d." ;; esac
 case "${DIST_BACKEND}" in auto|nccl|gloo) ;; *) fail_launch "--dist_backend must be auto, nccl or gloo." ;; esac
-case "${PARALLEL_MODE}" in ddp|fsdp|deepspeed) ;; *) fail_launch "--parallel must be ddp, fsdp or deepspeed; generic TP/PP is not implemented." ;; esac
+case "${PARALLEL_MODE}" in ddp|fsdp|deepspeed) ;; *) fail_launch "--parallel must be ddp, fsdp or deepspeed; select model parallel degrees with --tp_size/--pp_size." ;; esac
 [[ "${SP_SIZE}" =~ ^[1-9][0-9]*$ ]] || fail_launch "--sp_size must be a positive integer; model-specific SP support is still required."
+[[ "${TP_SIZE}" =~ ^[1-9][0-9]*$ && "${PP_SIZE}" =~ ^[1-9][0-9]*$ ]] || fail_launch "--tp_size and --pp_size must be positive integers."
+if (( MIN_NODES != MAX_NODES )); then
+    (( NUM_GPUS % (SP_SIZE * TP_SIZE * PP_SIZE) == 0 )) || fail_launch "Every elastic node count must support the fixed SP/TP/PP degrees; workers per node must be divisible by their product."
+fi
 case "${MIXED_PRECISION}" in auto|bf16|fp16|no) ;; *) fail_launch "Invalid --mixed_precision." ;; esac
-if (( NNODES > 1 )); then
+if (( MAX_NODES > 1 )); then
     [[ -n "${RDZV_ENDPOINT}" && -n "${RDZV_ID}" ]] || fail_launch "Multi-node launch needs shared --rdzv_endpoint and --rdzv_id on every node."
 fi
 if [[ -n "${RDZV_ENDPOINT}" ]]; then
@@ -315,7 +342,7 @@ if [[ -n "${RDZV_ENDPOINT}" ]]; then
     (( 10#${rendezvous_port} > 0 && 10#${rendezvous_port} <= 65535 )) || fail_launch "Rendezvous port must be 1..65535."
 fi
 if [[ "${FSDP_STRATEGY}" = "hybrid" && "${PARALLEL_MODE}" = "fsdp" ]]; then
-    (( NNODES >= 2 && NUM_GPUS >= 2 )) || fail_launch "Hybrid FSDP needs >=2 nodes and >=2 workers per node; use full otherwise."
+    (( MIN_NODES >= 2 && NUM_GPUS >= 2 )) || fail_launch "Hybrid FSDP needs >=2 nodes and >=2 workers per node throughout the node range; use full otherwise."
 fi
 
 if [ -z "${TEACHER_MODEL}" ]; then
@@ -349,9 +376,17 @@ fi
 # CPU mask) belongs to the scheduler/user. LOCAL_RANK indexes this visible set.
 export WORLD_DISTILL_DIST_BACKEND="${DIST_BACKEND}"
 export WORLD_DISTILL_DIST_TIMEOUT="${DIST_TIMEOUT}"
-export WORLD_DISTILL_EXPECTED_WORLD_SIZE="$((NNODES * NUM_GPUS))"
 export WORLD_DISTILL_EXPECTED_LOCAL_WORLD_SIZE="${NUM_GPUS}"
-export WORLD_DISTILL_FIXED_WORLD_SIZE=1
+export WORLD_DISTILL_ELASTIC_RESUME="${ELASTIC_RESUME}"
+if [[ "${ELASTIC_RESUME}" = "1" ]]; then
+    unset WORLD_DISTILL_EXPECTED_WORLD_SIZE
+    export WORLD_DISTILL_FIXED_WORLD_SIZE=0
+    export WORLD_DISTILL_MIN_NODES="${MIN_NODES}"
+    export WORLD_DISTILL_MAX_NODES="${MAX_NODES}"
+else
+    export WORLD_DISTILL_EXPECTED_WORLD_SIZE="$((MIN_NODES * NUM_GPUS))"
+    export WORLD_DISTILL_FIXED_WORLD_SIZE=1
+fi
 
 echo "============================================"
 echo "WorldDistill Training"
@@ -423,6 +458,8 @@ train_cmd=(
     --num_frames "${NUM_FRAMES}"
     --parallel_mode "${PARALLEL_MODE}"
     --sp_size "${SP_SIZE}"
+    --tp_size "${TP_SIZE}"
+    --pp_size "${PP_SIZE}"
     --deepspeed_stage "${DS_STAGE}"
     --fsdp_shard_strategy "${FSDP_STRATEGY}"
     --report_to "${REPORT_TO}"
@@ -439,6 +476,8 @@ train_cmd=(
 if [ -n "${RESUME_FROM}" ]; then
     train_cmd+=(--resume_from "${RESUME_FROM}")
 fi
+if [[ "${ELASTIC_RESUME}" = "1" ]]; then train_cmd+=(--elastic_resume); fi
+if [[ "${ELASTIC_AUTO_RESUME}" = "1" ]]; then train_cmd+=(--elastic_auto_resume); fi
 
 if [ -n "${STUDENT_MODEL}" ]; then
     train_cmd+=(--student_model_path "${STUDENT_MODEL}")
@@ -496,8 +535,13 @@ if [ -n "${TORCH_COMPILE_DYNAMIC}" ]; then
 fi
 
 if [[ "${DRY_RUN}" = "1" ]]; then
-    printf 'WORLD_DISTILL_DIST_BACKEND=%q WORLD_DISTILL_DIST_TIMEOUT=%q WORLD_DISTILL_EXPECTED_WORLD_SIZE=%q WORLD_DISTILL_EXPECTED_LOCAL_WORLD_SIZE=%q WORLD_DISTILL_FIXED_WORLD_SIZE=1 ' \
-        "${DIST_BACKEND}" "${DIST_TIMEOUT}" "${WORLD_DISTILL_EXPECTED_WORLD_SIZE}" "${NUM_GPUS}"
+    printf 'WORLD_DISTILL_DIST_BACKEND=%q WORLD_DISTILL_DIST_TIMEOUT=%q WORLD_DISTILL_EXPECTED_LOCAL_WORLD_SIZE=%q WORLD_DISTILL_FIXED_WORLD_SIZE=%q ' \
+        "${DIST_BACKEND}" "${DIST_TIMEOUT}" "${NUM_GPUS}" "${WORLD_DISTILL_FIXED_WORLD_SIZE}"
+    if [[ "${ELASTIC_RESUME}" = "1" ]]; then
+        printf 'WORLD_DISTILL_ELASTIC_RESUME=1 WORLD_DISTILL_MIN_NODES=%q WORLD_DISTILL_MAX_NODES=%q ' "${MIN_NODES}" "${MAX_NODES}"
+    else
+        printf 'WORLD_DISTILL_EXPECTED_WORLD_SIZE=%q ' "${WORLD_DISTILL_EXPECTED_WORLD_SIZE}"
+    fi
     printf '%q ' "${train_cmd[@]}"
     printf '\n'
     exit 0

@@ -47,6 +47,8 @@ jobs:
           git ls-files --error-unmatch training/runtime/teacher_offload.py training/utils/context_parallel.py
           git ls-files --error-unmatch training/trainers/mean_flow_distill_trainer.py training/trainers/joint_av_distill_trainer.py
           git ls-files --error-unmatch tools/cache_training_data.py tools/evaluate_generated.py
+          git ls-files --error-unmatch training/parallel/plans.py training/parallel/checkpoint.py training/utils/elastic.py
+          git ls-files --error-unmatch training/native_adapters/world_models.py training/native_adapters/matrix_game2/LICENSE training/native_adapters/lingbot/LICENSE
 
       - name: Run contract and training-loop tests
         run: python -m pytest -q training/tests

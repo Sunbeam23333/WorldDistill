@@ -444,6 +444,7 @@ class DMDDistillTrainer(AuxiliaryTrainingMixin, BaseDistillTrainer):
             )
             if self._checkpoint_is_main_process():
                 logger.info(f"DMD state saved to {ckpt_dir}")
+        self._publish_elastic_checkpoint(step, output_dir)
 
     def load_checkpoint(self, path: str):
         import os

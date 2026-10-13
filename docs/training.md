@@ -311,7 +311,9 @@ Export derives a default step count only from an unambiguous method/checkpoint
 record (including the current trained progressive stage). Otherwise supply
 `--num_steps`. The world-model paper script consequently requires
 `STUDENT_NUM_STEPS` and `STUDENT_PIPELINE_CONDITIONS` for a genuinely compatible
-pipeline; its stock native WorldPlay path is not a completed training adapter.
+pipeline. Native models can instead use encoded-condition adapter sampling;
+WorldPlay requires the separate licensed author training runtime described in
+[native model setup](native-world-models.md).
 
 Every training run records local `metrics.jsonl`, `host_manifest.json`,
 `config_snapshot.json` and `run_card.md`, even without W&B/TensorBoard. Use
@@ -339,10 +341,12 @@ Both modality losses are mean-reduced separately, then weighted by
 joint AV models. Raw audio input must already use the checkpoint's expected
 log-mel preprocessing; arbitrary waveforms are not interpreted as latent tensors.
 
-Native action models use `worlddistill_model.json` and
-`--allow_native_model_code`; the installed factory defines the actual
-architecture. Explicit input maps, required conditions and strict weights prevent
-silently dropping controls.
+Native action models use `worlddistill_model.json`. Matrix-Game2 and LingBot-CAM
+have built-in concrete architectures; HY-WorldPlay binds the separately
+installed licensed author training class. See [native setup](native-world-models.md).
+External custom factories additionally require `--allow_native_model_code`.
+Explicit input maps, required conditions and strict weights prevent silently
+dropping controls.
 
 For example, a local model directory can contain `model.safetensors` and this
 descriptor (replace the factory and argument names with those of the installed
@@ -369,6 +373,9 @@ accept each mapped input. VP descriptors additionally provide their complete
 the same explicit native-code opt-in.
 
 ## Wan context parallelism
+
+For tensor/pipeline partitioning and changed-DP-size checkpoint recovery, see
+[model parallelism and elastic training](parallel-elastic-native.md).
 
 Set `--sp_size 2` with a distributed Wan training job to split transformer tokens
 and exchange attention heads through Ulysses. `world_size` and the number of

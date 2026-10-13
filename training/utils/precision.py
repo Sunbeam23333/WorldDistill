@@ -27,6 +27,8 @@ def resolve_training_precision(args, device):
         "mixed_precision", "parallel_mode", "distill_method", "batch_size", "gradient_accumulation_steps",
         "sp_size", "seed", "enable_tf32", "float32_matmul_precision", "deepspeed_stage", "fsdp_shard_strategy",
     )}
+    controls.update({name: getattr(args, name, default) for name, default in
+                     (("tp_size", 1), ("pp_size", 1), ("elastic_resume", False))})
     try:
         probe = probe_cuda_precision(torch, device=device)
         local = {"controls": controls, "probe": probe, "error": None}

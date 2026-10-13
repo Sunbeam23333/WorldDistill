@@ -120,7 +120,10 @@ class VideoDataset(Dataset):
         if "fps" in item:
             sample["fps"] = float(item["fps"])
         for path_key, key, prefix in (("audio_feature_path", "audio_pixel_values", None),
-                ("action_path", "actions", "action"), ("camera_path", "camera_poses", "camera")):
+                ("action_path", "actions", "action"), ("camera_path", "camera_poses", "camera"),
+                ("camera_intrinsics_path", "camera_intrinsics", "camera_intrinsics"),
+                ("keyboard_action_path", "keyboard_actions", "keyboard_action"),
+                ("mouse_action_path", "mouse_actions", "mouse_action")):
             if not item.get(path_key):
                 continue
             path = item[path_key]
@@ -135,6 +138,8 @@ class VideoDataset(Dataset):
                 shape = list(value.movedim(axis, 0).shape)
                 shape[0] = frames
                 value = torch.empty(shape, dtype=value.dtype, device="meta")
+            if key == "camera_intrinsics":
+                value = value.float()
             sample[key] = value
         metadata = {"resolution": [self.target_h, self.target_w], "num_frames": frames,
                     "collation_signature": collation_signature(sample)}
@@ -185,11 +190,28 @@ class VideoDataset(Dataset):
         if "action_path" in item and item.get("action_path"):
             result["actions"] = self._load_optional_tensor(item["action_path"], "action")
 
-        for key, prefix in (("actions", "action"), ("camera_poses", "camera")):
+        for path_key, key in (("camera_intrinsics_path", "camera_intrinsics"),
+                              ("keyboard_action_path", "keyboard_actions"), ("mouse_action_path", "mouse_actions")):
+            if item.get(path_key):
+                result[key] = self._load_optional_tensor(item[path_key], key)
+
+        for key, prefix in (("actions", "action"), ("camera_poses", "camera"),
+                            ("camera_intrinsics", "camera_intrinsics"),
+                            ("keyboard_actions", "keyboard_action"), ("mouse_actions", "mouse_action")):
             if key not in result:
                 continue
             value = result[key]
             axis = int(item.get(f"{prefix}_temporal_axis", 0))
+            if key in {"keyboard_actions", "mouse_actions"}:
+                # Mouse inputs may be deltas and keyboard inputs event states.
+                # Selecting source indices would silently discard transitions;
+                # accept only controls already resampled by their producer.
+                if item.get("matrix_control_alignment") != "sampled_video":
+                    raise ValueError("Matrix raw keyboard/mouse controls require matrix_control_alignment='sampled_video'")
+                if value.ndim != 2 or not -value.ndim <= axis < value.ndim or value.shape[axis] != frames.shape[1]:
+                    raise ValueError(f"{key} must have one entry per sampled pixel frame")
+                result[key] = value.movedim(axis,0)
+                continue
             if value.ndim == 0 or not -value.ndim <= axis < value.ndim or value.shape[axis] != source_frames:
                 raise ValueError(
                     f"Raw {key} must declare one entry per source video frame ({source_frames}); "
@@ -197,6 +219,25 @@ class VideoDataset(Dataset):
                 )
             # Standardize to T,... before DataLoader adds the batch dimension.
             result[key] = value.index_select(axis, frame_indices).movedim(axis, 0)
+
+        if "camera_intrinsics" in result:
+            # Intrinsics use pixels, so decoder resize must resize focal length
+            # and principal point as well. Never assume an undeclared source
+            # resolution already equals the decoder output.
+            intrinsic_resolution=item.get("camera_intrinsics_resolution")
+            if (not isinstance(intrinsic_resolution,list) or len(intrinsic_resolution)!=2
+                    or any(not isinstance(v,(int,float)) or not 0<v<float("inf") for v in intrinsic_resolution)):
+                raise ValueError("Raw camera_intrinsics_resolution must declare positive [height,width] pixel units")
+            value=result["camera_intrinsics"].clone().float()
+            sy,sx=frames.shape[-2]/intrinsic_resolution[0],frames.shape[-1]/intrinsic_resolution[1]
+            if value.shape[1:]==(4,):
+                value=value*value.new_tensor([sx,sy,sx,sy])
+            elif value.shape[1:]==(3,3):
+                value[:,0,:]*=sx
+                value[:,1,:]*=sy
+            else:
+                raise ValueError("Raw camera_intrinsics must be T,4 or T,3,3")
+            result["camera_intrinsics"]=value
 
         return result
 

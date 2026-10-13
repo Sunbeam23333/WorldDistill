@@ -300,7 +300,10 @@ def wrap_denoiser(model: nn.Module) -> nn.Module:
     from diffusers import ModelMixin
     if type(model).__name__ == "LTX2VideoTransformer3DModel":
         return LTX2TrainingAdapter(model)
-    return DiffusersTrainingAdapter(model) if isinstance(model, ModelMixin) else model
+    if isinstance(model, ModelMixin):
+        from training.native_adapters.diffusers_controls import CONTROL_ADAPTERS
+        return CONTROL_ADAPTERS.get(type(model).__name__, DiffusersTrainingAdapter)(model)
+    return model
 
 
 def attach_training_scheduler(model: nn.Module, scheduler_config: dict) -> None:

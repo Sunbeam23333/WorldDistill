@@ -1,0 +1,29 @@
+{
+  "schema_version": 1,
+  "architecture": "matrix_game2",
+  "variant": "causal",
+  "source_revision": "756776d516233027631008761d4d40ddaea3e23a",
+  "weights": "model.safetensors",
+  "weights_prefix": "model.",
+  "num_train_timesteps": 1000,
+  "num_frame_per_block": 1,
+  "noise_process": "flow",
+  "prediction_type": "velocity",
+  "model_config": {
+    "model_type": "i2v", "dim": 1536, "ffn_dim": 8960,
+    "freq_dim": 256, "in_dim": 36, "out_dim": 16,
+    "num_heads": 12, "num_layers": 30, "text_len": 512,
+    "eps": 0.000001,
+    "local_attn_size": 6, "sink_size": 0,
+    "action_config": {
+      "blocks": [0,1,2,3,4,5,6,7,8,9,10,11,12,13,14],
+      "enable_keyboard": true, "enable_mouse": true,
+      "heads_num": 16, "hidden_size": 128, "img_hidden_size": 1536,
+      "keyboard_dim_in": 4, "keyboard_hidden_dim": 1024,
+      "mouse_dim_in": 2, "mouse_hidden_dim": 1024,
+      "mouse_qk_dim_list": [8,28,28], "patch_size": [1,2,2],
+      "qk_norm": true, "qkv_bias": false, "rope_dim_list": [8,28,28],
+      "rope_theta": 256, "vae_time_compression_ratio": 4, "windows_size": 3
+    }
+  }
+}
