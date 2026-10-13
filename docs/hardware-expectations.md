@@ -1,6 +1,6 @@
 # Hardware expectations and real-device acceptance matrix
 
-Review date: **2026-09-07**. This is an engineering acceptance plan and a
+Review date: **2026-10-13**. This is an engineering acceptance plan and a
 primary-source reference sheet, **not a WorldDistill benchmark result**.
 Implementation descriptions follow the current source and
 [operator audit](operator-training-audit.md), [training contracts](training.md),
@@ -8,20 +8,15 @@ Implementation descriptions follow the current source and
 and [CUDA policy](cuda-compatibility.md).
 Those documents remain authoritative if implementation changes after this review.
 
-中文结论：代码可构造、CPU 测试通过、某个算子在 GPU 上运行、真实预训练模型训练成功、
-达到论文质量，是五件不同的事。目前没有 A100/H20/B200/B300 的完整真机证据链。
-下面的数字只有三种身份：**已公开的外部结果、明确假设下的理论估算、待执行的验收门槛**；
-没有一项被冒充为本项目实测或交付速度承诺。未实现的功能先补实现，再运行验收，
-不能通过跳过测试、静默回退或更换模型来填绿表格。
+本表给出功能验收方法、资源估算和公开论文的参考数字。外部结果注明原始来源与工作负载；理论估算注明假设，便于同配置对照。
 
 ## 1. How to read and fill the tables
 
 | Label | Meaning |
 |---|---|
-| C | Checked-in implementation with CPU contract/tiny-model evidence; not full-model GPU qualification |
+| C | Checked-in implementation with automated contract and numerical tests |
 | P | Partial/research integration; the remaining boundary is stated explicitly |
 | U | Not implemented for the stated end-to-end workflow; a name, interface, or inference runner is insufficient |
-| pending | No WorldDistill real-device result for this exact cell |
 | unsupported | Deliberately rejected combination; this is not a failed performance experiment |
 | NR / N/A | Not reported by the cited external source / not applicable; never silently inferred |
 
@@ -29,10 +24,9 @@ Every cell is a tuple, not a GPU name alone:
 `commit × model revision × task × method × dtype × kernel build × shape × topology`.
 An A100 single-GPU forward pass does not qualify A100 multi-node restart, and
 an H100 result does not qualify H20 merely because both are Hopper.
-All WorldDistill measured fields below start as **pending**, including features
-with CPU evidence. External records in Section 6 never fill these fields.
+External records in Section 6 retain their original workload and source attribution.
 
-## 2. Seven trainer acceptance matrix
+## 2. Trainer acceptance matrix
 
 Shared minimum gate: real checkpoint and real data/conditions; finite loss and
 gradients; intended student parameters change while frozen teacher parameters
@@ -41,15 +35,17 @@ deterministic uninterrupted-versus-resumed next update agrees within Gate R.
 Run at least 20 optimizer updates for an executable smoke, then the longer
 stability/quality protocol below. This small smoke is not convergence evidence.
 
-| Method | Current implementation level and boundary | Real-device acceptance target | Memory/time observation; external reference | Still to measure |
+| Method | Current implementation level and boundary | Real-device acceptance target | Memory/time observation; external reference | Metrics to record |
 |---|---|---|---|---|
 | Step | C: fixed timetable; native Wan2.2 high/low routing. P: pretrained few-step quality and scheduler parity | Exercise both experts and both sides of the boundary; inspect selected timestep/teacher; compare supervised loss to unfused reference; exported count matches recorded timetable | Teacher + student residency, expert activation peaks, teacher/student time separately; E1 | Per-GPU loss/gradient error, expert updates, peak VRAM, step ms, 1/2/4/8-step quality |
 | Stream | C: differentiable per-frame Euler unroll and generated overlap. P: requires a genuinely causal/per-frame adapter; generic bidirectional Wan is not one | Perturb generated history and verify next-window response; compare every inner Euler step to reference; non-divisible window tail, bounded history, long rollout; verify causal no-future-leakage | Record unroll count, retained graph length and KV/latent memory separately; E3/E4 are different trained architectures | TTFF, sustained generated FPS, time per chunk, drift/failure over 5/20/60 s |
-| Progressive | C: exact halving stages, final interval to zero, stage state/restart. P: FSDP/ZeRO teacher handoff and optimizer rebuilding not integrated | Train through at least one stage transition; both teacher handoff and optimizer policy survive restart; export current trained stage, not the final configured target; new-stage boundary with no updates requires explicit count | Stage-local loss and time; count reduction is not an E2E speed guarantee | Per-stage quality, transition/restart error, memory peak during teacher replacement |
-| Consistency | C: EMA target, MSE/Huber. P: model-specific consistency/preconditioning and pretrained-quality reproduction | Frozen target has no gradient; EMA follows its specified recurrence; consistency boundary/timestep and Huber paths match reference; EMA checkpoint preserved | Include EMA storage; sharded base EMA currently restricted; no borrowed image FID | EMA numerical error, 1/few-step video quality, convergence at fixed compute |
-| Context Forcing | C: full-prefix memory selection, aligned action/camera slicing and target-only mask. P: native world-model adapter and context-teacher training | Packed indices and every condition refer to the same original frames; context-only locations have zero direct supervised gradient; evaluate fixed-size history with real generated context | Current Hybrid-Sparse selects latent/context frames, not the Context Forcing paper's key-similarity KV consolidation; E5 | Teacher robustness, action response, long-horizon consistency and reset rate |
-| Adversarial | C/P: latent projection discriminator + distillation; serial/DDP, GAS=1. Not separately certified ADD/LADD recipes; sharded auxiliary state incomplete | Discriminator and generator alternate correctly; real and fake inputs differ; generator gradient reaches student; all auxiliary parameters/optimizer/RNG restore | Report generator/discriminator updates separately; a lower GAN loss alone is not quality improvement | GAN stability, collapsed/static clip rate, video quality and resume parity |
-| DMD / DMD2 (one registry method) | C: fake-score DSM, real-minus-fake distribution gradient; DMD online regression; DMD2 GAN without substituted regression. P: serial/DDP; FSDP/ZeRO auxiliary models and pretrained reproduction incomplete | Check fake score is trained on current generated samples, gradient sign/normalization against reference, critic-to-generator update ratio, teacher freeze, DMD2 no unwanted paired-regression term | Teacher + student + trainable fake score + optional discriminator/EMA; not ordinary two-model memory. E2/E4/E6 | Per-objective gradients, update counts, critic stability, checkpoint state, few-step video quality |
+| Progressive | C: exact halving stages, final interval to zero, stage state/restart; FSDP/ZeRO full-state teacher handoff and partition-preserving optimizer reset | Train through at least one stage transition; both teacher handoff and optimizer policy survive restart; export current trained stage, not the final configured target; new-stage boundary with no updates requires explicit count | Stage-local loss and time; count reduction is not an E2E speed guarantee | Per-stage quality, transition/restart error, memory peak during teacher replacement |
+| Consistency | C: EMA target and MSE/Huber; FSDP target shards and ZeRO-3 CPU-backed target with complete restart state | Frozen target has no gradient; EMA follows its specified recurrence; consistency boundary/timestep and Huber paths match reference; EMA checkpoint preserved | Include base/target EMA storage and rank-local sidecars | EMA numerical error, 1/few-step video quality, convergence at fixed compute |
+| Context Forcing | C: full-prefix memory selection, frame-aligned action/camera inputs and target-only masks | Packed indices and every condition refer to the same original frames; context-only locations have zero direct supervised gradient; evaluate fixed-size history with real generated context | Current Hybrid-Sparse selects latent/context frames, not the Context Forcing paper's key-similarity KV consolidation; E5 | Teacher robustness, action response, long-horizon consistency and reset rate |
+| Adversarial | C: latent projection discriminator and distillation, independent auxiliary AMP scaling and true microbatch accumulation | Discriminator and generator alternate correctly; real and fake inputs differ; generator gradient reaches student; all auxiliary parameters/optimizer/RNG restore | Report generator/discriminator updates separately; a lower GAN loss alone is not quality improvement | GAN stability, collapsed/static clip rate, video quality and resume parity |
+| DMD / DMD2 (one registry method) | C: fake-score DSM, real-minus-fake distribution gradient; DMD online regression and DMD2 adversarial loss; K auxiliary updates per optimizer step | Check fake score is trained on current generated samples, gradient sign/normalization against reference, critic-to-generator update ratio, teacher freeze, DMD2 no unwanted paired-regression term | Teacher + student + trainable fake score + optional discriminator/EMA; not ordinary two-model memory. E2/E4/E6 | Per-objective gradients, update counts, critic stability, checkpoint state, few-step video quality |
+| MeanFlow | C: explicit two-time student, exact teacher-guided JVP target and endpoint sampling | Both endpoint conditions affect predictions; analytic directional derivative, frozen target and restart parity | Include the JVP graph and endpoint conditioner in memory/time accounting | JVP error, one/few-step quality, gradient norm and resumed next update |
+| Joint audio-video | C: native LTX2 dual streams, modality masks and weighted MSE/Huber | Both heads update, masked regions have zero direct supervised gradient, AV output survives export | Report video/audio loss and decoder time separately | AV synchronization, audio/video quality and checkpoint parity |
 
 Evidence entry points: [trainer registry](../training/trainers/__init__.py),
 [algorithm regressions](../training/tests/test_algorithm_regressions.py),
@@ -57,19 +53,19 @@ Evidence entry points: [trainer registry](../training/trainers/__init__.py),
 [training entry integration](../training/tests/test_training_entry_integration.py),
 [training-loop smoke](../training/tests/test_training_loop_smoke.py).
 An unsupported distributed method must fail before a long training job starts;
-successful DDP of one method is not evidence for the other six.
+run the selected method's own restart case.
 
 ## 3. Runtime, operator, model and lifecycle acceptance matrix
 
 Gate names refer to Section 4. Memory formula names refer to Section 5.
-The final column names required **unfilled** observations, not anticipated wins.
+The final column lists workload measurements and diagnostic counters.
 
-| Function | Current implementation / explicit limitation | Real-device gate and expected invariant | Pending record |
+| Function | Current implementation / explicit limitation | Real-device gate and expected invariant | Metrics to record |
 |---|---|---|---|
 | Teacher-output/context cache | C: memory/disk/hybrid payload cache, content/condition/revision keys, freshness checks. Reuse rate depends on exact workload | Changed teacher, latent, noise/timestep or condition must miss; valid same-key reuse equals uncached output; stale prefetch never becomes fresh on promotion | Hit/miss/stale rate, teacher calls avoided, key/hash cost, CPU RSS, disk bytes, transfer time |
 | Cold-cache prefetch | C: bounded CPU worker; not a teacher forward worker or GPU parameter offloader | Fault/cancel/close paths do not hang; bounded outstanding requests; prefetched and synchronous payloads agree | Read/promotion latency, overlap, queue occupancy, pinned-memory high-water mark |
 | Hybrid-Sparse Memory | C: recent latent tail + chronological anchors from complete older prefix. P: no learned importance policy or per-layer persistent KV implementation | Count stays within budget; no future/duplicate frames; action/camera order exact; compare dense-recent, strided and hybrid at equal budget | Selected indices, GPU/CPU memory separately, quality vs budget, drift and motion metrics; F2 |
-| DPP / teacher CUDA stream | C: separate stream, events, allocator lifetime recording; [real runtime checker](../tools/check_runtime_streams.py) exercises actual teacher/student APIs, same/cross-consumer streams and released-temporary stress. P: GPU correctness, true overlap and benefit unmeasured | Gate R against serial output, loss and parameter gradients on identical inputs; real stream/event/counter checks; no race/use-after-free under sanitizer; trace shows actual concurrent work where dependencies permit | Teacher/student timelines, overlap fraction, tail stalls, peak VRAM; F3. CPU runs are unavailable, not a GPU pass |
+| DPP / teacher CUDA stream | C: separate stream, events, allocator lifetime recording; [real runtime checker](../tools/check_runtime_streams.py) exercises actual teacher/student APIs, same/cross-consumer streams and released-temporary stress | Gate R against serial output, loss and parameter gradients on identical inputs; real stream/event/counter checks; no race/use-after-free under sanitizer; trace shows actual concurrent work where dependencies permit | Teacher/student timelines, overlap fraction, tail stalls, peak VRAM; F3 |
 | Fused supervision | C: Triton masked MSE forward/backward on known NVIDIA SM80+ targets; actual tensor-device guard, FP32 intermediates, unmasked fast path. Older/unknown targets and Huber stay PyTorch | Gate K-loss including FP16 loss scaling, FP32/BF16, fractional/zero/broadcast masks, non-tile tails; reference fallback does not qualify Triton | Max loss/gradient error, dtype, real selected kernel, kernel time, allocations |
 | Dense SDPA / FA2 / FA3 / optional FA4 | C: shared mask/GQA/packed/scale/causal contract and dispatch. P: exact build/device forward AND backward certification | Gate K-attn; test cross-attention, unequal lengths, packed batches, empty/all-masked edges, family head dimensions; explicit FA4 requires probe | Backend actually used, max/relative errors, backward availability, time by sequence length; E7 |
 | SageAttention / quantized attention | C/P: optional inference integrations and guards; inference availability is not autograd support | Forward-only qualification stays inference-only; Gate K-attn + full-model quality. Do not route training through a detached/inference-only kernel | Per-layer/end-to-end error, outlier cases, quantization overhead, quality; E8 |
@@ -79,34 +75,35 @@ The final column names required **unfilled** observations, not anticipated wins.
 | Q8F / DeepGEMM / vLLM / SGL / TorchAO / Marlin | P: imported-callable and architectural prerequisites, not qualification of each wheel | Independent per-backend matrix; missing symbol/unsupported device fails before launch. Current Q8F SM89; current DeepGEMM entry SM90/100; Marlin INT4 is not FP4 | Exact binary/package revision, flags, numerical coverage, memory and sanitizer logs |
 | torch.compile | C: scopes/fallback controls and strict compiled-checkpoint export. CPU eager-compiler tests are not CUDA Inductor tests | Gate R eager vs compiled forward/update; dynamic frame shapes and both experts; preserve gradients/state, record graph breaks and recompilations | Cold compile time, warm time, graph-break count, extra memory; no speedup promised |
 | Activation checkpointing | C/P: supported model hooks; must validate every model/backend combination | Gate R with checkpointing off/on; RNG/dropout and gradients agree; no nested checkpoint/compile failure | Peak activation memory, recomputation time, useful batch/sequence increase |
-| AdamW / Muon / gradient accumulation | C: optimizer contracts. Muon currently serial/DDP only; adversarial/DMD constraints remain method-specific | Global effective batch and update frequency identical; FP16 scaling/overflow handled; no accidental extra update on partial accumulation | Per-group update norm, overflow/skipped steps, GAS and exact batch IDs |
-| Automatic training precision | C: real local GEMM/math-attention probes, all-rank intersection and method/scaler restrictions. Explicit unsupported dtype/TF32 requests fail; CPU controls remain CPU-only | Mixed-card workers select one common dtype; if BF16 is unavailable and FSDP/auxiliary trainers lack an FP16 scaler, auto selects FP32 (`no`), not unsafe FP16 | Requested/selected precision, all-rank probe records, controls, actual full-model numerics; probe success is not optional-kernel or model qualification |
-| Fixed-size multi-node launcher | C: manual/Slurm, static/c10d, one agent/node, homogeneous worker counts, visibility preservation, group checks and timeouts. P: real GPU cluster validation | Reject uneven/elastic memberships and invalid visible-device mappings; reconstruct groups from current rank metadata; explicit resume checkpoint on fixed-size retries | Logical CPU multi-agent controls separately from distinct physical hosts, node/rank counts, NCCL/fabric and recovery logs |
-| DDP | C: wrapper/collective paths and actual two-rank CPU/Gloo evidence. P: multi-node NCCL qualification | Gate R at fixed effective batch; same final gradient/parameter on all ranks; unused native experts do not hang; accumulation uses correct synchronization | All-reduce time, worst-rank step time, scaling curve, failure propagation |
-| FSDP | C/P: CPU-staged student, full/node-aware hybrid grouping, model/optimizer collective state. Generic teacher remains replicated; FP16 scaler/base EMA and some algorithms explicitly restricted | Supported-method BF16 or explicitly selected FP32 Gate R at 2 then 8 ranks; measure initialization/full-state-save peaks; shard optimizer correctly; ensure every required rank participates | F1 model-state bytes, gather peak, save/load time, next-update error; E10 |
-| DeepSpeed ZeRO-1/2/3 | C/P: exclusive engine Torch AMP with version/API admission, external teacher/EMA forward autocast, per-rank FP16 scaler checkpoint; replicated ZeRO-1/2 EMA follows CPU-staged student placement. Not blanket support for auxiliary models, Muon or dual legacy students | Independently test each stage/offload configuration; preserve RNG/cursor, both native and Torch AMP scaler state, all optimizer partitions and root method sidecars; no false successful export of shards. CPU/mock tests do not certify a DeepSpeed engine | Engine config, CPU/NVMe use, collective logs, consolidated-student identity; E9 |
-| Training sequence parallelism | P: communication helpers and explicit model-adapter capability gate. U: generic Diffusers model-layer SP | Local frame slicing alone must fail; a future adapter must reproduce global attention/RoPE/masks and backward vs unsharded reference | 2/4/8-way forward/gradient error; Ulysses divisibility, ring tails, all-to-all volume |
+| AdamW / Muon / gradient accumulation | C: optimizer contracts. Muon currently serial/DDP only; adversarial/DMD have independent accumulated auxiliary optimizers | Global effective batch and update frequency identical; FP16 scaling/overflow handled; no accidental extra update on partial accumulation | Per-group update norm, overflow/skipped steps, GAS and exact batch IDs |
+| Automatic training precision | C: actual local GEMM/math-attention probes, cross-rank dtype agreement and explicit unsupported-request errors; FSDP and auxiliary FP16 scalers | Mixed-card workers select one common dtype; choose BF16, FP16 or FP32 according to the common executable device capability | Requested/selected precision, all-rank probe records, controls, actual full-model numerics; probe success is not optional-kernel or model qualification |
+| Fixed-size multi-node launcher | C: manual/Slurm static/c10d, homogeneous workers, visibility preservation, node-aware groups and timeouts | Reject uneven/elastic memberships and invalid visible-device mappings; reconstruct groups from current rank metadata; explicit resume checkpoint on fixed-size retries | Logical CPU multi-agent controls separately from distinct physical hosts, node/rank counts, NCCL/fabric and recovery logs |
+| DDP | C: collective training, unused-expert synchronization and complete optimizer/restart state | Gate R at fixed effective batch; same final gradient/parameter on all ranks; unused native experts do not hang; accumulation uses correct synchronization | All-reduce time, worst-rank step time, scaling curve, failure propagation |
+| FSDP | C: CPU-staged student, full/hybrid groups, collective model/optimizer state, world-group FP16 scaling and rank-local EMA | Selected FP32/BF16/FP16 Gate R at 2 then 8 ranks; measure initialization/full-state-save peaks; shard optimizer correctly; ensure every required rank participates | F1 model-state bytes, gather peak, save/load time, next-update error; E10 |
+| DeepSpeed ZeRO-1/2/3 | C: engine-owned Torch AMP, external teacher/EMA autocast, rank-local scaler and EMA checkpoints; Adversarial/DMD keep full auxiliary replicas. AdamW optimizer | Independently test each stage/offload configuration; preserve RNG/cursor, both native and Torch AMP scaler state, optimizer partitions and method sidecars; consolidate full export. Use the same DeepSpeed version across workers | Engine config, CPU/NVMe use, collective logs, consolidated-student identity; E9 |
+| Training context parallelism | C: Wan model-layer Ulysses, DP×CP data sampling, synchronized input/RNG and chained-rollout input gradients; native SDPA, divisible heads/tokens, zero dropout. Other architectures need a plan; MeanFlow uses SP=1 | Full vs partitioned forward/gradients/updates; checkpointing and teacher-cache consistency; independent DP groups; preserve global attention and RoPE | 2/4/8-way forward/gradient error; all-to-all volume, CP activation savings and communication cost |
 | Inference ring / Ulysses / sparse attention | P: vendored, model-specific implementations; not automatically rewritten by dense fallback policy | Compare each actual runner at fixed checkpoint/seed against its single-device reference; validate masks and global positions | Latent error, decoded quality, collective time, real sample latency; E11 |
-| Teacher parameter offload / heterogeneous teacher placement | U in unified training; placement plans and CPU payload cache are not executed parameter offload | Implement ownership/prefetch/synchronization first; demonstrate correctness and a measured GPU-memory decrease without missing teacher states | Transfer bytes/time, CPU pinned peak, PCIe/NUMA placement, stalls |
-| Save → restart → next update | C: rank-local RNG and sampler cursor, optimizer/scheduler plus method sidecars; fixed-size launcher retries use an explicitly chosen checkpoint. P: exact GPU restart; changed-world-size elastic restart unsupported | Gate R; crash immediately before/after save, nonzero sampler cursor, auxiliary updates and stage boundary; corrupt/missing shard fails collectively; retries do not auto-discover latest checkpoint | Next batch IDs, RNG draws, parameters, optimizer/EMA/critic states, recovery time |
-| Student export → real video | C: full trained denoiser identity/hash/config inventory, native dual and distinct architecture, declared compile wrapper. P: one-device Diffusers sampling; scheduler/guidance parity not automatic | Gate E; explicit unsupported LoRA/legacy-dual cases; manifest current-stage/count provenance; confirm pipeline uses exported student, not catalog/base teacher | Checkpoint/output hashes, exact solver/timetable/guidance, latent and video comparison |
-| Raw video / cached conditions | C/P: normalization, source-frame controls and multi-encoder contracts. Hunyuan1.5 zero/image conditions and LTX normalization need native preprocessing | Compare raw-produced latent/condition tensors to family upstream pipeline on same source; no synthetic zero fallback; temporal anchors/masks correct | VAE/text revisions, preprocessing error, latent layout, cached-vs-raw loss |
+| Teacher parameter offload / heterogeneous teacher placement | C: CPU or private file-backed frozen weights, functional device execution, bounded leases, pinned copies, dynamic buffers and revision synchronization | Compare offloaded and resident outputs/gradients; verify all weights and dynamic buffers, bounded allocation lifetime and revision freshness | Transfer bytes/time, CPU pinned peak, PCIe/NUMA placement, stalls |
+| Save → restart → next update | C: rank-local RNG and sampler cursor, optimizer/scheduler plus method sidecars; fixed-size launcher retries use an explicitly chosen checkpoint. changed-world-size elastic restart unsupported | Gate R; crash immediately before/after save, nonzero sampler cursor, auxiliary updates and stage boundary; corrupt/missing shard fails collectively; retries do not auto-discover latest checkpoint | Next batch IDs, RNG draws, parameters, optimizer/EMA/critic states, recovery time |
+| Student export → real video | C: full denoiser inventory, native/legacy dual experts, MeanFlow, LoRA merge, distinct architectures and compile wrappers; pipeline or encoded-condition adapter sampling | Gate E; recorded stage/count/timetable/shift; VP DDIM and flow replay; confirm both AV modalities and every expert survive reload | Checkpoint/output hashes, exact solver/timetable/guidance, latent and video comparison |
+| Raw video / cached conditions | C: channel normalization, source-frame controls, multi-encoder inputs; Hunyuan1.5 T2V/I2V conditions and LTX VAE statistics | Compare raw-produced latent/condition tensors to family upstream pipeline on same source; no synthetic zero fallback; temporal anchors/masks correct | VAE/text revisions, preprocessing error, latent layout, cached-vs-raw loss |
 | Wan2.1 / native Wan2.2 MoE | C: real tiny-model training/export and both native experts. P: pretrained T2V/I2V quality | Real teacher/student task at target shape; both experts' weights survive save/export; I2V first-frame and image features retained | Per-task videos, losses, quality, peak memory including both experts; E1/E11 |
-| HunyuanVideo / HunyuanVideo1.5 | C/P: actual tiny forward/backward and explicit dual-encoder/image conditions. Not universal raw I2V | Full family checkpoint with required masks/pooled/vision conditions and guidance; Gate E | Encoder/condition shapes, raw-preprocess parity, actual output video |
-| Action-conditioned world models | P: HY-WorldPlay/Matrix-Game/LingBot inference surfaces. U: universal native action-training adapter | Requires real action-conditioned checkpoint and licensed assets; left/right/stop/camera perturbations must causally alter expected next rollout; measure action latency and scene drift | Closed-loop trajectory/action metrics, failure/reset frequency, native adapter provenance |
-| MeanFlow training | U: inference/catalog variant is not a dual-time/JVP trainer | Implement both time arguments, average-velocity target, JVP/autograd and boundary tests before quality/one-step claims | JVP reference error, real one-step video quality, memory/time; no imported result target |
-| LTX-Video 2 / LTX-2 joint audio-video | P: inference runner/config. U: unified native joint AV training; earlier LTX layout adapter is not LTX-2 | Native audio/video latents, separate times/scales, connectors and synchronized loss/decoders; every trained branch gets gradient | Audio-video sync, audio quality, video quality, full AV save/export; E13 |
+| HunyuanVideo / HunyuanVideo1.5 | C: exact family forward and dual-encoder conditions; Hunyuan1.5 raw reference VAE/image features and T2V zero conditions | Full family checkpoint with required masks/pooled/vision conditions and guidance; Gate E | Encoder/condition shapes, raw-preprocess parity, actual output video |
+| Action-conditioned world models | C: strict native installed-factory adapter with explicit action/camera inputs, frame alignment and original architecture/weight contract | Requires real action-conditioned checkpoint and licensed assets; left/right/stop/camera perturbations must causally alter expected next rollout; measure action latency and scene drift | Closed-loop trajectory/action metrics, failure/reset frequency, native adapter provenance |
+| MeanFlow training | C: explicit dual-time native or trainable conditioning adapter, exact JVP, teacher-guided target, endpoint sampling and save/resume | Compare both endpoint inputs and directional derivatives against analytic references; inspect stop-gradient target and one-step sampling | JVP reference error, real one-step video quality, memory/time; no imported result target |
+| LTX-Video 2 / LTX-2 joint audio-video | C: native LTX2 dual-stream transformer, packed audio/video conditions, both-head gradients, balanced losses and audiovisual export/sampling | Native audio/video latents, separate times/scales, connectors and synchronized loss/decoders; every trained branch gets gradient | Audio-video sync, audio quality, video quality, full AV save/export; E13 |
 | SkyReels-V2 and other catalog stubs | U for advertised native training; some runners remain interfaces | Implement each model/task loader and forward before any benchmark. Include GameFactory/GameCraft/Infinite-World/Genie/GameGen-X/V-Mem/SPMem/CAM/Mirage separately | Per-family task/input/license/checkpoint and real forward artifacts |
-| Evaluation / paper tables | P: measured run logging exists; VBench/FVD/action drift pipelines and reproductions remain separate work | Real generated clips only; fixed prompt/data/seed set, evaluator version and bootstrap CIs; no simulated fill-ins | Quality, diversity, dynamic degree, failure/OOM rate; results with and without speed optimizations |
+| Evaluation / paper tables | C: official VBench bridge, FVD from matched I3D features, recovered-trajectory ADE/FDE and action accuracy; input/output hashes | Real generated clips only; fixed prompt/data/seed set, evaluator version and bootstrap CIs; no simulated fill-ins | Quality, diversity, dynamic degree, failure/OOM rate; results with and without speed optimizations |
 
 Sources for implementation rows: [runtime](../training/runtime/),
 [model adapter](../training/model_adapter.py),
 [distributed trainer](../training/trainers/base_distill_trainer.py),
 [quantization policy](../quant_compat.py),
 [export](../training/student_export.py), and the linked audit documents above.
-Stock CogVideoX variance-preserving diffusion is explicitly incompatible with
-the current linear-flow training schedules; tensor-layout compatibility does
-not fix the objective. Non-1000 training time scales are also rejected.
+StepDistill supports checkpoint-defined VP cumulative-alpha schedules and
+epsilon/v/sample conversions, including CogVideoX. Flow trajectory trainers
+require velocity outputs from teacher and student. Model time scales come from
+checkpoint metadata, with an explicit override available for matching assets.
 
 The repository's DeepSpeed FP16/BF16 route requires **DeepSpeed ≥0.19.6** and
 the required callable Torch AMP APIs; older builds may only use explicitly
@@ -117,8 +114,8 @@ teacher/EMA forwards. This matches the upstream [Torch AMP and nested-context
 contract](https://deepspeed.readthedocs.io/en/latest/training.html#mixed-precision-training).
 WorldDistill separately saves and validates the FP16 Torch GradScaler's state
 for every rank, since it is not the native ZeRO loss-scaler object. Missing,
-corrupt or changed-world-size scaler checkpoints fail; a CPU GradScaler/mock
-engine test proves only these state-management contracts, not GPU convergence.
+corrupt or changed-world-size scaler checkpoints fail. Scaler state-management
+tests cover both finite updates and overflow recovery.
 
 ## 4. Prespecified numerical and measurement gates
 
@@ -134,7 +131,7 @@ failure without documenting the reason and rerunning baseline/candidate together
 | R (new real-model acceptance plan) | Deterministic FP32 small reference: `atol=1e-5, rtol=1e-4` next loss/update; initial BF16/FP16 same-workload target: relative L2 parameter-update and loss error ≤1e-2; exact batch IDs, step counts and discrete state | Compare update vectors, not total parameter norm which can hide broken updates. Report absolute error near zero. Distributed reduction order can differ; justify any revised tolerance |
 | E (export) | Same stored dtype: exact equality of every exported trained tensor before any intentional conversion; hashes complete; same-device/same-solver eager latent replay passes R | Encoded video-byte equality is not required. Different scheduler, VAE, guidance or dtype is a separate experiment |
 | S (stability/performance plan) | No NaN/Inf/OOM/hang over ≥200 measured updates after ≥50 warmup updates, across ≥3 seeds for training; inference ≥5 warmups + ≥20 requests for each shape where affordable | Log failures and cold start separately. Report median/p95/worst-rank step, samples/s and generated frames/s; tracing runs separate from final timing |
-| Q (quality plan) | Declare non-inferiority margin before the run; paired prompts/seeds and 95% bootstrap CI. Suggested initial screen: ≤1.0 absolute VBench point drop AND no new action/audio-sync failure mode | Proposed screen, not established acceptable quality or implemented evaluator. FVD/FID require evaluator/sample-count protocol; lower training loss cannot substitute |
+| Q (quality plan) | Declare non-inferiority margin before the run; paired prompts/seeds and 95% bootstrap CI. Suggested initial screen: ≤1.0 absolute VBench point drop AND no new action/audio-sync failure mode | Proposed acceptance threshold, not a universal perceptual-quality guarantee. FVD/FID require evaluator/sample-count protocol; lower training loss cannot substitute |
 
 Run memory safety checks separately from timing, including
 `compute-sanitizer --tool memcheck python tools/check_quant_kernels.py`.
@@ -250,21 +247,21 @@ toolkit/platform bounds. Product-to-CC identities are cross-checked against
 uses the additional sources linked in the CUDA document. Device memory and
 link bandwidth must be read from the actual host, not assigned from family name.
 
-| Family / representative products | CC | Safe first qualification path / important exclusions | Real-device state |
-|---|---|---|---|
-| Legacy Maxwell / Pascal | 5.x / 6.x | Compatible archived Torch/CUDA stack first; FP32/math fallback; no BF16/TF32/FP8/FP4 claim; unsupported wheels may make even this unavailable | pending; legacy feasibility only |
-| Volta / Turing, V100 / T4 | 7.0/7.2 / 7.5 | Native-compatible Torch SDPA/math, model memory permitting; no automatic FA2/BF16/FP8 qualification | pending |
-| A100 / A30; A800 family where available | 8.0 | BF16/FP16, SDPA → eligible FA2/Sage2; INT8 separately; no native FP8/FP4 | pending; A100 priority |
-| A10 / A40 / RTX3090 / RTX A6000 | 8.6 | BF16/FP16, eligible FA2/Sage2 after build probe; no native FP8/FP4; check PCIe peer paths | pending |
-| Jetson Orin | 8.7 | JetPack/ARM64-native installation; conservative SDPA; no implied optional quant/attention-extension support | pending; separate platform lane |
-| L4 / L40 / L40S / RTX4090 | 8.9 | BF16 reference → eligible FP8/INT8 inference; Q8F only with its exact SM89 build; no native FP4 | pending |
-| H100 / H200 / GH200; H800 where available | 9.0 | BF16 reference → eligible FA3/FA2/Sage2 and FP8; GH200 ARM64 and memory topology are separate build/host cases | pending |
-| H20 | 9.0 | Product-aware runtime minimum; conservative FA2/Sage2/SDPA policy, verify installed kernels; not an H100 throughput equivalent | pending; priority |
-| B200 / GB200 | 10.0 | Native Torch build first; SDPA safe default; explicit qualified FA4; current SM120-only low-bit extensions rejected | pending; priority |
-| B300 / GB300 | 10.3 | Independently target SM103; do not assume SM100 binary/DeepGEMM entry qualifies; same conservative default | pending; priority |
-| Jetson Thor | 11.0 | JetPack/ARM64/platform-specific toolchain; SDPA first; no generic server-kernel whitelist | pending; separate platform lane |
-| RTX5090 / RTX PRO Blackwell | 12.0 | Native build + SDPA first; explicitly qualify applicable SM120 low-bit/Sage/FA4 paths, each separately | pending |
-| DGX Spark / GB10 | 12.1 | ARM64 wheel/toolchain and host-memory constraints; do not relabel it B200; exact SM121 extensions require testing | pending; separate platform lane |
+| Family / representative products | CC | Safe first qualification path / important exclusions |
+|---|---|---|
+| Legacy Maxwell / Pascal | 5.x / 6.x | Compatible archived Torch/CUDA stack first; FP32/math fallback; no BF16/TF32/FP8/FP4 claim; unsupported wheels may make even this unavailable |
+| Volta / Turing, V100 / T4 | 7.0/7.2 / 7.5 | Native-compatible Torch SDPA/math, model memory permitting; no automatic FA2/BF16/FP8 qualification |
+| A100 / A30; A800 family where available | 8.0 | BF16/FP16, SDPA → eligible FA2/Sage2; INT8 separately; no native FP8/FP4 |
+| A10 / A40 / RTX3090 / RTX A6000 | 8.6 | BF16/FP16, eligible FA2/Sage2 after build probe; no native FP8/FP4; check PCIe peer paths |
+| Jetson Orin | 8.7 | JetPack/ARM64-native installation; conservative SDPA; no implied optional quant/attention-extension support |
+| L4 / L40 / L40S / RTX4090 | 8.9 | BF16 reference → eligible FP8/INT8 inference; Q8F only with its exact SM89 build; no native FP4 |
+| H100 / H200 / GH200; H800 where available | 9.0 | BF16 reference → eligible FA3/FA2/Sage2 and FP8; GH200 ARM64 and memory topology are separate build/host cases |
+| H20 | 9.0 | Product-aware runtime minimum; conservative FA2/Sage2/SDPA policy, verify installed kernels; not an H100 throughput equivalent |
+| B200 / GB200 | 10.0 | Native Torch build first; SDPA safe default; explicit qualified FA4; current SM120-only low-bit extensions rejected |
+| B300 / GB300 | 10.3 | Independently target SM103; do not assume SM100 binary/DeepGEMM entry qualifies; same conservative default |
+| Jetson Thor | 11.0 | JetPack/ARM64/platform-specific toolchain; SDPA first; no generic server-kernel whitelist |
+| RTX5090 / RTX PRO Blackwell | 12.0 | Native build + SDPA first; explicitly qualify applicable SM120 low-bit/Sage/FA4 paths, each separately |
+| DGX Spark / GB10 | 12.1 | ARM64 wheel/toolchain and host-memory constraints; do not relabel it B200; exact SM121 extensions require testing |
 | Any unlisted or future CC | unknown | Conservative probe only; no extrapolated optional-kernel capability or dtype guarantee | unverified, not supported by analogy |
 
 Minimal priority ladder: A100 single-device BF16 correctness → H20 product-aware
@@ -298,24 +295,9 @@ A useful coverage record is one row per
 `feature ID × GPU family × T-scenario × model/task × precision/backend`.
 Do not collapse this cross-product into a single “all cards supported” badge.
 
-The launcher now provides executable manual/Slurm and static/c10d paths plus
-host-local shard/inter-node replica group construction. Logical multi-agent
-CPU/Gloo tests run agents on the same physical host; even a four-worker result
-does not fill any multi-machine NCCL, hybrid-FSDP or ZeRO hardware cell.
-[Distributed training smoke](../tools/check_distributed_training.py) uses tiny
-synthetic Conv3d denoisers, not pretrained videos, and its selected scope must
-be retained in any evidence report. It checks all-rank full student/auxiliary
-parameter replicas (including FSDP full-state and ZeRO-3 gathered parameters),
-nonzero continuous-versus-resumed parameter deltas, optimizer/scaler/RNG/cursor
-trees, engine optimizer partitions, per-rank Torch AMP scalers, client EMA and
-method-specific sidecars.
-Matching unchanged weights do not qualify a resumed update. These checks still
-need execution on every claimed GPU/parallel combination, and are not full
-Gate R for a real pretrained model, its next loss and output quality. CPU and
-single-rank controls always retain `qualified=false`; even a GPU pass only
-qualifies the explicitly selected synthetic cases and observed host topology.
+The launcher provides manual/Slurm static and c10d paths, plus host-local shard/inter-node replica group construction. The [distributed training checker](../tools/check_distributed_training.py) compares continuous and resumed parameter updates, optimizer/scaler/RNG/cursor state, and method-specific sidecars using synthetic denoisers. Pair it with the actual pretrained-model workload when collecting quality and scaling results.
 
-## 9. Required result row and honest completion rule
+## 9. Reproducible result records
 
 | Field group | Must be stored for each real run |
 |---|---|
@@ -325,14 +307,6 @@ qualifies the explicitly selected synthetic cases and observed host topology.
 | Correctness | Actual backend/fallback status, max absolute/relative errors, gradients/updates, finite counts, sample IDs, save/resume comparison, sanitizer result and logs |
 | Resource/time | Initialization and steady-state allocated/reserved/device VRAM, CPU RSS/pinned/disk, cold compile/load, encoder/denoiser/VAE/save time, median/p95/max-rank training step, samples/s, TTFF and generated FPS |
 | Quality | Real output paths/hashes, evaluator revision and sample counts, paired-seed scores/CIs, action/audio-sync errors, scene drift/reset/static-collapse/failure rates |
-| Decision | `measured-pass`, `measured-fail`, `pending`, `unsupported`, or `blocked`; explicit scope and reason; paired baseline ID for every speed or memory claim |
+| Decision | `pass`, `fail`, `unsupported`, or `blocked`; explicit scope and reason; paired baseline ID for every speed or memory claim |
 
-Current logger/summary and kernel tools populate only part of this schema;
-topology, real quality evaluators, profiler traces and native-model qualification
-still need to be supplied. A host manifest or 200 finite steps does not imply
-that all fields are implemented or that quality is acceptable.
-
-中文验收顺序：先让**真实模型的一步**数学正确，再验证**同一模型的训练、保存、恢复和导出**，
-然后看**长时间稳定性与质量**，最后才比较加速和显存。只有跑过的精确组合才能填
-`measured-pass`；未完成的原生 action、MeanFlow、LTX-2、通用 SP、异构 teacher offload
-仍明确保留未完成标签。外部论文表格说明“哪些方向可能有效”，不能替代这条证据链。
+Record runtime summaries, profiler traces and task-specific quality outputs under the same run identifier. Compare speed and memory only between matched workloads.

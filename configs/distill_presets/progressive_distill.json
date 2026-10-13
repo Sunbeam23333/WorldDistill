@@ -1,0 +1,11 @@
+{
+  "distill_method": "progressive_distill",
+  "description": "Progressive halving with full-state teacher handoff at each stage.",
+  "progressive_stages": [64, 32, 16, 8, 4],
+  "progressive_stage_steps": 10000,
+  "progressive_loss_space": "v",
+  "progressive_reset_optimizer": true,
+  "prediction_type": "velocity",
+  "optimizer": "adamw",
+  "mixed_precision": "auto"
+}

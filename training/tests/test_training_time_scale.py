@@ -11,7 +11,7 @@ def test_nonstandard_router_time_scale_is_not_silently_trained(role):
     teacher = NoiseRoutedDenoiser(torch.nn.Linear(2, 2), torch.nn.Linear(2, 2), 0.5)
     student = NoiseRoutedDenoiser(torch.nn.Linear(2, 2), torch.nn.Linear(2, 2), 0.5)
     {"teacher": teacher, "student": student}[role].num_train_timesteps = 500
-    with pytest.raises(ValueError, match=f"{role} declares num_train_timesteps=500"):
+    with pytest.raises(ValueError, match="num_train_timesteps=.*disagrees"):
         TRAINER_REGISTRY["step_distill"](
             args=TrainerArgs(mixed_precision="no", report_to="none"),
             teacher_model=teacher, student_model=student,
@@ -29,7 +29,7 @@ def test_cogvideox_vp_process_is_rejected_by_flow_trainers(role):
     models = {"teacher": torch.nn.Linear(2, 2), "student": torch.nn.Linear(2, 2)}
     models[role] = DiffusersTrainingAdapter(CogVideoXTransformer3DModel(2, 2))
     assert models[role].training_noise_process == "vp"
-    with pytest.raises(ValueError, match=f"{role} declares training_noise_process='vp'"):
+    with pytest.raises(ValueError, match="VP training requires checkpoint scheduler"):
         TRAINER_REGISTRY["step_distill"](
             args=TrainerArgs(mixed_precision="no", report_to="none"),
             teacher_model=models["teacher"], student_model=models["student"],

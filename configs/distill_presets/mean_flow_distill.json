@@ -1,0 +1,12 @@
+{
+  "distill_method": "mean_flow_distill",
+  "description": "Teacher-guided MeanFlow with explicit endpoints and exact JVP target.",
+  "meanflow_diagonal_ratio": 0.75,
+  "meanflow_norm_power": 1.0,
+  "meanflow_norm_eps": 0.01,
+  "meanflow_hidden_dim": 128,
+  "prediction_type": "velocity",
+  "mixed_precision": "auto",
+  "optimizer": "adamw",
+  "runtime_teacher_offload": "cpu"
+}

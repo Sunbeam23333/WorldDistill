@@ -9,6 +9,10 @@ on:
 permissions:
   contents: read
 
+env:
+  OMP_NUM_THREADS: "1"
+  MKL_NUM_THREADS: "1"
+
 jobs:
   test:
     runs-on: ubuntu-latest
@@ -40,6 +44,9 @@ jobs:
           git ls-files --error-unmatch inference/lightx2v/utils/attention.py
           git ls-files --error-unmatch training/distributed_config.py training/utils/precision.py
           git ls-files --error-unmatch tools/check_distributed_training.py tools/check_runtime_streams.py
+          git ls-files --error-unmatch training/runtime/teacher_offload.py training/utils/context_parallel.py
+          git ls-files --error-unmatch training/trainers/mean_flow_distill_trainer.py training/trainers/joint_av_distill_trainer.py
+          git ls-files --error-unmatch tools/cache_training_data.py tools/evaluate_generated.py
 
       - name: Run contract and training-loop tests
         run: python -m pytest -q training/tests

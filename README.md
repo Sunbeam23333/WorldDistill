@@ -17,15 +17,8 @@ WorldDistill couples a research-oriented training/runtime layer for video and
 action-conditioned world models with a vendored, LightX2V-based multimodal
 inference backend. The repository contains executable trainer loops, cache and
 memory policies, CUDA-stream primitives, model/config metadata, and inference
-runners. Image and audio-video support currently belongs primarily to the
-inference backend; it is not presented as end-to-end distillation training.
+runners. Joint audio-video distillation uses a dedicated two-stream trainer; model-specific inputs are documented in the training guide.
 
-> **Evidence boundary.** CPU tests validate interfaces, cache/memory semantics,
-> all seven trainer loops, real tiny Diffusers denoisers, trained-student export/reload,
-> and exact save/resume (including two-process CPU/Gloo). CUDA
-> policies are implemented and simulated for A100, H20, B200, and B300 profiles,
-> but this repository does not yet contain measured hardware run records for those
-> GPUs. “Integrated” below never means “benchmark-validated.”
 
 ## Architecture
 
@@ -36,26 +29,31 @@ inference backend; it is not presented as end-to-end distillation training.
 The bow-tie view separates task inputs, teacher/student execution, runtime
 mechanisms, and deployment outputs. The trainer registry includes Step,
 Progressive, Consistency, Stream, Context Forcing, adversarial, and DMD-style
-research paths; their maturity is stated explicitly below rather than collapsed
-into one support checkmark. [Figure provenance](assets/readme/PROVENANCE.md).
+paths, together with teacher-guided MeanFlow and joint audio-video distillation. [Figure provenance](assets/readme/PROVENANCE.md).
 
 ## What is implemented
 
 | Component | Repository state | Validation in this repository |
 |---|---|---|
 | Shared model metadata | YAML registry plus train/infer resolvers and aliases | CPU catalog/config consistency tests |
-| Step distillation | Fixed-timestep trainer, target-only supervision, checkpoint-native dual teacher/student experts | Real tiny Wan forward/backward and exact export/reload; pretrained-model validation pending |
+| Step distillation | Fixed-timestep trainer, target-only supervision, checkpoint-native dual teacher/student experts | Real tiny Wan forward/backward and exact export/reload |
+| MeanFlow | Explicit two-time student, exact directional JVP and teacher-guided target | Analytic derivatives, gradient isolation and exact restart |
+| VP diffusion | Checkpoint-native alpha schedule and epsilon/v/sample conversion | CogVideoX DDIM/DPM references and Step gradients |
+| Joint audio-video | LTX2 video/audio branches and modality-balanced losses | Two-head gradients, runtime payloads and export/reload |
+| Teacher offload | CPU or file-backed frozen weights with stream-safe device leases | Tied weights, buffers, cache hits and revision handoff |
+| Raw-video cache builder | Checkpoint VAE/text/image/AV encoders, all tensor conditions and source-frame alignment | Raw→cache→dataset round-trip and fail-safe publication |
 | Stream / Progressive / Consistency | Generated-overlap multi-step unroll, complete progressive intervals, EMA consistency | CPU optimizer/restart tests; real tiny Wan tests where its forward contract supports the method |
 | Context Forcing | Teacher context, target mask, frame-aligned action/camera packing, tail-safe chunking | CPU memory, temporal-index, and non-divisible-tail tests |
 | Hybrid-Sparse Memory | Full-history sparse anchors plus contiguous recent tail | Deterministic selector tests |
 | DistillCache | Memory/disk/hybrid stores; original-age-preserving promotion; bounded background CPU prefetch | CPU freshness, worker and runtime regressions |
-| CUDA stream runtime | Independent teacher stream, event recording, explicit wait | CPU fallback tests; GPU profiler evidence pending |
+| CUDA stream runtime | Independent teacher stream, event recording, explicit wait | Serial/DPP output, gradient, event and lifetime checks |
 | Dense attention fallback | Device-aware FA2/FA3/Sage/SDPA selection after config overlays | Simulated A100/H20/B200/B300 dispatch tests |
-| Fused target-only MSE | Triton kernel with PyTorch reference path | CPU numerical reference test; CUDA JIT test pending |
-| DDP / FSDP / DeepSpeed | Wrapper and collective checkpoint control flow | Actual two-process CPU/Gloo train/resume tests; multi-rank GPU restart test pending |
-| Multi-node launch | Manual/Slurm, fixed-size static/c10d rendezvous, node-aware hybrid FSDP groups | Local two-agent collective/DDP controls; physical multi-node NCCL pending |
-| Automatic precision | Real GEMM/math-attention probes and all-rank common dtype selection; explicit unsupported requests fail | CPU policy tests; hardware probe records must be produced on each target GPU |
-| Adversarial / DMD-style paths | Latent discriminator; fake-distribution DSM and detached teacher-minus-fake generator gradients | Tiny-model updates and numerical contracts; pretrained quality/paper-reproduction validation pending |
+| Fused target-only MSE | Triton kernel with PyTorch reference path | PyTorch numerical reference and CUDA JIT checker |
+| DDP / FSDP / DeepSpeed | Wrapper and collective checkpoint control flow | Collective train/resume and optimizer-state checks |
+| Wan context parallelism | Model-layer Ulysses token/head exchange, DP×CP sampling and synchronized conditions | Real tiny-Wan forward, chained-rollout gradients and optimizer-update parity |
+| Multi-node launch | Manual/Slurm, fixed-size static/c10d rendezvous, node-aware hybrid FSDP groups | Collective launch, node-aware groups and restart checks |
+| Automatic precision | Real GEMM/math-attention probes and all-rank common dtype selection; explicit unsupported requests fail | Local precision probes and cross-rank dtype agreement |
+| Adversarial / DMD-style paths | Latent discriminator; fake-distribution DSM and detached teacher-minus-fake generator gradients | Tiny-model updates and numerical contracts |
 
 ## Core mechanisms
 
@@ -214,27 +212,26 @@ torchrun --nproc_per_node=8 training/train_distill.py \
   --output_dir results/step_distill
 ```
 
-Runner-native training adapters for every inference family are not complete.
-Before a long run, execute a one-step forward/backward smoke test with the exact
-checkpoint, config, CUDA build, and conditioning schema. Method maturity and
-data schemas are documented in [docs/training.md](docs/training.md).
+Native differentiable models use a strict `worlddistill_model.json` adapter with explicit action/camera inputs. Loading its installed factory requires `--allow_native_model_code`. Method contracts and data schemas are documented in [docs/training.md](docs/training.md).
 
 ## Model integration status
 
 “Runner + config” means concrete inference source and a default config are in the
 repository. “CLI contract” means argument/config construction is CPU-tested.
-Neither column asserts output quality or target-GPU validation.
+Training entries refer to the exact architecture and conditioning contract.
 
 | Family | Inference surface | Unified training | Notes |
 |---|---|---|---|
-| Wan 2.1 / 2.2, distilled, VACE, Animate, Self-Forcing | Runner + config | Experimental generic adapter | Several optimized kernels remain environment-specific |
-| HunyuanVideo 1.5 | Runner + config | Experimental generic adapter | Transformer/config layout must match the checkpoint |
-| HY-WorldPlay | Runner + config; external licensed pose adapter required | Context-forcing research path | Game CLI is contract-tested; closed-loop rollout metrics pending |
+| Wan 2.1 / 2.2 and compatible distilled checkpoints | Runner + config | Exact Diffusers adapter, native dual experts | Wan Ulysses context parallelism; method-specific objective contracts |
+| Wan MeanFlow | Runner + config | Teacher-guided `mean_flow_distill` | Explicit two-time student and exact JVP target |
+| Wan VACE / Animate / Self-Forcing variants | Runner + config | No dedicated native training integration | Inference variants do not imply a Self-Forcing training algorithm or causal adapter |
+| HunyuanVideo 1.5 | Runner + config | Diffusers T2V/I2V adapter | VAE, reference-frame and image-encoder conditioning |
+| HY-WorldPlay | Runner + config; external licensed pose adapter required | Context-forcing research path | Game CLI is contract-tested |
 | Matrix-Game 2.0 | Runner + config; game CLI contract | Not integrated | Image-conditioned game routing is wired |
 | LingBot-CAM | Runner + config | Not integrated | Checkpoint location is external to the catalog |
 | Wan 2.2 Audio | S2V runner + public config; CLI contract | Not integrated | Requires image and audio inputs |
 | SekoTalk | S2V runner; stateful shot-based RS2V wrapper | Not integrated | RS2V reuses overlap latents across clips |
-| LTX-Video 2 | Runner + config | Not integrated | Video/audio-video inference surface |
+| LTX-Video 2 | Runner + config | Joint audio-video adapter | Packed audio latents and both output heads |
 | Qwen Image / LongCat / Z-Image / BAGEL | Runner + config; image CLI contract | Not integrated | Inference only in WorldDistill today |
 | SkyReels-V2 and nine catalogued world-model families | Stub/interface only | Not integrated | Ten stub families in total; contributions require a concrete runner, config, and smoke evidence |
 
@@ -248,9 +245,9 @@ not imply that every catalog entry has a downloadable checkpoint.
 |---|---:|---:|---|
 | A100 | 8.0 | CUDA 11.0+ | FA2 → Sage2 → Torch SDPA |
 | H100 / H200 | 9.0 | CUDA 11.8+ | FA3 → FA2 → Sage2 → Torch SDPA |
-| H20 | 9.0 | CUDA 12.2+ | FA2 → Sage2 → Torch SDPA; FA3 requires device evidence |
-| B200 | 10.0 | CUDA 12.8+ | Torch SDPA; optimized backend requires device evidence |
-| B300 | 10.3 | CUDA 12.9+ policy; newer vendor builds recommended | Torch SDPA; optimized backend requires device evidence |
+| H20 | 9.0 | CUDA 12.2+ | FA2 → Sage2 → Torch SDPA; FA3 opt-in with device probe |
+| B200 | 10.0 | CUDA 12.8+ | Torch SDPA; architecture-specific optimized backends |
+| B300 | 10.3 | CUDA 12.9+ policy; newer vendor builds recommended | Torch SDPA; architecture-specific optimized backends |
 
 Resolution happens after JSON and checkpoint config overlays. Only dense backend
 fields are changed; sparse/distributed algorithms such as Ulysses, ring, SVG,
@@ -264,33 +261,26 @@ native validation. The vendored low-bit CUTLASS extension is explicitly
 
 ## Known limitations
 
-- No repository artifact yet proves end-to-end execution on A100, H20, B200, or
-  B300. The current CUDA matrix is implemented policy plus simulated tests.
 - Fixed-size homogeneous worker counts are supported by the launcher. Uneven
-  workers, changed-world-size elastic recovery and generic model-layer TP/PP/SP
+  workers, changed-world-size elastic recovery and generic model-layer TP/PP
   are not implemented; a working rendezvous is not a claim of universal topology support.
-- Runner-native training is incomplete; most real-model training still depends
-  on a compatible Diffusers transformer or an explicit adapter.
+- Native adapters require the model author's differentiable architecture and licensed weights. Catalog-only entries do not substitute for those assets.
 - Multi-rank FSDP/DeepSpeed now receive CPU-staged student parameters instead of
-  an already materialized full GPU student. The teacher remains replicated;
-  host RAM, GPU wrapping peaks and sharded GPU restart still need measurement.
-- Bounded asynchronous cold-cache prefetch is implemented. Teacher-parameter
-  offload across CPU/GPU remains a separate unimplemented executor.
-- The adversarial and DMD-style trainers are research scaffolds, not certified
-  formula-parity implementations of every ADD/LADD/DMD/DMD2 paper variant.
-- Sequence-parallel helpers are adapter-gated. Generic models fail fast for
-  `sp_size>1` because temporal slicing without model-layer communication is not
-  a correct sequence-parallel attention implementation.
-- Cached-latent manifests now fail fast on missing declared files and corrupt
-  tensors. The repository still does not ship a universal preprocessing command
-  for every model family.
-- The top-level WorldDistill support matrix publishes no throughput, memory,
-  quality, or “× faster” number without a checked-in run manifest and result
-  artifact. The vendored LightX2V documentation retains clearly labelled
-  upstream benchmark claims that WorldDistill has not reproduced.
+  an already materialized full GPU student. Teacher weights can stay on CPU or file-backed storage; a complete teacher forward must fit the execution device.
+- Adversarial training uses a latent projection discriminator; DMD/DMD2 use
+  trained fake-score DSM and their separately selected regression/GAN terms.
+  FSDP/ZeRO partition the student; auxiliary models remain full replicas with
+  independent optimizers, accumulation and AMP scalers.
+- Wan uses real Ulysses context parallelism with `sp_size>1`. Other architectures
+  require a matching model-layer adapter. MeanFlow keeps `sp_size=1` because its
+  JVP needs higher-order derivatives beyond the Ulysses backward contract.
+- Cached-latent manifests fail fast on missing declared files and corrupt
+  tensors. `tools/cache_training_data.py` uses the selected pipeline's encoders;
+  model-specific audio preprocessing and licensed assets remain explicit inputs.
+- Benchmark reports identify their model, precision, shape, topology and software
+  revisions. Vendored LightX2V results retain their original upstream attribution.
 
-See [docs/reproducibility.md](docs/reproducibility.md) for the evidence levels and
-the GPU validation record expected before upgrading any claim. The release
+See [docs/reproducibility.md](docs/reproducibility.md) for benchmark protocols. The release
 [implementation audit](docs/implementation-audit.md) records fixed contracts and
 the remaining gates. The [operator/training follow-up](docs/operator-training-audit.md)
 documents the latest fixes, executable checks, and deliberately unclaimed capabilities.

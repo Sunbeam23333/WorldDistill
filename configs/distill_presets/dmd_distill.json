@@ -1,0 +1,15 @@
+{
+  "distill_method": "dmd_distill",
+  "description": "DMD with trained fake-score DSM and online teacher regression.",
+  "dmd_variant": "dmd",
+  "dmd_fake_score_updates": 5,
+  "dmd_student_steps": 1,
+  "dmd_teacher_steps": 32,
+  "dmd_lambda_distill": 1.0,
+  "dmd_lambda_reg": 1.0,
+  "dmd_latent_channels": 16,
+  "prediction_type": "velocity",
+  "optimizer": "adamw",
+  "mixed_precision": "auto",
+  "notes": "For DMD2 choose dmd_variant=dmd2. Match dmd_latent_channels to the checkpoint for GAN training. Auxiliary networks are full replicas."
+}

@@ -15,6 +15,8 @@ def main():
     parser.add_argument("--output_dir", required=True)
     parser.add_argument("--num_steps", type=int)
     parser.add_argument("--student_architecture", help="Exact student Diffusers config directory if its training-time location moved")
+    parser.add_argument("--allow_native_model_code", action="store_true",
+                        help="Allow the installed factory declared by a trusted native-model descriptor")
     args = parser.parse_args()
     print(json.dumps(export_student(**vars(args)), indent=2))
 

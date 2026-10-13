@@ -45,6 +45,7 @@ class ContextForcingTrainer(BaseDistillTrainer):
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
+        self._require_velocity_prediction("Context forcing")
         self.memory_frames = self.args.memory_frames
         self.temporal_context_size = self.args.temporal_context_size
         self.curriculum_training = self.args.curriculum_training

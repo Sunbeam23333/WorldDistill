@@ -1,6 +1,6 @@
 """Small real-autograd checks for the algorithm/runtime completion work.
 
-These are CPU correctness tests, not GPU-throughput or checkpoint-quality claims.
+These exercise numerical objectives, optimizer updates and runtime contracts.
 """
 
 import copy
@@ -33,6 +33,18 @@ class TinyFlow(nn.Module):
         return hidden_states * self.scale
 
 
+class TinyAVFlow(TinyFlow):
+    supports_joint_av = True
+
+    def __init__(self, scale):
+        super().__init__(scale)
+        self.audio_scale = nn.Parameter(torch.tensor(scale))
+
+    def forward(self, hidden_states, timestep, audio_hidden_states, audio_timestep, **kwargs):
+        return {"sample": hidden_states * self.scale,
+                "audio_sample": audio_hidden_states * self.audio_scale}
+
+
 def make_trainer(method, output_dir, **overrides):
     values = dict(
         distill_method=method, output_dir=output_dir, mixed_precision="no",
@@ -48,10 +60,17 @@ def make_trainer(method, output_dir, **overrides):
     )
     values.update(overrides)
     args = TrainerArgs(**values)
-    teacher, student = TinyFlow(0.8), TinyFlow(0.4)
+    model_cls = TinyAVFlow if method == "joint_av_distill" else TinyFlow
+    teacher, student = model_cls(0.8), model_cls(0.4)
+    if method == "mean_flow_distill":
+        from training.utils.meanflow import MeanFlowTimeAdapter
+        student = MeanFlowTimeAdapter(student, latent_channels=2)
     optimizer = torch.optim.AdamW(student.parameters(), lr=args.learning_rate)
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lambda _: 1.0)
-    loader = DataLoader([{"latents": torch.randn(2, 6, 8, 8)}], batch_size=1)
+    sample = {"latents": torch.randn(2, 6, 8, 8)}
+    if method == "joint_av_distill":
+        sample["audio_latents"] = torch.randn(5, 3)
+    loader = DataLoader([sample], batch_size=1)
     return TRAINER_REGISTRY[method](
         args=args, teacher_model=teacher, student_model=student,
         optimizer=optimizer, lr_scheduler=scheduler, train_dataloader=loader,
@@ -244,16 +263,17 @@ class AlgorithmCorrectnessTests(unittest.TestCase):
             self.assertIsNone(generated.grad)
             self.assertFalse(torch.equal(before, trainer.fake_score_model.scale))
 
-    def test_all_seven_trainers_run_real_cpu_updates_and_save(self):
+    def test_all_registered_trainers_run_real_cpu_updates_and_save(self):
         for method in TRAINER_REGISTRY:
             with self.subTest(method=method), tempfile.TemporaryDirectory() as directory:
                 torch.manual_seed(17)
                 trainer = make_trainer(method, directory)
-                original = trainer.student_model.scale.detach().clone()
+                model = getattr(trainer.student_model, "base_model", trainer.student_model)
+                original = model.scale.detach().clone()
                 trainer.train()
                 self.assertEqual(trainer.global_step, 2)
-                self.assertTrue(torch.isfinite(trainer.student_model.scale))
-                self.assertFalse(torch.equal(original, trainer.student_model.scale))
+                self.assertTrue(torch.isfinite(model.scale))
+                self.assertFalse(torch.equal(original, model.scale))
                 self.assertTrue((Path(directory) / "checkpoint-2" / "trainer_state.pt").exists())
 
     def test_dmd2_two_time_scale_and_validation_does_not_update_auxiliaries(self):

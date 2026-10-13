@@ -49,6 +49,19 @@ class TinyDenoiser(torch.nn.Module):
         return self.projection(hidden_states)
 
 
+class TinyAVDenoiser(TinyDenoiser):
+    """Two trainable branches exercise joint AV optimizer and restart state."""
+    supports_joint_av = True
+
+    def __init__(self, scale):
+        super().__init__(scale)
+        self.audio_projection = torch.nn.Linear(3, 3)
+
+    def forward(self, hidden_states, timestep, audio_hidden_states, audio_timestep, **conditions):
+        return {"sample": self.projection(hidden_states),
+                "audio_sample": self.audio_projection(audio_hidden_states)}
+
+
 def gather(value):
     if not dist.is_initialized():
         return [value]
@@ -120,16 +133,9 @@ def _seed(seed):
 
 
 def unsupported_combination(method, options):
-    if options.parallel != "ddp" and method in {"progressive_distill", "adversarial_distill", "dmd_distill"}:
-        return "This trainer's auxiliary/stage transitions currently require replicated DDP"
-    if method == "consistency_distill" and (options.parallel == "fsdp" or
-            (options.parallel == "deepspeed" and options.zero_stage == 3)):
-        return "A sharded EMA target is not implemented for this combination"
-    if method in {"adversarial_distill", "dmd_distill"} and options.gradient_accumulation_steps != 1:
-        return "Auxiliary optimizer update frequency currently requires accumulation=1"
-    if options.mixed_precision == "fp16" and (options.parallel == "fsdp" or
-            method in {"adversarial_distill", "dmd_distill"}):
-        return "The required sharded/auxiliary GradScaler contract is not implemented"
+    # Auxiliary networks retain their own complete replicas/optimizers while
+    # the selected strategy wraps only the student. All registry methods have
+    # a corresponding execution and checkpoint path.
     return None
 
 
@@ -142,12 +148,13 @@ def check_replicas(trainer):
         if model is None:
             continue
         context = contextlib.nullcontext()
-        if trainer.parallel_mode == "deepspeed":
+        is_student = model is trainer.student_model
+        if is_student and trainer.parallel_mode == "deepspeed":
             import deepspeed
             if trainer.args.deepspeed_stage == 3:
                 context = deepspeed.zero.GatheredParameters(list(model.parameters()), modifier_rank=None)
         with context:
-            if trainer.parallel_mode == "fsdp":
+            if is_student and trainer.parallel_mode == "fsdp":
                 from torch.distributed.checkpoint.state_dict import get_model_state_dict, StateDictOptions
                 state = get_model_state_dict(model, options=StateDictOptions(full_state_dict=True, cpu_offload=False))
             else:
@@ -237,8 +244,12 @@ def train_resume_case(method, output, device, options):
     def construct(name, steps, resume=""):
         # Initialization identical across ranks, data/noise stream rank-specific.
         _seed(431)
-        teacher = TinyDenoiser(0.8).to(device)
-        student = TinyDenoiser(0.4)
+        model_cls = TinyAVDenoiser if method == "joint_av_distill" else TinyDenoiser
+        teacher = model_cls(0.8).to(device)
+        student = model_cls(0.4)
+        if method == "mean_flow_distill":
+            from training.utils.meanflow import MeanFlowTimeAdapter
+            student = MeanFlowTimeAdapter(student, latent_channels=2)
         if options.parallel == "ddp":
             student.to(device)
         args = TrainerArgs(
@@ -249,6 +260,7 @@ def train_resume_case(method, output, device, options):
             lr_scheduler="constant", resume_from=resume,
             report_to="none", log_every=1, save_every=100, gradient_checkpointing=False,
             gradient_accumulation_steps=options.gradient_accumulation_steps,
+            use_dual_model=bool(getattr(options, "dual_student", False) and method == "step_distill"),
             batch_size=1, num_workers=0, window_size=4, overlap_frames=2,
             denoising_steps_per_frame=2, curriculum_training=False,
             temporal_context_size=2, memory_frames=2,
@@ -260,6 +272,9 @@ def train_resume_case(method, output, device, options):
         optimizer = torch.optim.AdamW(student.parameters(), lr=args.learning_rate)
         generator = torch.Generator().manual_seed(601 + rank)
         loader = [{"latents": torch.randn(1, 2, 6, 8, 8, generator=generator)} for _ in range(3)]
+        if method == "joint_av_distill":
+            for batch in loader:
+                batch["audio_latents"] = torch.randn(1, 5, 3, generator=generator)
         trainer = TRAINER_REGISTRY[method](args=args, teacher_model=teacher, student_model=student,
             optimizer=optimizer, lr_scheduler=torch.optim.lr_scheduler.LambdaLR(optimizer, lambda _: 1.0),
             train_dataloader=loader, device=device)
@@ -312,6 +327,7 @@ def train_resume_case(method, output, device, options):
     if largest_update <= 1e-8 or all(torch.equal(actual[key], baseline[key]) for key in actual):
         raise AssertionError("No student parameter changed after resume")
     return {"status": "passed", "method": method, "precision": precision, "atol": atol, "rtol": rtol,
+            "dual_student": bool(getattr(options, "dual_student", False) and method == "step_distill"),
             "max_parameter_error": error, "max_reference_update": largest_update,
             "optimizer_rng_auxiliary_state_checked": True, "continuous_steps": 4, "interruption_step": 2,
             "scope": "synthetic denoiser optimizer/save/resume, not pretrained model quality"}
@@ -328,6 +344,7 @@ def main():
     parser.add_argument("--zero-stage", type=int, choices=[1, 2, 3], default=2)
     parser.add_argument("--cpu-offload", action="store_true")
     parser.add_argument("--gradient-accumulation-steps", type=int, default=1)
+    parser.add_argument("--dual-student", action="store_true", help="Exercise Step's unified high/low-noise student")
     parser.add_argument("--timeout", type=int, default=120, help="Process-group timeout in seconds")
     options = parser.parse_args()
     methods = list(TRAINER_REGISTRY) if options.methods == "all" else options.methods.split(",")
@@ -335,6 +352,8 @@ def main():
         parser.error("--methods must select distinct registered trainers")
     if options.gradient_accumulation_steps < 1 or options.timeout < 1:
         parser.error("gradient accumulation and timeout must be positive")
+    if options.dual_student and "step_distill" not in methods:
+        parser.error("--dual-student requires step_distill among the selected methods")
     if options.device == "cpu" and (options.parallel != "ddp" or torch.cuda.is_available()):
         parser.error("CPU validation supports DDP/Gloo only; on a GPU host explicitly hide GPUs for the CPU control run")
     os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")

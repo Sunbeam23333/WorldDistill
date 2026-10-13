@@ -15,9 +15,8 @@ class DiffusersRawBatchEncoder:
     """Encode raw video batches with auxiliary modules loaded from a diffusers pipeline.
 
     This adapter keeps the training loop in latent space while allowing the dataset to
-    provide raw `pixel_values` + prompt text. It is intentionally conservative:
-    - latent encoding is required;
-    - prompt encoding is best-effort and falls back gracefully when unavailable.
+    provide raw `pixel_values` + prompt text. Missing model-specific conditions
+    are errors; raw examples never silently become unconditional examples.
     """
 
     def __init__(self, model_path: str, device: torch.device, dtype: torch.dtype = torch.bfloat16):
@@ -48,7 +47,8 @@ class DiffusersRawBatchEncoder:
         self.encode_prompt = getattr(pipe, "encode_prompt", None)
         self.vae_scaling_factor = getattr(getattr(self.vae, "config", None), "scaling_factor", 1.0)
         self.temporal_compression_ratio = int(getattr(pipe, "vae_scale_factor_temporal",
-                                                     getattr(getattr(self.vae, "config", None), "temporal_compression_ratio", 1)))
+            getattr(pipe, "vae_temporal_compression_ratio", getattr(self.vae, "temporal_compression_ratio",
+                getattr(getattr(self.vae, "config", None), "temporal_compression_ratio", 1)))))
         if self.temporal_compression_ratio < 1:
             raise ValueError("VAE temporal compression ratio must be positive")
 
@@ -56,12 +56,18 @@ class DiffusersRawBatchEncoder:
             raise RuntimeError(
                 "Raw video mode requires a VAE in the teacher pipeline, but no `vae` component was found."
             )
+        # Auxiliary-only loading must still use the checkpoint's vision width,
+        # rather than the pipeline constructor's default for transformer=None.
+        transformer_config = Path(model_path) / "transformer" / "config.json"
+        if "HunyuanVideo15" in type(pipe).__name__ and transformer_config.is_file():
+            denoiser_config = json.loads(transformer_config.read_text())
+            pipe.vision_states_dim = denoiser_config.get("image_embed_dim", pipe.vision_states_dim)
 
         self._freeze_module(self.vae)
         self._freeze_module(self.image_encoder)
 
         self.vae.to(device)
-        for attr in ("text_encoder", "text_encoder_2", "text_encoder_3"):
+        for attr in ("text_encoder", "text_encoder_2", "text_encoder_3", "connectors", "audio_vae"):
             encoder = getattr(pipe, attr, None)
             self._freeze_module(encoder)
             if encoder is not None:
@@ -115,7 +121,70 @@ class DiffusersRawBatchEncoder:
             else:
                 raise RuntimeError("Prompt encoding produced no conditioning; refusing unconditional fallback")
 
+        if "HunyuanVideo15" in type(getattr(self, "pipe", None)).__name__:
+            self._encode_hunyuan15_conditions(batch)
+        if "LTX2" in type(getattr(self, "pipe", None)).__name__ and "audio_latents" not in batch:
+            # Audio inputs are log-mel features from the checkpoint's prescribed
+            # preprocessing; no guessed sample-rate/STFT transform is applied.
+            if "audio_pixel_values" not in batch:
+                raise ValueError("LTX2 raw AV encoding requires audio_pixel_values (checkpoint log-mel features) "
+                                 "or normalized packed audio_latents")
+            with torch.no_grad():
+                audio = self._extract_latents(self.pipe.audio_vae.encode(
+                    batch["audio_pixel_values"].to(self.device, dtype=self.dtype)))
+                if audio.ndim != 4:
+                    raise ValueError("LTX2 audio VAE must encode B,C,L,M latents")
+                packed = audio.transpose(1, 2).flatten(2, 3)
+                mean = self.pipe.audio_vae.latents_mean.to(packed)
+                std = self.pipe.audio_vae.latents_std.to(packed)
+                if not torch.isfinite(mean).all() or not torch.isfinite(std).all() or (std <= 0).any():
+                    raise ValueError("Invalid audio VAE normalization statistics")
+                batch["audio_latents"] = (packed - mean) / std
         return batch
+
+    @torch.no_grad()
+    def _encode_hunyuan15_conditions(self, batch: Dict[str, Any]) -> None:
+        """Match the upstream latent+mask and SigLIP branches for T2V/I2V."""
+        latents = batch["latents"]
+        if latents.ndim != 5:
+            raise ValueError("HunyuanVideo1.5 conditioning requires B,C,T,H,W latents")
+        b, c, t, h, w = latents.shape
+        is_i2v = "ImageToVideo" in type(self.pipe).__name__
+        if not is_i2v:
+            batch.setdefault("image_cond", latents.new_zeros(b, c + 1, t, h, w))
+            batch.setdefault("image_embeds", latents.new_zeros(
+                b, self.pipe.vision_num_semantic_tokens, self.pipe.vision_states_dim))
+            return
+        if "image_cond" in batch and "image_embeds" in batch:
+            return
+        pixels = batch.get("conditioning_pixel_values", batch.get("pixel_values"))
+        if not torch.is_tensor(pixels) or pixels.ndim not in (4, 5) or pixels.shape[0] != b or pixels.shape[1] != 3:
+            raise ValueError("HunyuanVideo1.5 I2V requires aligned RGB conditioning_pixel_values or raw pixel_values")
+        first = pixels[:, :, 0] if pixels.ndim == 5 else pixels
+        if not torch.isfinite(first).all() or first.min() < -1.001 or first.max() > 1.001:
+            raise ValueError("I2V conditioning pixels must be finite and normalized to [-1,1]")
+        if "image_cond" not in batch:
+            # Encode only the reference image, never target future video frames.
+            encoded = self.vae.encode(first.unsqueeze(2).to(self.device, dtype=self.dtype))
+            distribution = getattr(encoded, "latent_dist", None)
+            image_latent = distribution.mode() if distribution is not None else self._extract_latents(encoded)
+            image_latent = self._normalize_latents(image_latent)
+            if image_latent.shape != (b, c, 1, h, w):
+                raise ValueError("I2V reference image VAE latent does not match the target spatial/channel layout")
+            condition, mask = latents.new_zeros(latents.shape), latents.new_zeros(b, 1, t, h, w)
+            condition[:, :, :1] = image_latent.to(latents)
+            mask[:, :, :1] = 1
+            batch["image_cond"] = torch.cat((condition, mask), dim=1)
+        if "image_embeds" not in batch:
+            from PIL import Image
+            # Upstream encode_image repeats one image batch_size times; call it
+            # once per sample so different batch members keep their own image.
+            images = ((first.detach().float().cpu().clamp(-1, 1) + 1) * 127.5).round().byte()
+            batch["image_embeds"] = torch.cat([
+                self.pipe.encode_image(Image.fromarray(value.permute(1, 2, 0).numpy()),
+                    batch_size=1, device=self.device, dtype=self.dtype)
+                for value in images
+            ], dim=0)
 
     def _encode_pixels(self, pixel_values: torch.Tensor) -> torch.Tensor:
         pixels = pixel_values.to(self.device, dtype=self.dtype)
@@ -150,7 +219,9 @@ class DiffusersRawBatchEncoder:
 
     def _normalize_latents(self, latents: torch.Tensor) -> torch.Tensor:
         config = self.vae.config
-        mean, std = getattr(config, "latents_mean", None), getattr(config, "latents_std", None)
+        # LTX stores these as registered VAE buffers, not config attributes.
+        mean = getattr(self.vae, "latents_mean", getattr(config, "latents_mean", None))
+        std = getattr(self.vae, "latents_std", getattr(config, "latents_std", None))
         if mean is not None or std is not None:
             if mean is None or std is None:
                 raise ValueError("VAE must declare both latents_mean and latents_std")
@@ -159,7 +230,10 @@ class DiffusersRawBatchEncoder:
             std = torch.as_tensor(std, device=latents.device, dtype=torch.float32).reshape(shape)
             if (std <= 0).any() or not torch.isfinite(std).all() or not torch.isfinite(mean).all() or mean.shape[1] != latents.shape[1] or std.shape[1] != latents.shape[1]:
                 raise ValueError("Invalid per-channel VAE normalization statistics")
-            return ((latents.float() - mean) / std).to(latents.dtype)
+            scale = self.vae_scaling_factor if "LTX" in type(self.vae).__name__ else 1.0
+            if not isinstance(scale, (float, int)) or scale <= 0:
+                raise ValueError("Invalid VAE scaling factor")
+            return ((latents.float() - mean) * scale / std).to(latents.dtype)
         shift = getattr(config, "shift_factor", 0.0) or 0.0
         return (latents - shift) * self.vae_scaling_factor
 
@@ -228,6 +302,16 @@ class DiffusersRawBatchEncoder:
             return encoded.to(self.device)
         if isinstance(encoded, (tuple, list)):
             family = type(self.pipe).__name__
+            if "LTX2" in family:
+                if len(encoded) < 2 or not all(torch.is_tensor(v) for v in encoded[:2]):
+                    raise TypeError("LTX2 prompt encoder must return embeddings and attention mask")
+                with torch.no_grad():
+                    video, audio, mask = self.pipe.connectors(encoded[0], encoded[1],
+                        padding_side=getattr(self.tokenizer, "padding_side", "left"))
+                return {"encoder_hidden_states": video.to(self.device),
+                        "audio_encoder_hidden_states": audio.to(self.device),
+                        "encoder_attention_mask": mask.to(self.device),
+                        "audio_encoder_attention_mask": mask.to(self.device)}
             if "HunyuanVideo15" in family:
                 names = ("encoder_hidden_states", "encoder_attention_mask", "encoder_hidden_states_2", "encoder_attention_mask_2")
             elif "HunyuanVideo" in family:

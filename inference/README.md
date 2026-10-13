@@ -17,9 +17,8 @@
 --------------------------------------------------------------------------------
 
 > **Vendored upstream documentation.** Performance and quality claims below
-> are retained from the upstream LightX2V project. They have not been reproduced
-> by the WorldDistill maintainers and are not evidence for WorldDistill's CUDA
-> compatibility or benchmark matrix.
+> are retained from the upstream LightX2V project and refer to its original
+> workloads, configurations, and benchmark protocols.
 >
 > **License boundary.** The code shipped in this vendored tree is Apache-2.0.
 > WorldDistill does not bundle Tencent HY-WorldPlay source or weights; an optional

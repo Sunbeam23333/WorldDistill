@@ -107,6 +107,152 @@ def test_unmerged_lora_and_legacy_dual_fail_before_export(bundle, unsupported, t
     assert not destination.exists()
 
 
+@pytest.mark.parametrize("meanflow", [False, True])
+def test_lora_export_merges_actual_student_and_meanflow_time_conditioner(tmp_path, meanflow):
+    pytest.importorskip("peft")
+    from training.trainer_args import TrainerArgs
+    from training.train_distill import _apply_lora
+    from training.utils.meanflow import MeanFlowTimeAdapter
+    base = tmp_path / "base"
+    tiny_wan().save_pretrained(base / "transformer")
+    (base / "model_index.json").write_text(json.dumps({"_class_name": "WanPipeline",
+        "transformer": ["diffusers", "WanTransformer3DModel"]}))
+    student = load_diffusers_training_model(base)
+    if meanflow:
+        student = MeanFlowTimeAdapter(student, latent_channels=2, hidden_dim=12)
+    args = TrainerArgs(distill_method="mean_flow_distill" if meanflow else "step_distill",
+        use_lora=True, lora_rank=2, lora_alpha=4., lora_target_modules=["to_q", "to_k"],
+        meanflow_latent_channels=2, meanflow_hidden_dim=12)
+    student = _apply_lora(student, args).eval()
+    with torch.no_grad():
+        for name, parameter in student.named_parameters():
+            if "lora_B" in name or (meanflow and "modules_to_save.default" in name):
+                parameter.add_(0.05)
+    inputs = {"hidden_states": torch.randn(1, 2, 2, 2, 2), "timestep": torch.tensor([700.]),
+              "encoder_hidden_states": torch.randn(1, 3, 16)}
+    if meanflow:
+        inputs["timestep_r"] = torch.tensor([300.])
+    expected = student(**inputs)
+    checkpoint = tmp_path / "lora.pt"
+    torch.save({"student_model": student.state_dict(), "step": 4, "args": vars(args)}, checkpoint)
+    destination = tmp_path / "merged"
+    manifest = export_student(str(base), str(checkpoint), str(destination), num_steps=2)
+    restored = load_diffusers_training_model(destination).eval()
+    torch.testing.assert_close(restored(**inputs), expected, atol=2e-5, rtol=2e-5)
+    assert manifest["lora_merged"]
+    assert not any("lora_" in name or "modules_to_save" in name for name in restored.state_dict())
+
+
+@pytest.mark.parametrize("lora,compiled", [(False, False), (True, False), (True, True)])
+@pytest.mark.parametrize("layout", ["legacy", "unified_v1"])
+def test_dual_export_preserves_both_branches_and_shifted_native_boundary(tmp_path, lora, compiled, layout):
+    from training.model_adapter import NoiseRoutedDenoiser
+    from training.trainer_args import TrainerArgs
+    from training.train_distill import _apply_lora
+    if lora:
+        pytest.importorskip("peft")
+    base = tmp_path / "base"
+    tiny_wan().save_pretrained(base / "transformer")
+    (base / "model_index.json").write_text(json.dumps({"_class_name": "WanPipeline",
+        "transformer": ["diffusers", "WanTransformer3DModel"]}))
+    (base / "scheduler").mkdir()
+    (base / "scheduler" / "scheduler_config.json").write_text(json.dumps({"num_train_timesteps": 20}))
+    args = TrainerArgs(distill_method="step_distill", use_dual_model=True, use_lora=lora,
+        lora_rank=2, lora_alpha=4., lora_target_modules=["to_q", "to_k"], sample_shift=3.,
+        boundary_step_index=2, enable_torch_compile=compiled, torch_compile_scope="student")
+    if layout == "unified_v1":
+        args.dual_student_layout = layout
+    high = load_diffusers_training_model(base)
+    if lora:
+        high = _apply_lora(high, args)
+    low = copy.deepcopy(high)
+    with torch.no_grad():
+        for branch, delta in ((high, .03), (low, -.07)):
+            for name, parameter in branch.named_parameters():
+                if not lora or "lora_B" in name:
+                    parameter.add_(delta)
+    high.eval(); low.eval()
+    inputs = {"hidden_states": torch.randn(2, 2, 2, 2, 2), "timestep": torch.tensor([16., 8.]),
+              "encoder_hidden_states": torch.randn(2, 3, 16)}
+    expected = NoiseRoutedDenoiser(high, low, .75, 20)(**inputs)
+    checkpoint = tmp_path / "trainer_state.pt"
+    saved_high = torch.compile(high, backend="eager") if compiled else high
+    saved_low = torch.compile(low, backend="eager") if compiled else low
+    saved = NoiseRoutedDenoiser(saved_high, saved_low, .75, 20) if layout == "unified_v1" else saved_high
+    torch.save({"student_model": saved.state_dict(), "step": 4, "args": vars(args)}, checkpoint)
+    if layout == "legacy":
+        torch.save(saved_low.state_dict(), tmp_path / "student_low.pt")
+    else:
+        torch.save({"dual_student_layout": "unified_v1", "num_train_timesteps": 20,
+                    "distill_timesteps": [20., 18., 15., 10.], "boundary_step_index": 2},
+                   tmp_path / "dual_student_state.pt")
+    destination = tmp_path / "dual"
+    manifest = export_student(str(base), str(checkpoint), str(destination))
+    restored = load_diffusers_training_model(destination).eval()
+    torch.testing.assert_close(restored(**inputs), expected, atol=2e-5, rtol=2e-5)
+    assert manifest["legacy_dual_consolidated"] == (layout == "legacy")
+    assert manifest["requires_adapter_sampling"]
+    assert manifest["low_checkpoint_sha256"] == (file_sha256(tmp_path / "student_low.pt") if layout == "legacy" else None)
+    assert manifest["boundary_ratio"] == pytest.approx(.75)
+    assert manifest["trained_sampling_timesteps"] == pytest.approx([20, 18, 15, 10])
+    assert manifest["components"] == ["transformer", "transformer_2"]
+    assert not any("lora_" in name for name in restored.state_dict())
+    if layout == "unified_v1":
+        assert manifest["dual_routing_state_sha256"] == file_sha256(tmp_path / "dual_student_state.pt")
+        routing = torch.load(tmp_path / "dual_student_state.pt", weights_only=True)
+        routing["boundary_step_index"] = 1
+        torch.save(routing, tmp_path / "dual_student_state.pt")
+        with pytest.raises(ValueError, match="routing state disagrees"):
+            export_student(str(base), str(checkpoint), str(tmp_path / "invalid-routing"))
+
+
+def test_vp_step_times_match_integer_scheduler_and_native_default_rescaling():
+    from training.student_export import _step_distill_timesteps
+    model = SimpleNamespace(num_train_timesteps=20, training_noise_process="vp")
+    config = {"denoising_step_list": [1000, 750, 500, 250], "sample_shift": 1}
+    assert _step_distill_timesteps(config, model) == [19, 15, 10, 5]
+    with pytest.raises(ValueError, match="VP"):
+        _step_distill_timesteps({**config, "sample_shift": 3}, model)
+
+
+@pytest.mark.parametrize("lora", [False, True])
+def test_native_dual_wan_meanflow_export_retains_nested_router_and_endpoint_adapter(tmp_path, lora):
+    from training.model_adapter import NoiseRoutedDenoiser
+    from training.trainer_args import TrainerArgs
+    from training.train_distill import _apply_lora
+    from training.utils.meanflow import MeanFlowTimeAdapter
+    if lora:
+        pytest.importorskip("peft")
+    base = tmp_path / "base_dual"
+    tiny_wan().save_pretrained(base / "transformer")
+    tiny_wan().save_pretrained(base / "transformer_2")
+    (base / "model_index.json").write_text(json.dumps({"_class_name": "WanPipeline", "boundary_ratio": .6,
+        "transformer": ["diffusers", "WanTransformer3DModel"],
+        "transformer_2": ["diffusers", "WanTransformer3DModel"]}))
+    args = TrainerArgs(distill_method="mean_flow_distill", use_lora=lora,
+        lora_rank=2, lora_alpha=4., lora_target_modules=["to_q", "to_k"],
+        meanflow_latent_channels=2, meanflow_hidden_dim=12)
+    student = MeanFlowTimeAdapter(load_diffusers_training_model(base), latent_channels=2, hidden_dim=12)
+    if lora:
+        student = _apply_lora(student, args)
+    with torch.no_grad():
+        for name, parameter in student.named_parameters():
+            if "lora_B" in name or "time_conditioner" in name:
+                parameter.add_(.03)
+    student.eval()
+    inputs = {"hidden_states": torch.randn(2, 2, 2, 2, 2), "timestep": torch.tensor([700., 300.]),
+              "timestep_r": torch.tensor([600., 200.]), "encoder_hidden_states": torch.randn(2, 3, 16)}
+    expected = student(**inputs)
+    checkpoint = tmp_path / "trainer_state.pt"
+    torch.save({"student_model": student.state_dict(), "step": 4, "args": vars(args)}, checkpoint)
+    output = tmp_path / "meanflow_dual"
+    export_student(str(base), str(checkpoint), str(output), num_steps=2)
+    restored = load_diffusers_training_model(output).eval()
+    assert isinstance(restored, MeanFlowTimeAdapter) and isinstance(restored.base_model, NoiseRoutedDenoiser)
+    assert restored.base_model.boundary_ratio == .6
+    torch.testing.assert_close(restored(**inputs), expected, atol=2e-5, rtol=2e-5)
+
+
 def test_explicit_teacher_file_is_not_replaced_by_default_weights(tmp_path):
     from training.train_distill import _load_models
     teacher = tiny_wan()
@@ -223,6 +369,16 @@ def test_ambiguous_export_leaves_no_partial_bundle(bundle, tmp_path):
     with pytest.raises(ValueError, match="explicit --num_steps"):
         export_student(str(base), str(checkpoint), str(destination))
     assert not destination.exists()
+
+
+def test_explicit_steps_keep_legacy_missing_schedule_export_without_replay_claim(bundle, tmp_path):
+    base, checkpoint, _, _, _ = bundle
+    state = torch.load(checkpoint, weights_only=False)
+    state["args"].pop("denoising_step_list")
+    torch.save(state, checkpoint)
+    manifest = export_student(str(base), str(checkpoint), str(tmp_path / "legacy-count"), num_steps=3)
+    assert manifest["num_inference_steps"] == 3
+    assert manifest["trained_sampling_timesteps"] is None
 
 
 def progressive_checkpoint(tmp_path, stage=0, global_step=7):

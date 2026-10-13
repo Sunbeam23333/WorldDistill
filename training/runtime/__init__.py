@@ -99,6 +99,8 @@ def build_runtime(
         runtime_name = "world_model" if getattr(args, "distill_method", "") == "context_forcing" else "teacher_student"
 
     if runtime_name in {"noop", "none"}:
+        if getattr(args, "runtime_teacher_offload", "none") != "none":
+            raise ValueError("runtime_teacher_offload requires an active runtime, not runtime_name=none/noop")
         return None
 
     runtime_cls = TeacherStudentRuntime

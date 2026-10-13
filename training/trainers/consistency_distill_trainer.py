@@ -33,6 +33,9 @@ from loguru import logger
 
 from training.trainers.base_distill_trainer import BaseDistillTrainer, EMAModel
 from training.utils.model_output import extract_prediction_tensor
+from training.utils.sharded_state import ShardedEMA
+from training.utils.distributed import wrap_model_fsdp
+from training.runtime.teacher_offload import TeacherParameterOffloader
 
 
 class ConsistencyDistillTrainer(BaseDistillTrainer):
@@ -64,7 +67,7 @@ class ConsistencyDistillTrainer(BaseDistillTrainer):
         # Create dedicated EMA for consistency target (separate from base EMA)
         # This EMA tracks the student and provides stable targets.
         raw_student = self._unwrap_model(self.student_model)
-        self.consistency_ema = EMAModel(
+        self.consistency_ema = None if self.parallel_mode == "fsdp" else EMAModel(
             raw_student,
             decay=self.args.ema_decay,
             warmup_steps=getattr(self.args, "ema_warmup_steps", 0),
@@ -72,13 +75,52 @@ class ConsistencyDistillTrainer(BaseDistillTrainer):
         # We also need a model instance to load EMA weights into for forward pass
         # ZeRO-1/2 may receive a CPU-staged student. The frozen full EMA target
         # is outside that engine and must live on its actual forward device.
-        self.ema_model = copy.deepcopy(raw_student).to(self.device)
-        self.consistency_ema.shadow = {
-            name: value.to(self.device) for name, value in self.consistency_ema.shadow.items()
-        }
+        target_device = torch.device("cpu") if self._parameters_are_sharded() else self.device
+        self.ema_model = copy.deepcopy(raw_student).to(target_device)
+        if self.consistency_ema is not None:
+            self.consistency_ema.shadow = {
+                name: value.to(target_device) for name, value in self.consistency_ema.shadow.items()
+            }
         self.ema_model.eval()
         for p in self.ema_model.parameters():
             p.requires_grad = False
+        self._ema_offloader = None
+
+    def _initialize_parallel_targets(self):
+        if self.parallel_mode == "fsdp" and not self._is_fsdp_wrapped(self.ema_model):
+            if not self._is_fsdp_wrapped(self.student_model):
+                raise RuntimeError("Initialize the FSDP student before its consistency target")
+            self.ema_model = wrap_model_fsdp(
+                self.ema_model,
+                shard_strategy=self.args.fsdp_shard_strategy,
+                cpu_offload=self.args.cpu_offload,
+                mixed_precision=self.args.mixed_precision,
+            )
+            self.consistency_ema = ShardedEMA(
+                self._unwrap_model(self.student_model), parallel_mode="fsdp",
+                decay=self.args.ema_decay, warmup_steps=self.args.ema_warmup_steps,
+            )
+        elif self.parallel_mode == "deepspeed" and self.args.deepspeed_stage == 3 and self._ema_offloader is None:
+            from deepspeed.utils import safe_get_full_fp32_param
+
+            for name, parameter in self._unwrap_model(self.student_model).named_parameters():
+                if name in self.consistency_ema.shadow:
+                    value = safe_get_full_fp32_param(parameter)
+                    if value is None or value.shape != self.consistency_ema.shadow[name].shape:
+                        raise RuntimeError(f"ZeRO-3 consistency initialization cannot read {name!r}")
+                    self.consistency_ema.shadow[name].copy_(value.detach().cpu())
+            self.consistency_ema.apply_to(self.ema_model)
+            self._ema_offloader = TeacherParameterOffloader(self.ema_model, self.device, target="cpu")
+        elif self.consistency_ema is not None and self.consistency_ema.step_count == 0:
+            parameters = dict(self._unwrap_model(self.student_model).named_parameters())
+            self.consistency_ema.shadow = {
+                name: parameters[name].detach().to(device=value.device, dtype=value.dtype).clone()
+                for name, value in self.consistency_ema.shadow.items()
+            }
+
+    def _close_parallel_targets(self):
+        if self._ema_offloader is not None:
+            self._ema_offloader.close()
 
     def _get_delta(self) -> float:
         """Get current ODE step size delta, optionally decayed over training."""
@@ -161,11 +203,19 @@ class ConsistencyDistillTrainer(BaseDistillTrainer):
 
         # --- EMA model prediction at t_{n-1} (target) ---
         # Sync EMA weights into ema_model
-        self.consistency_ema.apply_to(self.ema_model)
+        if self.consistency_ema is None:
+            raise RuntimeError("Initialize distributed consistency targets before forward")
+        if self._ema_offloader is not None:
+            self._ema_offloader.synchronize()
+        target = self._unwrap_model(self.ema_model) if isinstance(self.consistency_ema, ShardedEMA) else self.ema_model
+        self.consistency_ema.apply_to(target)
 
         ema_input = self.prepare_teacher_input(batch, noisy_latents_n1, t_n1)
         with torch.no_grad():
-            ema_output = self.ema_model(**ema_input)
+            if self._ema_offloader is not None:
+                ema_output, _ = self._ema_offloader.forward(ema_input)
+            else:
+                ema_output = self.ema_model(**ema_input)
             ema_output = extract_prediction_tensor(ema_output, tag="consistency EMA")
 
         sigma_n1_expanded = sigma_n1.view(bs, *([1] * (latents.dim() - 1)))
@@ -214,13 +264,66 @@ class ConsistencyDistillTrainer(BaseDistillTrainer):
 
     def on_train_step_end(self, metrics):
         """Update EMA after each step."""
+        if metrics.get("optimizer_skipped", 0):
+            return
         raw_student = self._unwrap_model(self.student_model)
-        self.consistency_ema.update(raw_student)
+        if self.parallel_mode == "deepspeed" and self.args.deepspeed_stage == 3:
+            # Gather one original parameter at a time using the public ZeRO-3
+            # API. Its FP32 EMA lives on CPU; the target is offloaded between
+            # forwards instead of keeping another full model on every GPU.
+            from deepspeed.utils import safe_get_full_fp32_param
+
+            decay = self.consistency_ema.get_decay()
+            with torch.no_grad():
+                for name, parameter in raw_student.named_parameters():
+                    if name not in self.consistency_ema.shadow:
+                        continue
+                    value = safe_get_full_fp32_param(parameter)
+                    if value is None or value.shape != self.consistency_ema.shadow[name].shape:
+                        raise RuntimeError(f"ZeRO-3 consistency target cannot read full parameter {name!r}")
+                    self.consistency_ema.shadow[name].mul_(decay).add_(value.detach().cpu(), alpha=1 - decay)
+            self.consistency_ema.step_count += 1
+        else:
+            self.consistency_ema.update(raw_student)
+
+    def _local_target_state(self):
+        model = self._unwrap_model(self.ema_model)
+        return {
+            "parameters": {name: value.detach().cpu().clone() for name, value in model.named_parameters()},
+            "buffers": {name: value.detach().cpu().clone() for name, value in model.named_buffers()},
+        }
+
+    @torch.no_grad()
+    def _restore_local_target_state(self, state):
+        model = self._unwrap_model(self.ema_model)
+        for kind, current in (("parameters", dict(model.named_parameters())), ("buffers", dict(model.named_buffers()))):
+            values = state.get(kind)
+            if not isinstance(values, dict) or values.keys() != current.keys():
+                raise ValueError(f"Consistency target {kind} names differ")
+            for name, value in values.items():
+                if not isinstance(value, torch.Tensor) or value.shape != current[name].shape:
+                    raise ValueError(f"Consistency target {name} shard shape differs")
+            for name, value in values.items():
+                current[name].copy_(value.to(current[name].device, dtype=current[name].dtype))
 
     def save_checkpoint(self, step: int, output_dir: str):
         """Save checkpoint including EMA model."""
         super().save_checkpoint(step, output_dir)
         ckpt_dir = os.path.join(output_dir, f"checkpoint-{step}")
+        if self._ema_offloader is not None:
+            self._ema_offloader.synchronize()
+        if isinstance(self.consistency_ema, ShardedEMA):
+            ema_path = os.path.join(ckpt_dir, f"consistency_ema_rank_{self.rank:05d}.pt")
+            def _save_local():
+                temporary = f"{ema_path}.tmp-{os.getpid()}"
+                try:
+                    torch.save({"consistency_ema": self.consistency_ema.state_dict(), "target": self._local_target_state()}, temporary)
+                    os.replace(temporary, ema_path)
+                finally:
+                    if os.path.exists(temporary):
+                        os.remove(temporary)
+            self._run_all_ranks_or_raise(_save_local, "Save sharded consistency target")
+            return
         ema_path = os.path.join(ckpt_dir, "ema_state.pt")
         self._atomic_save_rank0(
             ema_path,
@@ -235,14 +338,25 @@ class ConsistencyDistillTrainer(BaseDistillTrainer):
         """Load checkpoint including EMA model."""
         super().load_checkpoint(path)
         ckpt_dir = path if os.path.isdir(path) else os.path.dirname(path)
+        if isinstance(self.consistency_ema, ShardedEMA):
+            ema_path = os.path.join(ckpt_dir, f"consistency_ema_rank_{self.rank:05d}.pt")
+            def _restore_local():
+                state = torch.load(ema_path, map_location="cpu", weights_only=True)
+                self.consistency_ema.load_state_dict(state["consistency_ema"])
+                self._restore_local_target_state(state["target"])
+            self._run_all_ranks_or_raise(_restore_local, "Restore sharded consistency target")
+            return
         ema_path = os.path.join(ckpt_dir, "ema_state.pt")
         ema_state = self._load_checkpoint_file_all_ranks(
             ema_path,
             description=f"Load consistency EMA checkpoint {ema_path}",
             weights_only=False,
+            map_location="cpu",
         )
 
         def _restore_consistency_ema():
+            if self._ema_offloader is not None:
+                self._ema_offloader.synchronize()
             if not isinstance(ema_state, dict):
                 raise TypeError(
                     f"Expected consistency EMA checkpoint dict, got {type(ema_state).__name__}"

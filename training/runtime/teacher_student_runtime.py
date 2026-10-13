@@ -5,7 +5,7 @@ substrate for distillation-aware overlap:
 - teacher-output / teacher-context caching
 - CUDA-stream based teacher-student overlap (DPP primitive)
 - cache-backed supervision buffering
-- bounded CPU cache prefetch and explicit future heterogeneous-placement plans
+- bounded CPU cache prefetch and event-safe teacher parameter offload
 """
 
 from __future__ import annotations
@@ -24,6 +24,7 @@ import torch.nn as nn
 from loguru import logger
 
 from training.runtime.distill_cache import DistillCache, move_payload_to_device
+from training.runtime.teacher_offload import TeacherParameterLease, TeacherParameterOffloader
 from training.utils.model_output import extract_prediction_tensor
 
 
@@ -66,6 +67,7 @@ class PendingTeacherForward:
     cache_namespace: str = "teacher_output"
     from_cache: bool = False
     cache_written: bool = False
+    parameter_lease: Optional[TeacherParameterLease] = None
 
 
 class TeacherStudentRuntime:
@@ -93,6 +95,8 @@ class TeacherStudentRuntime:
         self.prefetch_policy = getattr(args, "runtime_prefetch_policy", "none")
         self.enable_heterogeneous = getattr(args, "runtime_enable_heterogeneous", False)
         self.teacher_offload = getattr(args, "runtime_teacher_offload", "none")
+        if self.teacher_offload not in {"none", "cpu", "nvme"}:
+            raise ValueError(f"Unsupported runtime_teacher_offload: {self.teacher_offload!r}")
         self.enable_dpp = bool(getattr(args, "runtime_enable_dpp", False))
         self.teacher_stream_priority = int(getattr(args, "runtime_teacher_stream_priority", 0))
         self.cache_identity = self._build_cache_identity()
@@ -115,6 +119,16 @@ class TeacherStudentRuntime:
         self.step_state = RuntimeStepState()
         self._teacher_stream: Optional[torch.cuda.Stream] = None
         self._maybe_init_dpp_stream()
+        self._teacher_offloader = None
+        if self.teacher_offload != "none":
+            offload_dir = getattr(args, "runtime_teacher_offload_dir", "") or os.path.join(
+                getattr(args, "output_dir", "."), "runtime_teacher_weights"
+            )
+            self._teacher_offloader = TeacherParameterOffloader(
+                teacher_model, self.device, target=self.teacher_offload,
+                directory=offload_dir,
+                pin_memory=bool(getattr(args, "runtime_teacher_offload_pin_memory", True)),
+            )
 
     def begin_step(self, global_step: int, batch: dict[str, Any]) -> RuntimeStepState:
         self.step_state = RuntimeStepState(
@@ -129,15 +143,31 @@ class TeacherStudentRuntime:
         return None
 
     def close(self) -> None:
-        """Drain CPU I/O before releasing runtime/cache ownership."""
+        """Drain I/O and CUDA work before releasing runtime-owned resources."""
+        self._drain_prefetch()
+        self.synchronize_teacher()
+        if self._teacher_offloader is not None:
+            self._teacher_offloader.close()
+
+    def _drain_prefetch(self) -> None:
         if self._prefetch_executor is not None:
             self._prefetch_executor.shutdown(wait=True, cancel_futures=True)
             self._prefetch_executor = None
         self._prefetch_futures.clear()
 
+    def synchronize_teacher(self) -> None:
+        """Finish teacher work before a checkpoint or external weight handoff."""
+        if self._teacher_stream is not None:
+            self._teacher_stream.synchronize()
+        if self._teacher_offloader is not None:
+            self._teacher_offloader.synchronize()
+
     def advance_teacher_revision(self, revision: str) -> None:
         """Invalidate supervision identity after an in-memory teacher handoff."""
-        self.close()
+        self._drain_prefetch()
+        self.synchronize_teacher()
+        if self._teacher_offloader is not None:
+            self._teacher_offloader.refresh_weights()
         self.cache_identity = hashlib.sha256(
             f"{self._base_cache_identity}:{revision}".encode("utf-8")
         ).hexdigest()
@@ -220,6 +250,8 @@ class TeacherStudentRuntime:
                 extra=cache_extra,
             )
             cached = self._get_cached_value(cache_key, current_step=global_step)
+            if not self._context_cache_hit_agreement(cached is not None):
+                cached = None
             if cached is not None:
                 self._async_teacher_cache_hits += 1
                 self._plan_prefetch(
@@ -227,13 +259,14 @@ class TeacherStudentRuntime:
                     cache_extra=cache_extra,
                     placement_plan=placement_plan,
                 )
+                cached_output = move_payload_to_device(cached, self.device)
                 return PendingTeacherForward(
-                    output=move_payload_to_device(cached, self.device),
+                    output=cached_output,
                     global_step=global_step,
                     cache_key=cache_key,
                     cache_enabled=True,
                     cache_metadata=None,
-                    ready_event=None,
+                    ready_event=self._record_teacher_ready_event(),
                     placement_plan=placement_plan,
                     cache_namespace=cache_namespace,
                     from_cache=True,
@@ -265,7 +298,7 @@ class TeacherStudentRuntime:
             teacher_stream.wait_stream(current_stream)
             self._record_payload_stream(input_kwargs, teacher_stream)
             with torch.cuda.stream(teacher_stream):
-                output = self._run_model(self.teacher_model, input_kwargs, no_grad=True, tag="teacher")
+                output, parameter_lease = self._run_teacher_model(input_kwargs)
             ready_event = torch.cuda.Event(blocking=False)
             teacher_stream.record_event(ready_event)
             self._async_teacher_launches += 1
@@ -281,20 +314,22 @@ class TeacherStudentRuntime:
                 cache_namespace=cache_namespace,
                 from_cache=False,
                 cache_written=False,
+                parameter_lease=parameter_lease,
             )
 
-        output = self._run_model(self.teacher_model, input_kwargs, no_grad=True, tag="teacher")
+        output, parameter_lease = self._run_teacher_model(input_kwargs)
         return PendingTeacherForward(
             output=output,
             global_step=global_step,
             cache_key=cache_key,
             cache_enabled=use_cache and cache_key is not None,
             cache_metadata=cache_metadata,
-            ready_event=None,
+            ready_event=self._record_teacher_ready_event(),
             placement_plan=placement_plan,
             cache_namespace=cache_namespace,
             from_cache=False,
             cache_written=False,
+            parameter_lease=parameter_lease,
         )
 
     def wait_teacher(self, handle: PendingTeacherForward) -> Any:
@@ -302,7 +337,8 @@ class TeacherStudentRuntime:
             current_stream = torch.cuda.current_stream(device=self.device)
             current_stream.wait_event(handle.ready_event)
             self._record_payload_stream(handle.output, current_stream)
-            self._async_teacher_waits += 1
+            if self.can_pipeline_teacher_student() and not handle.from_cache:
+                self._async_teacher_waits += 1
 
         if handle.cache_enabled and handle.cache_key is not None and not handle.cache_written:
             assert self.distill_cache is not None
@@ -359,6 +395,8 @@ class TeacherStudentRuntime:
 
         cache_key = self.build_cache_key(namespace=namespace, batch=batch, extra=extra)
         cached = self._get_cached_value(cache_key, current_step=global_step)
+        if not self._context_cache_hit_agreement(cached is not None):
+            cached = None
         if cached is not None:
             return move_payload_to_device(cached, self.device)
 
@@ -374,6 +412,16 @@ class TeacherStudentRuntime:
             },
         )
         return value
+
+    def _context_cache_hit_agreement(self, available: bool) -> bool:
+        """A CP teacher collective must be entered by every rank or by none."""
+        group = getattr(self, "context_parallel_group", None)
+        if group is None:
+            return available
+        import torch.distributed as dist
+        flag = torch.tensor(int(available), dtype=torch.int32, device=self.device)
+        dist.all_reduce(flag, op=dist.ReduceOp.MIN, group=group)
+        return bool(flag.item())
 
     def select_memory_frames(
         self,
@@ -509,7 +557,22 @@ class TeacherStudentRuntime:
         base_stats["async_teacher_launches"] = self._async_teacher_launches
         base_stats["async_teacher_waits"] = self._async_teacher_waits
         base_stats["async_teacher_cache_hits"] = self._async_teacher_cache_hits
+        if self._teacher_offloader is not None:
+            base_stats.update(self._teacher_offloader.stats())
         return base_stats
+
+    def _run_teacher_model(self, input_kwargs):
+        if self._teacher_offloader is None:
+            return self._run_model(self.teacher_model, input_kwargs, no_grad=True, tag="teacher"), None
+        output, lease = self._teacher_offloader.forward(input_kwargs)
+        return self._normalize_model_output(output, tag="teacher"), lease
+
+    def _record_teacher_ready_event(self):
+        if self.device.type != "cuda":
+            return None
+        event = torch.cuda.Event(blocking=False)
+        torch.cuda.current_stream(self.device).record_event(event)
+        return event
 
     def _run_model(
         self,
@@ -527,6 +590,10 @@ class TeacherStudentRuntime:
 
     @staticmethod
     def _normalize_model_output(output: Any, tag: str = "model") -> Any:
+        if isinstance(output, dict) and "audio_sample" in output:
+            if not isinstance(output.get("sample"), torch.Tensor) or not isinstance(output["audio_sample"], torch.Tensor):
+                raise TypeError(f"{tag} joint audio/video output requires sample and audio_sample tensors")
+            return {"sample": output["sample"], "audio_sample": output["audio_sample"]}
         return extract_prediction_tensor(output, tag=tag)
 
     @staticmethod
@@ -544,10 +611,8 @@ class TeacherStudentRuntime:
 
     def _build_teacher_placement_plan(self, namespace: str) -> RuntimePlacementPlan:
         execution_device = str(self.device)
-        offload_target = "none"
+        offload_target = self.teacher_offload
         allow_async_prefetch = self.prefetch_policy != "none"
-        if self.enable_heterogeneous:
-            offload_target = self.teacher_offload
         return RuntimePlacementPlan(
             namespace=namespace,
             execution_device=execution_device,
@@ -617,12 +682,11 @@ class TeacherStudentRuntime:
         return None
 
     def _maybe_log_heterogeneous_mode(self, placement_plan: RuntimePlacementPlan) -> None:
-        if not self.enable_heterogeneous or self._heterogeneous_notice_emitted:
+        if not (self.enable_heterogeneous or self.teacher_offload != "none") or self._heterogeneous_notice_emitted:
             return
         logger.info(
-            "TeacherStudentRuntime 异构模式当前为 research skeleton："
-            f"teacher 仍在 {placement_plan.execution_device} 执行，"
-            f"但已显式记录 offload_target={placement_plan.offload_target}、"
+            f"TeacherStudentRuntime 在 {placement_plan.execution_device} 执行 teacher，"
+            f"参数卸载={placement_plan.offload_target}，"
             f"cache_backend={placement_plan.cache_backend}、prefetch={self.prefetch_policy}。"
         )
         self._heterogeneous_notice_emitted = True
@@ -633,14 +697,10 @@ class TeacherStudentRuntime:
         if self.device.type != "cuda":
             logger.warning("runtime_enable_dpp=True 但当前 device 不是 CUDA，DPP 将自动禁用。")
             return
-        try:
-            self._teacher_stream = torch.cuda.Stream(
-                device=self.device,
-                priority=self.teacher_stream_priority,
-            )
-        except Exception as exc:  # pragma: no cover - defensive fallback
-            logger.warning(f"初始化 teacher CUDA stream 失败，DPP 已回退到串行执行: {exc}")
-            self._teacher_stream = None
+        self._teacher_stream = torch.cuda.Stream(
+            device=self.device,
+            priority=self.teacher_stream_priority,
+        )
 
     def _maybe_log_dpp_mode(self) -> None:
         if self._dpp_notice_emitted:

@@ -32,29 +32,19 @@ from training.trainers.adversarial_distill_trainer import ProjectionDiscriminato
 from training.trainers.base_distill_trainer import BaseDistillTrainer, EMAModel
 from training.utils.model_output import extract_prediction_tensor
 from training.utils.replicated_gradients import broadcast_replicated_model, synchronize_replicated_gradients
+from training.utils.auxiliary_optimization import (
+    AuxiliaryTrainingMixin, auxiliary_sync_context, finish_auxiliary_step, restore_auxiliary_scaler,
+)
 
 
-class DMDDistillTrainer(BaseDistillTrainer):
+class DMDDistillTrainer(AuxiliaryTrainingMixin, BaseDistillTrainer):
     """Trainer for Distribution Matching Distillation (DMD/DMD2)."""
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         self._require_velocity_prediction("DMD-style distillation")
-        if self.parallel_mode != "ddp":
-            raise ValueError(
-                "DMD-style distillation currently supports serial/DDP training only; "
-                "auxiliary score/discriminator state is not integrated with FSDP/DeepSpeed."
-            )
-        if self.args.gradient_accumulation_steps != 1:
-            raise ValueError(
-                "DMD-style distillation currently requires gradient_accumulation_steps=1 "
-                "so auxiliary update frequency is defined per optimizer step."
-            )
-        if self.args.mixed_precision == "fp16":
-            raise ValueError(
-                "DMD-style fp16 is disabled until its auxiliary optimizers are "
-                "integrated with GradScaler; use bf16 or no."
-            )
+        self.fake_score_scaler = self._new_auxiliary_scaler()
+        self.disc_scaler = self._new_auxiliary_scaler()
 
         # Variant selection
         self.dmd_variant = getattr(self.args, "dmd_variant", "dmd")  # dmd | dmd2
@@ -106,7 +96,10 @@ class DMDDistillTrainer(BaseDistillTrainer):
                 self.is_distributed
                 and getattr(self.fake_score_model, "requires_unused_parameter_detection", False)
             )
-            if self._manual_fake_sync:
+            if self.is_distributed:
+                # Synchronize before constructing EMA copies, not merely at
+                # the later DDP wrapper initialization. CPU-staged teachers and
+                # rank-specific construction seeds must not create stale EMA.
                 broadcast_replicated_model(self.fake_score_model)
 
             self.fake_score_optimizer = torch.optim.AdamW(
@@ -153,6 +146,8 @@ class DMDDistillTrainer(BaseDistillTrainer):
         self._fake_score_loss_ema = 0.0
         self._gan_loss_ema = 0.0
         self._disc_loss_ema = 0.0
+        self._validate_auxiliary_ownership((("fake_score_model", "fake_score_optimizer"),
+                                           ("discriminator", "disc_optimizer")))
 
         logger.info(
             f"DMD initialized | variant={self.dmd_variant}, "
@@ -242,7 +237,7 @@ class DMDDistillTrainer(BaseDistillTrainer):
             fake_x0 = noisy.float() - sigma * fake_v.float()
         return self.distribution_matching_loss(generated, teacher_x0, fake_x0)
 
-    def _update_fake_score(self, batch, generated):
+    def _fake_score_loss(self, batch, generated):
         """Denoising score matching on generated data, never on teacher outputs."""
         generated = generated.detach()
         timesteps = self._sample_score_timesteps(generated.shape[0])
@@ -254,15 +249,17 @@ class DMDDistillTrainer(BaseDistillTrainer):
         inputs = self.prepare_teacher_input(batch, noisy.to(batch["latents"].dtype), timesteps)
         prediction = extract_prediction_tensor(self.fake_score_model(**inputs), tag="DMD fake-score training")
         target_velocity = noise.float() - generated.float()
-        loss = F.mse_loss(prediction.float(), target_velocity)
+        return F.mse_loss(prediction.float(), target_velocity)
+
+    def _update_fake_score(self, batch, generated):
+        """Single-batch DSM optimizer turn; multi-batch training uses the same loss."""
         self.fake_score_optimizer.zero_grad(set_to_none=True)
-        loss.backward()
-        if self._manual_fake_sync:
-            synchronize_replicated_gradients(self.fake_score_model)
-        if self.args.max_grad_norm > 0:
-            torch.nn.utils.clip_grad_norm_(self.fake_score_model.parameters(), self.args.max_grad_norm)
-        self.fake_score_optimizer.step()
-        if self.fake_score_ema is not None:
+        with self._auxiliary_autocast():
+            loss = self._fake_score_loss(batch, generated)
+        self.fake_score_scaler.scale(loss).backward()
+        updated = finish_auxiliary_step(self.fake_score_model, self.fake_score_optimizer,
+            self.fake_score_scaler, self.args.max_grad_norm, manual_sync=self._manual_fake_sync)
+        if updated and self.fake_score_ema is not None:
             self.fake_score_ema.update(self._unwrap_model(self.fake_score_model))
         return loss.detach()
 
@@ -279,8 +276,9 @@ class DMDDistillTrainer(BaseDistillTrainer):
         return current
 
     def _compute_r1_penalty(self, real_samples: torch.Tensor) -> torch.Tensor:
-        real_samples = real_samples.detach().requires_grad_(True)
-        real_logits = self.discriminator(real_samples)
+        real_samples = real_samples.detach().float().requires_grad_(True)
+        with torch.amp.autocast("cuda", enabled=False):
+            real_logits = self.discriminator(real_samples)
         grad_outputs = torch.ones_like(real_logits)
         gradients = torch.autograd.grad(
             outputs=real_logits,
@@ -293,44 +291,55 @@ class DMDDistillTrainer(BaseDistillTrainer):
         r1_penalty = gradients.reshape(gradients.size(0), -1).norm(2, dim=1).pow(2).mean()
         return r1_penalty
 
+    def _run_auxiliary_updates(self, batches):
+        score_due = self.global_step % self.fake_score_update_freq == 0
+        disc_due = self.use_gan and self.global_step >= self.disc_start_step and self.global_step % self.disc_update_freq == 0
+        if not (score_due or disc_due):
+            return
+        with self._auxiliary_autocast(), torch.no_grad():
+            generated = [self._generate_student_samples(batch, torch.randn_like(batch["latents"])) for batch in batches]
+        score_losses = []
+        if score_due:
+            for _ in range(self.fake_score_updates):
+                if len(batches) == 1:
+                    score_losses.append(self._update_fake_score(batches[0], generated[0]))
+                    continue
+                self.fake_score_optimizer.zero_grad(set_to_none=True)
+                for index, (batch, fake) in enumerate(zip(batches, generated)):
+                    with auxiliary_sync_context(self.fake_score_model, index == len(batches) - 1):
+                        with self._auxiliary_autocast():
+                            loss = self._fake_score_loss(batch, fake)
+                        self.fake_score_scaler.scale(loss / len(batches)).backward()
+                    score_losses.append(loss.detach())
+                updated = finish_auxiliary_step(self.fake_score_model, self.fake_score_optimizer,
+                    self.fake_score_scaler, self.args.max_grad_norm, manual_sync=self._manual_fake_sync)
+                if updated and self.fake_score_ema is not None:
+                    self.fake_score_ema.update(self._unwrap_model(self.fake_score_model))
+            self._fake_score_loss_ema = 0.9 * self._fake_score_loss_ema + 0.1 * torch.stack(score_losses).mean().item()
+        if disc_due:
+            self.discriminator.train()
+            self.disc_optimizer.zero_grad(set_to_none=True)
+            losses = []
+            for index, (batch, fake) in enumerate(zip(batches, generated)):
+                latents = batch["latents"]
+                with auxiliary_sync_context(self.discriminator, index == len(batches) - 1):
+                    with self._auxiliary_autocast():
+                        real_logits = self.discriminator(latents)
+                        fake_logits = self.discriminator(fake.to(latents.dtype))
+                        r1 = self._compute_r1_penalty(latents) if self.r1_penalty_weight > 0 else 0.0
+                        loss = F.relu(1 - real_logits).mean() + F.relu(1 + fake_logits).mean() + self.r1_penalty_weight * r1
+                    self.disc_scaler.scale(loss / len(batches)).backward()
+                losses.append(loss.detach())
+            finish_auxiliary_step(self.discriminator, self.disc_optimizer, self.disc_scaler, 1.0)
+            self._disc_loss_ema = 0.9 * self._disc_loss_ema + 0.1 * torch.stack(losses).mean().item()
+
     def _forward_and_loss(self, batch: Dict[str, Any]) -> torch.Tensor:
         """Alternating fake DSM / discriminator updates, then generator KL loss."""
         latents = batch["latents"]
         training = torch.is_grad_enabled() and self.student_model.training
+        if training and not getattr(self, "_auxiliary_prepared", False):
+            self._run_auxiliary_updates([batch])
         noise = torch.randn_like(latents)
-        # Fake updates use independent detached samples and cannot backpropagate
-        # through a generator whose graph is later used by the outer optimizer.
-        fake_samples = self._generate_student_samples(batch, noise)
-
-        fake_score_losses = []
-        if training and self.global_step % self.fake_score_update_freq == 0:
-            for _ in range(self.fake_score_updates):
-                fake_score_losses.append(self._update_fake_score(batch, fake_samples))
-        if fake_score_losses:
-            value = torch.stack(fake_score_losses).mean().item()
-            self._fake_score_loss_ema = 0.9 * self._fake_score_loss_ema + 0.1 * value
-
-        # ---- GAN Discriminator Update (DMD2) ----
-        if training and self.use_gan and self.global_step >= self.disc_start_step:
-            if self.global_step % self.disc_update_freq == 0:
-                self.discriminator.train()
-                self.disc_optimizer.zero_grad()
-
-                real_logits = self.discriminator(latents)
-                d_loss_real = F.relu(1.0 - real_logits).mean()
-
-                fake_logits = self.discriminator(fake_samples.to(latents.dtype))
-                d_loss_fake = F.relu(1.0 + fake_logits).mean()
-
-                r1_penalty = (
-                    self._compute_r1_penalty(latents) if self.r1_penalty_weight > 0 else 0.0
-                )
-                disc_loss = d_loss_real + d_loss_fake + self.r1_penalty_weight * r1_penalty
-                disc_loss.backward()
-
-                torch.nn.utils.clip_grad_norm_(self.discriminator.parameters(), max_norm=1.0)
-                self.disc_optimizer.step()
-                self._disc_loss_ema = 0.9 * self._disc_loss_ema + 0.1 * disc_loss.item()
 
         # ---- Student Update ----
         generated = self._generate_student_samples_with_grad(batch, noise)
@@ -405,12 +414,13 @@ class DMDDistillTrainer(BaseDistillTrainer):
             dmd_path = os.path.join(ckpt_dir, "dmd_state.pt")
 
             def _dmd_state():
-                save_dict = {}
+                save_dict = {"auxiliary_parallel_mode": self.auxiliary_parallel_mode}
                 if self.enable_fake_score:
                     save_dict.update(
                         {
                             "fake_score_model": self._unwrap_model(self.fake_score_model).state_dict(),
                             "fake_score_optimizer": self.fake_score_optimizer.state_dict(),
+                            "fake_score_scaler": self.fake_score_scaler.state_dict(),
                         }
                     )
                     if self.fake_score_ema is not None:
@@ -424,6 +434,7 @@ class DMDDistillTrainer(BaseDistillTrainer):
                     )
                     save_dict["discriminator"] = disc_state
                     save_dict["disc_optimizer"] = self.disc_optimizer.state_dict()
+                    save_dict["disc_scaler"] = self.disc_scaler.state_dict()
                 return save_dict
 
             self._atomic_save_rank0(
@@ -451,6 +462,8 @@ class DMDDistillTrainer(BaseDistillTrainer):
         def _restore_dmd_state():
             if not isinstance(state, dict):
                 raise TypeError(f"Expected DMD checkpoint dict, got {type(state).__name__}")
+            if state.get("auxiliary_parallel_mode", "replicated") != "replicated":
+                raise ValueError("DMD checkpoint must contain full replicated auxiliary state")
             required = set()
             if self.enable_fake_score:
                 required.update({"fake_score_model", "fake_score_optimizer"})
@@ -466,6 +479,7 @@ class DMDDistillTrainer(BaseDistillTrainer):
                 raw_fake = self._unwrap_model(self.fake_score_model)
                 raw_fake.load_state_dict(state["fake_score_model"], strict=True)
                 self.fake_score_optimizer.load_state_dict(state["fake_score_optimizer"])
+                restore_auxiliary_scaler(self.fake_score_scaler, state, "fake_score_scaler")
                 if self.fake_score_ema is not None:
                     self.fake_score_ema.load_state_dict(state["fake_score_ema"])
 
@@ -473,6 +487,7 @@ class DMDDistillTrainer(BaseDistillTrainer):
                 raw_disc = self.discriminator.module if hasattr(self.discriminator, "module") else self.discriminator
                 raw_disc.load_state_dict(state["discriminator"], strict=True)
                 self.disc_optimizer.load_state_dict(state["disc_optimizer"])
+                restore_auxiliary_scaler(self.disc_scaler, state, "disc_scaler")
 
         self._run_all_ranks_or_raise(
             _restore_dmd_state,

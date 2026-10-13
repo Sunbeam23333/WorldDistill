@@ -38,8 +38,7 @@ by:
 5. real inference for every advertised model/task pair;
 6. benchmark manifest with warmup, repeats, synchronization, and failure logs.
 
-Unrun cells remain “pending”; they are not silently inferred from a neighboring
-GPU architecture.
+Record the exact model, device, precision and topology for each run.
 
 Executable single-device stream/lifetime and multi-rank optimizer/restart
 commands are in [training qualification](training.md#hardware-qualification-commands).

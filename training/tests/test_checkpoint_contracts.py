@@ -323,7 +323,7 @@ class CheckpointContractTests(unittest.TestCase):
             self.assertEqual(restored_optimizer_state, optimizer_state)
 
     def test_ema_and_consistency_sharding_contract_matrix(self):
-        rejected = (
+        sharded = (
             ("fsdp", 2, True, "step_distill"),
             ("deepspeed", 3, True, "step_distill"),
             ("fsdp", 2, False, "consistency_distill"),
@@ -336,8 +336,8 @@ class CheckpointContractTests(unittest.TestCase):
             ("ddp", 2, False, "consistency_distill"),
         )
 
-        for parallel_mode, stage, use_ema, method in rejected:
-            with self.subTest(contract="rejected", parallel_mode=parallel_mode, stage=stage):
+        for parallel_mode, stage, use_ema, method in sharded:
+            with self.subTest(contract="sharded", parallel_mode=parallel_mode, stage=stage):
                 trainer = self._bare_trainer()
                 trainer.parallel_mode = parallel_mode
                 trainer.args = SimpleNamespace(
@@ -345,8 +345,8 @@ class CheckpointContractTests(unittest.TestCase):
                     use_ema=use_ema,
                     distill_method=method,
                 )
-                with self.assertRaises(ValueError):
-                    trainer._validate_ema_parallel_contract()
+                trainer._validate_ema_parallel_contract()
+                self.assertTrue(trainer._parameters_are_sharded())
 
         for parallel_mode, stage, use_ema, method in allowed:
             with self.subTest(contract="allowed", parallel_mode=parallel_mode, stage=stage):
@@ -358,6 +358,7 @@ class CheckpointContractTests(unittest.TestCase):
                     distill_method=method,
                 )
                 trainer._validate_ema_parallel_contract()
+                self.assertFalse(trainer._parameters_are_sharded())
 
     def test_stateful_hook_runs_before_checkpoint(self):
         from training.trainer_args import TrainerArgs

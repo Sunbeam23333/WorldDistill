@@ -38,6 +38,9 @@ import torch.nn.functional as F
 from loguru import logger
 
 from training.trainers.base_distill_trainer import BaseDistillTrainer
+from training.utils.auxiliary_optimization import (
+    AuxiliaryTrainingMixin, auxiliary_sync_context, finish_auxiliary_step, restore_auxiliary_scaler,
+)
 
 
 @contextmanager
@@ -147,7 +150,7 @@ class ProjectionDiscriminator(nn.Module):
         return x
 
 
-class AdversarialDistillTrainer(BaseDistillTrainer):
+class AdversarialDistillTrainer(AuxiliaryTrainingMixin, BaseDistillTrainer):
     """Trainer for Adversarial Diffusion Distillation (ADD/LADD).
 
     Training alternates between:
@@ -162,21 +165,6 @@ class AdversarialDistillTrainer(BaseDistillTrainer):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         self._require_velocity_prediction("Adversarial distillation")
-        if self.parallel_mode != "ddp":
-            raise ValueError(
-                "Adversarial distillation currently supports serial/DDP training only; "
-                "auxiliary discriminator state is not integrated with FSDP/DeepSpeed."
-            )
-        if self.args.gradient_accumulation_steps != 1:
-            raise ValueError(
-                "Adversarial distillation currently requires gradient_accumulation_steps=1 "
-                "so discriminator update frequency is defined per optimizer step."
-            )
-        if self.args.mixed_precision == "fp16":
-            raise ValueError(
-                "Adversarial distillation fp16 is disabled until its auxiliary "
-                "discriminator optimizer is integrated with GradScaler; use bf16 or no."
-            )
 
         # Hyperparameters
         self.lambda_adv = getattr(self.args, "adversarial_lambda_adv", 0.5)
@@ -204,6 +192,8 @@ class AdversarialDistillTrainer(BaseDistillTrainer):
             betas=(0.0, 0.99),  # Standard GAN optimizer settings
             weight_decay=0.0,
         )
+        self.disc_scaler = self._new_auxiliary_scaler()
+        self._validate_auxiliary_ownership((("discriminator", "disc_optimizer"),))
 
         # Track discriminator loss for logging
         self._disc_loss_ema = 0.0
@@ -249,8 +239,11 @@ class AdversarialDistillTrainer(BaseDistillTrainer):
         R1 = E[||grad D(x_real)||^2]
         This regularizes the discriminator to prevent mode collapse.
         """
-        real_samples = real_samples.detach().requires_grad_(True)
-        real_logits = self.discriminator(real_samples)
+        real_samples = real_samples.detach().float().requires_grad_(True)
+        # R1 differentiates input gradients again; evaluate that branch in FP32
+        # instead of squaring tiny FP16 gradients before optimizer loss scaling.
+        with torch.amp.autocast("cuda", enabled=False):
+            real_logits = self.discriminator(real_samples)
         grad_outputs = torch.ones_like(real_logits)
 
         gradients = torch.autograd.grad(
@@ -265,6 +258,29 @@ class AdversarialDistillTrainer(BaseDistillTrainer):
         r1_penalty = gradients.reshape(gradients.size(0), -1).norm(2, dim=1).pow(2).mean()
         return r1_penalty
 
+    def _run_auxiliary_updates(self, batches):
+        if self.global_step < self.disc_start_step or self.global_step % self.disc_update_freq:
+            return
+        self.discriminator.train()
+        self.disc_optimizer.zero_grad(set_to_none=True)
+        losses = []
+        for index, batch in enumerate(batches):
+            latents = batch["latents"]
+            timesteps = self._sample_timesteps(latents.shape[0])
+            noisy = self.noise_objective.add_noise(latents, torch.randn_like(latents), timesteps)
+            with self._auxiliary_autocast(), torch.no_grad():
+                fake = self._student_one_step_generate(batch, noisy, timesteps)
+            with auxiliary_sync_context(self.discriminator, index == len(batches) - 1):
+                with self._auxiliary_autocast():
+                    real_logits = self.discriminator(latents)
+                    fake_logits = self.discriminator(fake.detach().to(latents.dtype))
+                    r1 = self._compute_r1_penalty(latents) if self.r1_penalty_weight > 0 else 0.0
+                    loss = F.relu(1 - real_logits).mean() + F.relu(1 + fake_logits).mean() + self.r1_penalty_weight * r1
+                self.disc_scaler.scale(loss / len(batches)).backward()
+            losses.append(loss.detach())
+        finish_auxiliary_step(self.discriminator, self.disc_optimizer, self.disc_scaler, 1.0)
+        self._disc_loss_ema = 0.9 * self._disc_loss_ema + 0.1 * torch.stack(losses).mean().item()
+
     def _forward_and_loss(self, batch: Dict[str, Any]) -> torch.Tensor:
         """Alternating training: discriminator then generator (student).
 
@@ -274,6 +290,8 @@ class AdversarialDistillTrainer(BaseDistillTrainer):
         latents = batch["latents"]
         bs = latents.shape[0]
         training = torch.is_grad_enabled() and self.student_model.training
+        if training and not getattr(self, "_auxiliary_prepared", False):
+            self._run_auxiliary_updates([batch])
 
         # Sample timesteps and create noisy latents
         timesteps = self._sample_timesteps(bs)
@@ -282,43 +300,7 @@ class AdversarialDistillTrainer(BaseDistillTrainer):
         sigmas_expanded = sigmas.view(bs, *([1] * (latents.dim() - 1)))
         noisy_latents = (1 - sigmas_expanded) * latents + sigmas_expanded * noise
 
-        # ---- Step 1: Discriminator update ----
-        disc_loss = torch.tensor(0.0, device=self.device)
-        if (
-            training and self.global_step >= self.disc_start_step
-            and self.global_step % self.disc_update_freq == 0
-        ):
-            self.discriminator.train()
-            self.disc_optimizer.zero_grad()
-
-            with torch.no_grad():
-                # Student generates fake samples
-                fake_x0 = self._student_one_step_generate(
-                    batch, noisy_latents, timesteps
-                )
-
-            # Discriminator on real
-            real_logits = self.discriminator(latents)
-            d_loss_real = F.relu(1.0 - real_logits).mean()  # Hinge loss
-
-            # Discriminator on fake
-            fake_logits = self.discriminator(fake_x0.detach())
-            d_loss_fake = F.relu(1.0 + fake_logits).mean()  # Hinge loss
-
-            # R1 gradient penalty
-            r1_penalty = self._compute_r1_penalty(latents) if self.r1_penalty_weight > 0 else 0.0
-
-            disc_loss = d_loss_real + d_loss_fake + self.r1_penalty_weight * r1_penalty
-            disc_loss.backward()
-
-            # Gradient clipping for discriminator
-            torch.nn.utils.clip_grad_norm_(
-                self.discriminator.parameters(), max_norm=1.0
-            )
-            self.disc_optimizer.step()
-            self._disc_loss_ema = 0.9 * self._disc_loss_ema + 0.1 * disc_loss.item()
-
-        # ---- Step 2: Generator (student) update ----
+        # Generator sees the discriminator after its complete accumulation turn.
         # Score distillation loss
         teacher_input = self.prepare_teacher_input(batch, noisy_latents, timesteps)
         student_input = self.prepare_student_input(batch, noisy_latents, timesteps)
@@ -398,6 +380,8 @@ class AdversarialDistillTrainer(BaseDistillTrainer):
             return {
                 "discriminator": raw_disc.state_dict(),
                 "disc_optimizer": self.disc_optimizer.state_dict(),
+                "disc_scaler": self.disc_scaler.state_dict(),
+                "auxiliary_parallel_mode": self.auxiliary_parallel_mode,
             }
 
         self._atomic_save_rank0(
@@ -424,6 +408,8 @@ class AdversarialDistillTrainer(BaseDistillTrainer):
                 raise TypeError(
                     f"Expected discriminator checkpoint dict, got {type(state).__name__}"
                 )
+            if state.get("auxiliary_parallel_mode", "replicated") != "replicated":
+                raise ValueError("Discriminator checkpoint must contain full replicated auxiliary state")
             missing = sorted({"discriminator", "disc_optimizer"}.difference(state))
             if missing:
                 raise KeyError(f"Discriminator checkpoint is missing required keys: {missing}")
@@ -434,6 +420,7 @@ class AdversarialDistillTrainer(BaseDistillTrainer):
             )
             raw_disc.load_state_dict(state["discriminator"], strict=True)
             self.disc_optimizer.load_state_dict(state["disc_optimizer"])
+            restore_auxiliary_scaler(self.disc_scaler, state, "disc_scaler")
 
         self._run_all_ranks_or_raise(
             _restore_discriminator,

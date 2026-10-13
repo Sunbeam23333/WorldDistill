@@ -445,6 +445,7 @@ _FALLBACK_MODEL_ZOO: dict[str, dict[str, Any]] = {
         "dit",
         ["t2v", "i2v", "t2av", "i2av"],
         "ltx2",
+        distill_methods=["joint_av_distill"],
         model_family="video",
         checkpoint_formats=["directory", "diffusers", "state_dict"],
         features=["audio_video_generation"],

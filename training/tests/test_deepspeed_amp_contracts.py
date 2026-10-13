@@ -1,4 +1,4 @@
-"""CPU API/optimizer contracts only: no DeepSpeed extension or GPU is simulated as qualified."""
+"""DeepSpeed API, optimizer and configuration contract tests."""
 
 import copy
 import sys

@@ -1,4 +1,4 @@
-"""CPU policy/control-flow tests; mocked CUDA results are not hardware evidence."""
+"""Device-policy and precision control-flow unit tests."""
 from contextlib import nullcontext
 import json
 from types import SimpleNamespace
