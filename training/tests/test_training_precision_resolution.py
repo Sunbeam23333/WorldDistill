@@ -32,12 +32,13 @@ def test_single_gpu_resolution_rechecks_settings_for_the_trainer(monkeypatch):
             resolve_training_precision(args, "cuda:0")
 
 
-def test_auto_does_not_choose_missing_fsdp_or_auxiliary_scaler(monkeypatch):
+def test_auto_uses_fsdp_and_independent_auxiliary_scalers(monkeypatch):
     monkeypatch.setattr(torch.distributed, "is_initialized", lambda: False)
     monkeypatch.setattr(cuda_compat, "probe_cuda_precision", lambda *a, **k: report(["no", "fp16"]))
-    for fields in ({"parallel_mode": "fsdp"}, {"distill_method": "dmd_distill"}, {"distill_method": "adversarial_distill"}):
+    assert resolve_training_precision(TrainerArgs(parallel_mode="fsdp"), "cuda:0")["selected"] == "fp16"
+    for fields in ({"distill_method": "dmd_distill"}, {"distill_method": "adversarial_distill"}):
         args = TrainerArgs(**fields)
-        assert resolve_training_precision(args, "cuda:0")["selected"] == "no"
+        assert resolve_training_precision(args, "cuda:0")["selected"] == "fp16"
 
 
 def test_explicit_unavailable_precision_and_tf32_are_not_downgraded(monkeypatch):

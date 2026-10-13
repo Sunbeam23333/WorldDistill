@@ -1,0 +1,10 @@
+{
+  "distill_method": "joint_av_distill",
+  "description": "LTX2 joint video/audio flow distillation using normalized cached latents.",
+  "joint_av_video_weight": 1.0,
+  "joint_av_audio_weight": 1.0,
+  "prediction_type": "velocity",
+  "mixed_precision": "auto",
+  "optimizer": "adamw",
+  "runtime_teacher_offload": "cpu"
+}

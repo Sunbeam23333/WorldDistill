@@ -1,0 +1,12 @@
+{
+  "distill_method": "adversarial_distill",
+  "description": "Latent projection discriminator and frozen-teacher velocity supervision.",
+  "adversarial_lambda_adv": 0.5,
+  "adversarial_lambda_distill": 2.5,
+  "adversarial_r1_weight": 0.00001,
+  "adversarial_latent_channels": 16,
+  "prediction_type": "velocity",
+  "optimizer": "adamw",
+  "mixed_precision": "auto",
+  "notes": "Set adversarial_latent_channels to the checkpoint's video latent channel count. Auxiliary networks are full replicas."
+}

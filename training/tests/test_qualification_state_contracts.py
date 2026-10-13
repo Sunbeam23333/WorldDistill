@@ -352,6 +352,9 @@ def test_deepspeed_microbatches_autocast_all_forwards_without_double_loss_scalin
                            amp_dtype=dtype, use_amp=enabled, sp_group=None, _next_batch=lambda: {},
                            _move_batch_to_device=lambda value: value, _prepare_batch_for_model=lambda value: value,
                            _forward_and_loss=forward)
+    fake._training_microbatches = lambda batch: base.BaseDistillTrainer._training_microbatches(fake, batch)
+    fake._prepare_sequence_parallel_batch = lambda batch: batch
+    fake._context_parallel_backward_loss = lambda loss: loss
     result = base.BaseDistillTrainer._train_step_deepspeed(fake, {})
     assert contexts == [(dtype, enabled)] * 3
     assert backward == [2., 4., 6.]  # DeepSpeed, not this wrapper, scales losses.
@@ -368,6 +371,9 @@ def test_consistency_cpu_staged_target_and_shadows_follow_execution_device(monke
         self.student_model = kwargs["student_model"]
         self.device = kwargs["device"]
         self.prediction_type = "velocity"
+        self.noise_objective = SimpleNamespace(process="flow")
+        self.teacher_noise_objective = SimpleNamespace(process="flow", prediction_type="velocity")
+        self.parallel_mode = self.args.parallel_mode
 
     monkeypatch.setattr(base.BaseDistillTrainer, "__init__", minimal_base)
     # Meta is only a no-allocation device transition contract; no GPU executes.
@@ -387,7 +393,8 @@ def test_deepspeed_base_ema_migrates_after_engine_placement_preserving_precision
     args = TrainerArgs(parallel_mode="deepspeed", deepspeed_stage=stage, use_ema=True, mixed_precision="bf16")
     monkeypatch.setattr(base, "init_deepspeed", lambda **kwargs: (engine, "engine_optimizer", "engine_scheduler"))
     fake = SimpleNamespace(args=args, world_size=2, student_model=student, optimizer=object(), lr_scheduler=object(),
-                           ema=ema, _refresh_distributed_state=lambda: None, _unwrap_model=lambda model: model.module)
+                           ema=ema, _refresh_distributed_state=lambda: None, _unwrap_model=lambda model: model.module,
+                           _initialize_sharded_ema=lambda: None)
     base.BaseDistillTrainer._init_deepspeed(fake)
     assert fake._deepspeed_engine is engine
     assert fake.optimizer == "engine_optimizer"

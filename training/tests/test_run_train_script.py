@@ -114,7 +114,7 @@ class RunTrainScriptTests(unittest.TestCase):
             self.assertEqual(self._value_after(argv, "--wandb_run_name"), run_name)
             self.assertEqual(self._value_after(argv, "--num_frames"), "160")
 
-    def test_non_context_default_and_sharded_step_dual_fallback_are_preserved(self) -> None:
+    def test_sharded_step_keeps_configured_dual_students(self) -> None:
         with tempfile.TemporaryDirectory(prefix="worlddistill shell test ") as temp_dir:
             temp_root = Path(temp_dir)
             config_path = temp_root / "step preset.json"
@@ -135,7 +135,25 @@ class RunTrainScriptTests(unittest.TestCase):
 
             self.assertEqual(result.returncode, 0, msg=result.stderr)
             self.assertEqual(self._value_after(argv, "--num_frames"), "49")
-            self.assertIn("--no-use_dual_model", argv)
+            self.assertNotIn("--no-use_dual_model", argv)
+
+    def test_every_registered_method_has_a_default_preset(self) -> None:
+        from training.trainers import TRAINER_REGISTRY
+        for method in TRAINER_REGISTRY:
+            with self.subTest(method=method), tempfile.TemporaryDirectory(prefix="worlddistill preset ") as temp_dir:
+                result, argv = self._captured_argv(Path(temp_dir), "--method", method,
+                    "--teacher_model", "teacher", "--data_json", "data.json")
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertEqual(self._value_after(argv, "--distill_method"), method)
+                for path in self._value_after(argv, "--config").split(","):
+                    self.assertTrue(Path(path).is_file())
+
+    def test_explicit_dual_override_is_forwarded(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="worlddistill dual ") as temp_dir:
+            result, argv = self._captured_argv(Path(temp_dir), "--teacher_model", "teacher",
+                "--data_json", "data.json", "--parallel", "deepspeed", "--use_dual_model")
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertIn("--use_dual_model", argv)
 
 
 if __name__ == "__main__":

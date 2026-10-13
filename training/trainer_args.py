@@ -6,6 +6,7 @@ References HY-WorldPlay's TrainingArgs and Open-Sora's config system.
 
 import argparse
 import json
+import math
 import os
 import sys
 from dataclasses import dataclass, field
@@ -61,6 +62,7 @@ class TrainerArgs:
     strict_env_check: bool = True
     required_transformers_version: str = _expected_transformers_version
     config_json: str = ""
+    allow_native_model_code: bool = False
     output_dir: str = "./results/distill"
 
     # --- Distillation Method ---
@@ -69,14 +71,26 @@ class TrainerArgs:
 
     # --- Flow Matching / Noise ---
     prediction_type: str = "velocity"  # velocity | epsilon | x0
+    num_train_timesteps: int = 0  # 0: resolve from checkpoint, otherwise require an exact match
     logit_normal_mean: float = 0.0  # Logit-normal timestep sampling mean
     logit_normal_std: float = 1.0  # Logit-normal timestep sampling std
     sample_shift: float = 1.0  # Sigma shift for Wan2.x style schedule
+
+    # --- MeanFlow average-velocity / joint audio-video objectives ---
+    meanflow_diagonal_ratio: float = 0.75
+    meanflow_norm_power: float = 1.0
+    meanflow_norm_eps: float = 0.01
+    meanflow_latent_channels: int = 0
+    meanflow_hidden_dim: int = 128
+    joint_av_video_weight: float = 1.0
+    joint_av_audio_weight: float = 1.0
+    runtime_teacher_offload_dir: str = ""
 
     # --- Step Distillation ---
     denoising_step_list: List[int] = field(default_factory=lambda: [1000, 750, 500, 250])
     boundary_step_index: int = 2
     use_dual_model: bool = False
+    dual_student_layout: str = ""  # Written by the unified dual-student trainer.
     student_low_model: Optional[str] = None  # Path to low-noise student model (for dual-model)
 
     # --- Stream Distillation ---
@@ -253,6 +267,19 @@ class TrainerArgs:
         self._validate_and_normalize()
 
     def _validate_and_normalize(self) -> None:
+        if not isinstance(self.eval_batches, int) or isinstance(self.eval_batches, bool) or self.eval_batches < 1:
+            raise ValueError("eval_batches must be a positive integer")
+        if self.num_train_timesteps < 0:
+            raise ValueError("num_train_timesteps must be zero (checkpoint default) or positive")
+        if self.meanflow_latent_channels < 0 or self.meanflow_hidden_dim < 1:
+            raise ValueError("meanflow_latent_channels must be non-negative and meanflow_hidden_dim positive")
+        if not 0 <= self.meanflow_diagonal_ratio <= 1:
+            raise ValueError("meanflow_diagonal_ratio must lie in [0, 1]")
+        if not math.isfinite(self.meanflow_norm_power) or self.meanflow_norm_power < 0:
+            raise ValueError("meanflow_norm_power must be finite and non-negative")
+        for name in ("meanflow_norm_eps", "joint_av_video_weight", "joint_av_audio_weight"):
+            if not math.isfinite(getattr(self, name)) or getattr(self, name) <= 0:
+                raise ValueError(f"{name} must be finite and positive")
         if self.mixed_precision not in {"auto", "no", "fp16", "bf16"}:
             raise ValueError(
                 f"mixed_precision must be 'auto', 'no', 'fp16', or 'bf16', got {self.mixed_precision!r}"
@@ -377,6 +404,7 @@ def build_training_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--strict_env_check", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--required_transformers_version", type=str, default=_expected_transformers_version)
     parser.add_argument("--config_json", type=str, default="")
+    parser.add_argument("--allow_native_model_code", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--output_dir", type=str, default="./results/distill")
     parser.add_argument("--profile_warmup_steps", type=int, default=0)
     parser.add_argument("--profile_active_steps", type=int, default=0)
@@ -395,10 +423,21 @@ def build_training_arg_parser() -> argparse.ArgumentParser:
             "context_forcing",
             "adversarial_distill",
             "dmd_distill",
+            "mean_flow_distill",
+            "joint_av_distill",
         ],
     )
     parser.add_argument("--distill_preset", "--config", type=str, default="")
     parser.add_argument("--prediction_type", type=str, default="velocity", choices=["velocity", "epsilon", "x0"])
+    parser.add_argument("--num_train_timesteps", type=int, default=0)
+    parser.add_argument("--meanflow_diagonal_ratio", type=float, default=0.75)
+    parser.add_argument("--meanflow_norm_power", type=float, default=1.0)
+    parser.add_argument("--meanflow_norm_eps", type=float, default=0.01)
+    parser.add_argument("--meanflow_latent_channels", type=int, default=0)
+    parser.add_argument("--meanflow_hidden_dim", type=int, default=128)
+    parser.add_argument("--joint_av_video_weight", type=float, default=1.0)
+    parser.add_argument("--joint_av_audio_weight", type=float, default=1.0)
+    parser.add_argument("--runtime_teacher_offload_dir", type=str, default="")
     parser.add_argument("--use_dual_model", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--student_low_model", type=str, default=None)
 
@@ -437,6 +476,9 @@ def build_training_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--adam_beta1", type=float, default=0.9)
     parser.add_argument("--adam_beta2", type=float, default=0.999)
     parser.add_argument("--adam_epsilon", type=float, default=1e-8)
+    parser.add_argument("--muon_momentum", type=float, default=0.95)
+    parser.add_argument("--muon_nesterov", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--muon_ns_steps", type=int, default=5)
     parser.add_argument("--lr_min_ratio", type=float, default=0.1)
 
     # EMA

@@ -23,11 +23,13 @@ def test_evidence_directory_is_never_overwritten(tmp_path):
         shared_output_directory(tmp_path)
 
 
-def test_unsupported_parallel_cells_are_not_qualified():
+def test_registered_auxiliary_methods_allow_sharded_student_with_replicated_auxiliaries():
     fsdp = SimpleNamespace(parallel="fsdp", zero_stage=3, gradient_accumulation_steps=1, mixed_precision="auto")
     assert unsupported_combination("step_distill", fsdp) is None
-    assert unsupported_combination("dmd_distill", fsdp)
-    assert unsupported_combination("consistency_distill", fsdp)
+    assert unsupported_combination("dmd_distill", fsdp) is None
+    assert unsupported_combination("adversarial_distill", fsdp) is None
+    assert unsupported_combination("consistency_distill", fsdp) is None
+    assert unsupported_combination("progressive_distill", fsdp) is None
 
 
 @pytest.mark.skipif(torch.cuda.is_available(), reason="This is the explicit CPU/Gloo control job")
@@ -51,5 +53,6 @@ def test_actual_torchrun_two_rank_training_qualification(tmp_path):
     assert result.returncode == 0, result.stdout + result.stderr
     report = json.loads((tmp_path / "evidence/summary.json").read_text())
     assert report["status"] == "passed" and report["qualified"] is False
-    assert len(report["ranks"]) == 2 and len(report["cases"]) == 7
+    from training.trainers import TRAINER_REGISTRY
+    assert len(report["ranks"]) == 2 and len(report["cases"]) == len(TRAINER_REGISTRY)
     assert all(case["status"] == "passed" for case in report["cases"])

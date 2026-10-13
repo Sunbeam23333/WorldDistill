@@ -54,6 +54,7 @@ from training.utils.distributed import (
 from training.utils.experiment_tracking import ExperimentTracker
 from training.utils.model_output import extract_prediction_tensor
 from training.utils.replicated_gradients import broadcast_replicated_model, synchronize_replicated_gradients
+from training.utils.sharded_state import ShardedEMA, build_training_grad_scaler
 
 
 @contextlib.contextmanager
@@ -70,8 +71,8 @@ class EMAModel:
 
     Supports warmup: decay ramps from 0 to target_decay over warmup_steps.
 
-    For FSDP models: EMA must operate on the unwrapped (local shard) parameters.
-    We handle this by accepting the raw model (not FSDP-wrapped).
+    This class tracks replicated parameters. FSDP and ZeRO-3 use ShardedEMA
+    initialized after the student has been partitioned.
 
     References:
     - Consistency Models: EMA for stable target network
@@ -211,6 +212,10 @@ class BaseDistillTrainer(ABC):
         from training.utils.precision import resolve_training_precision
         resolve_training_precision(args, self.device)
         self._deepspeed_engine = None  # Set during train() if using DeepSpeed
+        if args.distill_method != "joint_av_distill" and any(
+            getattr(model, "supports_joint_av", False) for model in (teacher_model, student_model)
+        ):
+            raise ValueError("Joint audio/video models require distill_method=joint_av_distill; a video-only loss would discard audio")
         self._validate_ema_parallel_contract()
         self._validate_optimizer_parallel_contract()
         self._validate_mixed_precision_contract()
@@ -218,32 +223,17 @@ class BaseDistillTrainer(ABC):
         # Mixed precision
         self.use_amp = args.mixed_precision != "no"
         self.amp_dtype = torch.bfloat16 if args.mixed_precision == "bf16" else torch.float16
-        # Note: When using DeepSpeed or FSDP, they handle their own mixed precision.
-        # GradScaler is only needed for DDP + fp16.
-        self._use_scaler = (args.mixed_precision == "fp16" and self.parallel_mode == "ddp")
-        self.scaler = torch.amp.GradScaler("cuda", enabled=self._use_scaler)
+        self._use_scaler = args.mixed_precision == "fp16" and self.parallel_mode != "deepspeed"
+        self.scaler = build_training_grad_scaler(self.parallel_mode, args.mixed_precision, self.device)
 
-        # Flow Matching parameters
-        self.num_train_timesteps = 1000
-        for role, model in (("teacher", teacher_model), ("student", student_model)):
-            noise_process = getattr(model, "training_noise_process", "flow")
-            if noise_process != "flow":
-                raise ValueError(
-                    f"{role} declares training_noise_process={noise_process!r}, but the current "
-                    "trainers only implement flow-matching noise and prediction conversions. "
-                    "CogVideoX requires a VP scheduler/noise/prediction adapter; "
-                    "translating tensor layouts alone does not make VP and flow equivalent."
-                )
-            model_time_scale = getattr(model, "num_train_timesteps", self.num_train_timesteps)
-            if model_time_scale != self.num_train_timesteps:
-                raise ValueError(
-                    f"{role} declares num_train_timesteps={model_time_scale}, but the current "
-                    "training schedules use the 1000-step flow-matching time scale. "
-                    "Provide a compatible scheduler/model adapter; silently rescaling "
-                    "would change noise-expert routing and distillation targets."
-                )
+        # Read the checkpoint's actual noise process and time convention.
+        from training.utils.noise_objective import resolve_noise_objectives
+        self.teacher_noise_objective, self.noise_objective = resolve_noise_objectives(
+            args, teacher_model, student_model
+        )
+        self.num_train_timesteps = self.noise_objective.num_train_timesteps
         self.sigma_min = 0.0
-        self.prediction_type = getattr(args, "prediction_type", "velocity")  # velocity | epsilon | x0
+        self.prediction_type = self.noise_objective.prediction_type
 
         # Distributed
         self.is_distributed = dist.is_initialized()
@@ -261,6 +251,8 @@ class BaseDistillTrainer(ABC):
         # Sequence Parallelism
         self.sp_size = getattr(args, "sp_size", 1)
         self.sp_group = None
+        self._managed_context_parallel = False
+        self._context_parallel_initialized = False
         if self.sp_size > 1:
             unsupported_roles = [
                 role
@@ -279,6 +271,15 @@ class BaseDistillTrainer(ABC):
                     f"{', '.join(unsupported_roles)}. Temporal tensor slicing alone is "
                     "not a correct sequence-parallel implementation."
                 )
+            if not self.is_distributed or self.world_size % self.sp_size:
+                raise ValueError("sp_size>1 requires distributed initialization and world_size divisible by sp_size")
+            if args.distill_method == "mean_flow_distill":
+                raise ValueError("MeanFlow JVP requires higher-order attention derivatives; the Ulysses training backend provides first-order backward only")
+            managed = [bool(getattr(model, "worlddistill_managed_context_parallel", False))
+                       for model in (self.teacher_model, self.student_model)]
+            if any(managed) and not all(managed):
+                raise ValueError("Teacher and student must agree on full-input managed context-parallel semantics")
+            self._managed_context_parallel = all(managed)
         if self.sp_size > 1 and self.is_distributed:
             self.sp_group = init_sequence_parallel(self.sp_size)
             if self.sp_group is not None:
@@ -290,8 +291,8 @@ class BaseDistillTrainer(ABC):
             param.requires_grad = False
 
         # EMA (optional, enabled by subclasses or args)
-        self.ema: Optional[EMAModel] = None
-        if getattr(args, "use_ema", False):
+        self.ema: Optional[EMAModel | ShardedEMA] = None
+        if getattr(args, "use_ema", False) and not self._parameters_are_sharded():
             self.ema = EMAModel(
                 self._unwrap_model(self.student_model)
                 if hasattr(self.student_model, "module")
@@ -332,25 +333,74 @@ class BaseDistillTrainer(ABC):
     # ==================== Helpers ====================
 
     def _validate_ema_parallel_contract(self) -> None:
-        """Reject EMA modes whose parameters would be sharded underneath it."""
+        """EMA is initialized after parameter partitioning for sharded engines."""
 
-        deepspeed_stage = int(getattr(self.args, "deepspeed_stage", 2))
-        uses_parameter_sharding = self.parallel_mode == "fsdp" or (
-            self.parallel_mode == "deepspeed" and deepspeed_stage == 3
+    def _parameters_are_sharded(self) -> bool:
+        return self.parallel_mode == "fsdp" or (
+            self.parallel_mode == "deepspeed" and int(getattr(self.args, "deepspeed_stage", 2)) == 3
         )
-        if not uses_parameter_sharding:
-            return
 
-        if bool(getattr(self.args, "use_ema", False)):
-            raise ValueError(
-                "Base EMA is not supported with FSDP or DeepSpeed ZeRO-3. "
-                "Use DDP/DeepSpeed ZeRO-1/2 or implement a sharded EMA state."
+    def _initialize_sharded_ema(self) -> None:
+        if getattr(self.args, "use_ema", False) and self._parameters_are_sharded() and self.ema is None:
+            self.ema = ShardedEMA(
+                self._unwrap_model(self.student_model), parallel_mode=self.parallel_mode,
+                decay=getattr(self.args, "ema_decay", 0.9999),
+                warmup_steps=getattr(self.args, "ema_warmup_steps", 0),
             )
-        if getattr(self.args, "distill_method", "") == "consistency_distill":
-            raise ValueError(
-                "Consistency distillation requires a full EMA target and is not "
-                "supported with FSDP or DeepSpeed ZeRO-3."
-            )
+
+    def _initialize_parallel_targets(self) -> None:
+        """Hook for frozen auxiliary targets, after the student is partitioned."""
+
+    def _close_parallel_targets(self) -> None:
+        """Release resources owned by an auxiliary frozen target."""
+
+    def _initialize_context_parallel(self):
+        """Configure real token/attention partitioning before parameter wrapping.
+
+        Construction of cloned EMA/dual students has already finished here, so
+        process-group handles are never passed through deepcopy.
+        """
+        if not self._managed_context_parallel or self._context_parallel_initialized:
+            return
+        models = [self.teacher_model, self.student_model]
+        models.extend(getattr(self, name, None) for name in ("student_low", "ema_model"))
+        seen = set()
+        for model in models:
+            if model is None or id(model) in seen:
+                continue
+            seen.update(id(module) for module in model.modules())
+            configure = getattr(model, "enable_worlddistill_sequence_parallel", None)
+            if not callable(configure):
+                raise ValueError("Managed context-parallel targets require an executable configuration hook")
+            configure(self.sp_size, self.device)
+        # Frozen teachers are not broadcast by DDP/FSDP. Synchronize even a
+        # CPU/mmap-resident teacher with bounded one-tensor staging for NCCL.
+        source = dist.get_global_rank(self.sp_group, 0)
+        with torch.no_grad():
+            for value in list(self.teacher_model.parameters()) + list(self.teacher_model.buffers()):
+                staged = value.detach().to(self.device).contiguous()
+                dist.broadcast(staged, src=source, group=self.sp_group)
+                value.copy_(staged.to(value.device))
+        if self.runtime is not None:
+            self.runtime.context_parallel_group = self.sp_group
+        self._context_parallel_initialized = True
+
+    def _prepare_sequence_parallel_batch(self, batch):
+        if self.sp_group is None:
+            return batch
+        if getattr(self, "_managed_context_parallel", False):
+            from training.utils.context_parallel import synchronize_context_batch, synchronize_context_rng
+            batch = synchronize_context_batch(batch, self.sp_group, self.device)
+            synchronize_context_rng(self.sp_group, self.device)
+        elif "latents" in batch:
+            # Preserve the contract for external, frame-local native adapters.
+            batch["latents"] = scatter_sequence(batch["latents"], self.sp_group, dim=2)
+        return batch
+
+    def _context_parallel_backward_loss(self, loss):
+        # Diffusers output-gather backward selects the local token derivative;
+        # DDP/FSDP/ZeRO average over WORLD, so CP contributions need a sum.
+        return loss * self.sp_size if getattr(self, "_managed_context_parallel", False) else loss
 
     def _validate_optimizer_parallel_contract(self) -> None:
         """Reject optimizer/parallel combinations without correct shard semantics."""
@@ -362,11 +412,6 @@ class BaseDistillTrainer(ABC):
             )
 
     def _validate_mixed_precision_contract(self) -> None:
-        if self.parallel_mode == "fsdp" and self.args.mixed_precision == "fp16":
-            raise ValueError(
-                "FSDP fp16 is disabled until a ShardedGradScaler path is validated; "
-                "use bf16 or mixed_precision=no."
-            )
         if self.parallel_mode == "deepspeed" and math.isfinite(self.args.grad_skip_threshold):
             raise ValueError(
                 "grad_skip_threshold is a native PyTorch optimizer policy and is not "
@@ -374,10 +419,14 @@ class BaseDistillTrainer(ABC):
             )
 
     def _require_velocity_prediction(self, method_name: str) -> None:
-        if self.prediction_type != "velocity":
+        if (self.noise_objective.process != "flow" or self.prediction_type != "velocity"
+                or self.teacher_noise_objective.process != "flow"
+                or self.teacher_noise_objective.prediction_type != "velocity"):
             raise ValueError(
                 f"{method_name} currently implements velocity-space trajectory math only; "
-                f"got prediction_type={self.prediction_type!r}. Use 'velocity'."
+                f"got process={self.noise_objective.process!r}, prediction_type={self.prediction_type!r}, "
+                f"teacher_prediction_type={self.teacher_noise_objective.prediction_type!r}. "
+                "Use a flow model with 'velocity', or StepDistill for VP diffusion."
             )
 
     @staticmethod
@@ -502,10 +551,12 @@ class BaseDistillTrainer(ABC):
             "best_loss",
         }
         if self.ema is not None:
-            required.add("ema")
+            required.add("sharded_ema" if isinstance(self.ema, ShardedEMA) else "ema")
         missing = sorted(required.difference(state))
         if missing:
             raise KeyError(f"Checkpoint is missing required keys: {missing}")
+        if isinstance(self.ema, ShardedEMA) and state["sharded_ema"] != ShardedEMA.SCHEMA:
+            raise ValueError("Invalid sharded EMA checkpoint marker")
 
     def _capture_rng_state(self) -> Dict[str, Any]:
         state: Dict[str, Any] = {
@@ -655,6 +706,8 @@ class BaseDistillTrainer(ABC):
         if self._tracker is not None:
             self._tracker.log_config(vars(self.args))
 
+        self._initialize_context_parallel()
+
         # ---- Wrap model with chosen parallel strategy ----
         if self.parallel_mode == "deepspeed":
             self._init_deepspeed()
@@ -670,6 +723,17 @@ class BaseDistillTrainer(ABC):
                     device_ids=[int(os.environ.get("LOCAL_RANK", 0))] if self.device.type == "cuda" else None,
                     find_unused_parameters=bool(getattr(self.student_model, "requires_unused_parameter_detection", False)),
                 )
+
+        self._initialize_sharded_ema()
+        if isinstance(self.ema, EMAModel) and self.ema.step_count == 0:
+            # DDP/DeepSpeed may broadcast initial weights during wrapping.
+            # Initialize from those synchronized values, not pre-wrap replicas.
+            parameters = dict(self._unwrap_model(self.student_model).named_parameters())
+            self.ema.shadow = {
+                name: parameters[name].detach().to(device=value.device, dtype=value.dtype).clone()
+                for name, value in self.ema.shadow.items()
+            }
+        self._initialize_parallel_targets()
 
         # Resume only after the DeepSpeed/FSDP/DDP wrapper and its optimizer
         # representation exist.  Loading earlier silently discards FSDP optimizer
@@ -702,9 +766,7 @@ class BaseDistillTrainer(ABC):
                 batch = self._move_batch_to_device(batch)
                 batch = self._prepare_batch_for_model(batch)
 
-                # Sequence parallel: scatter video latents along temporal dim
-                if self.sp_group is not None and "latents" in batch:
-                    batch["latents"] = scatter_sequence(batch["latents"], self.sp_group, dim=2)
+                batch = self._prepare_sequence_parallel_batch(batch)
 
                 if self.device.type == "cuda":
                     torch.cuda.synchronize(self.device)
@@ -718,7 +780,7 @@ class BaseDistillTrainer(ABC):
                     profiler.step()
 
                 # EMA update
-                if self.ema is not None:
+                if self.ema is not None and not step_metrics.get("optimizer_skipped", 0):
                     self.ema.update(self._unwrap_model(self.student_model))
 
                 # Stateful subclass hooks (for example, consistency EMA updates)
@@ -751,6 +813,7 @@ class BaseDistillTrainer(ABC):
                 profiler.__exit__(None, None, None)
             if self.runtime is not None and hasattr(self.runtime, "close"):
                 self.runtime.close()
+            self._close_parallel_targets()
             if self._tracker is not None:
                 self._tracker.close()
 
@@ -776,7 +839,8 @@ class BaseDistillTrainer(ABC):
         self._deepspeed_engine = self.student_model
         # ZeRO-1/2 moves a CPU-staged student during engine initialization.
         # Its replicated EMA must follow that move before the first update;
-        # keep the shadow's original precision. ZeRO-3 EMA is rejected earlier.
+        # keep the shadow's original precision. ZeRO-3 initializes shard-local
+        # EMA only after the engine has created its FP32 master partitions.
         if self.ema is not None:
             parameters = dict(self._unwrap_model(self.student_model).named_parameters())
             self.ema.shadow = {
@@ -784,10 +848,13 @@ class BaseDistillTrainer(ABC):
                 for name, value in self.ema.shadow.items()
             }
         self._refresh_distributed_state()
+        self._initialize_sharded_ema()
         logger.info(f"DeepSpeed ZeRO-{ds_stage} initialized.")
 
     def _init_fsdp(self):
         """Initialize FSDP wrapping for training."""
+        if not self.is_distributed:
+            raise RuntimeError("FSDP requires an initialized distributed process group")
         if self.is_distributed and not self._is_fsdp_wrapped(self.student_model):
             from training.utils.optimizers import partition_adamw_parameters
 
@@ -847,6 +914,7 @@ class BaseDistillTrainer(ABC):
                 min_lr_ratio=self.args.lr_min_ratio,
             )
             logger.info("Optimizer/scheduler re-created for FSDP-wrapped model.")
+        self._initialize_sharded_ema()
 
     @staticmethod
     def _is_fsdp_wrapped(model: nn.Module) -> bool:
@@ -918,14 +986,7 @@ class BaseDistillTrainer(ABC):
         self.optimizer.zero_grad()
         total_loss = 0.0
 
-        for accum_idx in range(self.args.gradient_accumulation_steps):
-            if accum_idx > 0:
-                batch = self._next_batch()
-                batch = self._move_batch_to_device(batch)
-                batch = self._prepare_batch_for_model(batch)
-                if self.sp_group is not None and "latents" in batch:
-                    batch["latents"] = scatter_sequence(batch["latents"], self.sp_group, dim=2)
-
+        for accum_idx, batch in enumerate(self._training_microbatches(batch)):
             # Sync gradients only on last accumulation step
             is_last_accum = accum_idx == self.args.gradient_accumulation_steps - 1
             ctx = (
@@ -938,7 +999,7 @@ class BaseDistillTrainer(ABC):
                 with torch.amp.autocast("cuda", dtype=self.amp_dtype, enabled=self.use_amp):
                     loss = self._forward_and_loss(batch)
                     loss = loss / self.args.gradient_accumulation_steps
-                self.scaler.scale(loss).backward()
+                self.scaler.scale(self._context_parallel_backward_loss(loss)).backward()
             total_loss += loss.item()
 
         if self._manual_replicated_sync:
@@ -991,6 +1052,18 @@ class BaseDistillTrainer(ABC):
             "optimizer_skipped": optimizer_skipped,
         }
 
+    def _training_microbatches(self, batch):
+        """Yield fully encoded microbatches for one effective optimizer step.
+
+        Auxiliary optimizers can override this hook to consume the same batch
+        group before yielding it to the student's native or DeepSpeed loop.
+        """
+        yield batch
+        for _ in range(1, self.args.gradient_accumulation_steps):
+            batch = self._prepare_batch_for_model(self._move_batch_to_device(self._next_batch()))
+            batch = self._prepare_sequence_parallel_batch(batch)
+            yield batch
+
     def _train_step_deepspeed(self, batch: Dict[str, Any]) -> Dict[str, float]:
         """DeepSpeed training step.
 
@@ -1002,14 +1075,8 @@ class BaseDistillTrainer(ABC):
         total_loss = 0.0
 
         accumulation_steps = self.args.gradient_accumulation_steps
-        for accum_idx in range(accumulation_steps):
-            if accum_idx > 0:
-                batch = self._next_batch()
-                batch = self._move_batch_to_device(batch)
-                batch = self._prepare_batch_for_model(batch)
-                if self.sp_group is not None and "latents" in batch:
-                    batch["latents"] = scatter_sequence(batch["latents"], self.sp_group, dim=2)
-
+        skipped_before = getattr(engine, "skipped_steps", 0)
+        for accum_idx, batch in enumerate(self._training_microbatches(batch)):
             # The engine owns student loss scaling, but the frozen teacher /
             # EMA targets are external modules. They need the same autocast
             # context when their stored dtype differs from the input latents.
@@ -1019,7 +1086,7 @@ class BaseDistillTrainer(ABC):
             # DeepSpeed owns loss scaling and the accumulation boundary. Its
             # step() is called for every microbatch and updates parameters only
             # when the configured boundary is reached.
-            engine.backward(loss)
+            engine.backward(self._context_parallel_backward_loss(loss))
             total_loss += loss.item()
             engine.step()
 
@@ -1032,7 +1099,7 @@ class BaseDistillTrainer(ABC):
             "loss": total_loss / accumulation_steps,
             "grad_norm": grad_norm if isinstance(grad_norm, float) else 0.0,
             "lr": engine.get_lr()[0] if hasattr(engine, "get_lr") else self.args.learning_rate,
-            "optimizer_skipped": 0.0,
+            "optimizer_skipped": float(getattr(engine, "skipped_steps", 0) > skipped_before),
         }
 
     def _augment_step_metrics(
@@ -1046,7 +1113,7 @@ class BaseDistillTrainer(ABC):
         effective_batch_size = (
             self._infer_batch_size(batch)
             * self.args.gradient_accumulation_steps
-            * self.world_size
+            * (self.world_size // getattr(self.args, "sp_size", 1))
         )
         self._optimizer_skipped_steps += int(enriched.get("optimizer_skipped", 0.0))
 
@@ -1091,12 +1158,8 @@ class BaseDistillTrainer(ABC):
 
         # Sample timesteps
         timesteps = self._sample_timesteps(bs)
-        sigmas = timesteps / self.num_train_timesteps
-
-        # Create noisy latents via flow matching: x_t = (1-sigma)*x_0 + sigma*noise
         noise = torch.randn_like(latents)
-        sigmas_expanded = sigmas.view(bs, *([1] * (latents.dim() - 1)))
-        noisy_latents = (1 - sigmas_expanded) * latents + sigmas_expanded * noise
+        noisy_latents = self.noise_objective.add_noise(latents, noise, timesteps)
 
         teacher_input = self.prepare_teacher_input(batch, noisy_latents, timesteps)
         student_input = self.prepare_student_input(batch, noisy_latents, timesteps)
@@ -1124,6 +1187,8 @@ class BaseDistillTrainer(ABC):
         # Clamp to avoid numerical issues at boundaries
         t = t.clamp(min=0.001, max=0.999)
         timesteps = t * self.num_train_timesteps
+        if self.noise_objective.process == "vp":
+            timesteps = timesteps.floor().clamp(max=self.num_train_timesteps - 1)
         return timesteps.to(self.device)
 
     def prepare_student_input(
@@ -1139,7 +1204,9 @@ class BaseDistillTrainer(ABC):
         for key in ("encoder_hidden_states", "encoder_attention_mask", "pooled_projections",
                     "encoder_hidden_states_2", "encoder_attention_mask_2", "image_embeds",
                     "encoder_hidden_states_image", "image_cond", "camera_poses", "actions",
-                    "guidance", "timestep_r", "image_rotary_emb", "rope_interpolation_scale"):
+                    "guidance", "timestep_r", "image_rotary_emb", "rope_interpolation_scale",
+                    "audio_hidden_states", "audio_timestep", "audio_encoder_hidden_states",
+                    "audio_encoder_attention_mask"):
             if key in batch and batch[key] is not None:
                 input_kwargs[key] = batch[key]
         return input_kwargs
@@ -1415,11 +1482,8 @@ class BaseDistillTrainer(ABC):
         bs = latents.shape[0]
 
         timesteps = self._sample_timesteps(bs)
-        sigmas = timesteps / self.num_train_timesteps
-
         noise = torch.randn_like(latents)
-        sigmas_expanded = sigmas.view(bs, *([1] * (latents.dim() - 1)))
-        noisy_latents = (1 - sigmas_expanded) * latents + sigmas_expanded * noise
+        noisy_latents = self.noise_objective.add_noise(latents, noise, timesteps)
 
         teacher_input = self.prepare_teacher_input(batch, noisy_latents, timesteps)
         teacher_output = self.run_teacher(
@@ -1445,17 +1509,24 @@ class BaseDistillTrainer(ABC):
 
         self.student_model.eval()
         total_loss = 0.0
+        total_samples = 0
         num_batches = 0
+        validation_sampler = getattr(self.val_dataloader, "batch_sampler", None)
+        is_padding = getattr(validation_sampler, "is_padding_batch", lambda _: False)
 
         with torch.no_grad():
             for batch in self.val_dataloader:
                 batch = self._move_batch_to_device(batch)
                 batch = self._prepare_batch_for_model(batch)
-                if self.sp_group is not None and "latents" in batch:
-                    batch["latents"] = scatter_sequence(batch["latents"], self.sp_group, dim=2)
+                batch = self._prepare_sequence_parallel_batch(batch)
 
                 loss = self.validation_step(batch)
-                total_loss += loss.item()
+                batch_size = batch["latents"].shape[0]
+                # Padding must still execute sharded-model collectives, but
+                # duplicated whole batches must not alter validation metrics.
+                if not is_padding(num_batches):
+                    total_loss += loss.item() * batch_size
+                    total_samples += batch_size
                 num_batches += 1
 
                 if num_batches >= self.args.eval_batches:
@@ -1465,11 +1536,10 @@ class BaseDistillTrainer(ABC):
             self.student_model.train()
             return {}
 
-        avg_loss = total_loss / max(1, num_batches)
+        counts = torch.tensor([total_loss, total_samples], dtype=torch.float64, device=self.device)
         if self.is_distributed:
-            loss_tensor = torch.tensor(avg_loss, device=self.device)
-            dist.all_reduce(loss_tensor, op=dist.ReduceOp.SUM)
-            avg_loss = loss_tensor.item() / self.world_size
+            dist.all_reduce(counts, op=dist.ReduceOp.SUM)
+        avg_loss = (counts[0] / counts[1].clamp_min(1)).item()
 
         self.student_model.train()
         return {"eval_loss": avg_loss}
@@ -1489,6 +1559,10 @@ class BaseDistillTrainer(ABC):
             lambda: os.makedirs(ckpt_dir, exist_ok=True),
             f"Create checkpoint directory {ckpt_dir}",
         )
+        if self.runtime is not None:
+            self.runtime.synchronize_teacher()
+        if isinstance(self.ema, ShardedEMA):
+            self._run_all_ranks_or_raise(lambda: self.ema.save(ckpt_dir), "Save rank-local EMA shards")
 
         if self._deepspeed_engine is not None:
             self._save_checkpoint_deepspeed(step, ckpt_dir)
@@ -1503,10 +1577,6 @@ class BaseDistillTrainer(ABC):
     def _save_checkpoint_deepspeed(self, step: int, ckpt_dir: str) -> None:
         """Save a DeepSpeed checkpoint collectively with strict client state."""
 
-        deepspeed_stage = int(getattr(self.args, "deepspeed_stage", 2))
-        if self.ema is not None and deepspeed_stage >= 3:
-            raise RuntimeError("Base EMA cannot be checkpointed from partitioned ZeRO-3 parameters.")
-
         resume_state = self._collect_resume_state()
         client_state = {
             "step": step,
@@ -1514,7 +1584,9 @@ class BaseDistillTrainer(ABC):
             "best_loss": self.best_loss,
             "resume_state": resume_state,
         }
-        if self.ema is not None:
+        if isinstance(self.ema, ShardedEMA):
+            client_state["sharded_ema"] = ShardedEMA.SCHEMA
+        elif self.ema is not None:
             client_state["ema"] = self.ema.state_dict()
         amp_state = self._collect_deepspeed_amp_scaler_state()
         if amp_state is not None:
@@ -1599,9 +1671,6 @@ class BaseDistillTrainer(ABC):
     def _save_checkpoint_fsdp(self, step: int, ckpt_dir: str):
         """Collect canonical full FSDP model/optimizer state on rank zero."""
 
-        if self.ema is not None:
-            raise RuntimeError("Base EMA is not supported with FSDP checkpoints.")
-
         resume_state = self._collect_resume_state()
 
         def _collect_state() -> tuple[dict[str, Any], dict[str, Any]]:
@@ -1629,6 +1698,7 @@ class BaseDistillTrainer(ABC):
                 "scaler": self.scaler.state_dict(),
                 "best_loss": self.best_loss,
                 "resume_state": resume_state,
+                **({"sharded_ema": ShardedEMA.SCHEMA} if isinstance(self.ema, ShardedEMA) else {}),
                 "args": vars(self.args) if hasattr(self.args, "__dict__") else str(self.args),
             },
             f"Write FSDP checkpoint {checkpoint_path}",
@@ -1669,10 +1739,12 @@ class BaseDistillTrainer(ABC):
         """Load training checkpoint (DDP/FSDP/DeepSpeed compatible)."""
         if self._deepspeed_engine is not None:
             self._load_checkpoint_deepspeed(path)
+            self._restore_sharded_ema(path)
             return
 
         if self._is_fsdp_wrapped(self.student_model):
             self._load_checkpoint_fsdp(path)
+            self._restore_sharded_ema(path)
             return
 
         ckpt_path = os.path.join(path, "trainer_state.pt") if os.path.isdir(path) else path
@@ -1686,6 +1758,11 @@ class BaseDistillTrainer(ABC):
             f"Restore DDP checkpoint {ckpt_path}",
         )
         logger.info(f"Resumed from step {self.global_step}")
+
+    def _restore_sharded_ema(self, path: str) -> None:
+        if isinstance(self.ema, ShardedEMA):
+            directory = path if os.path.isdir(path) else os.path.dirname(path)
+            self._run_all_ranks_or_raise(lambda: self.ema.load(directory), "Restore rank-local EMA shards")
 
     def _restore_standard_checkpoint_state(self, state: dict[str, Any]) -> None:
         """Strictly restore a replicated model checkpoint on the local rank."""
@@ -1705,10 +1782,6 @@ class BaseDistillTrainer(ABC):
     def _load_checkpoint_deepspeed(self, path: str) -> None:
         """Collectively restore DeepSpeed state and validate client metadata."""
 
-        deepspeed_stage = int(getattr(self.args, "deepspeed_stage", 2))
-        if self.ema is not None and deepspeed_stage >= 3:
-            raise RuntimeError("Base EMA cannot be restored from partitioned ZeRO-3 parameters.")
-
         def _load_and_restore() -> str:
             load_path, client_state = self._deepspeed_engine.load_checkpoint(path)
             if load_path is None:
@@ -1717,17 +1790,19 @@ class BaseDistillTrainer(ABC):
                 raise TypeError("DeepSpeed checkpoint client_state must be a dict")
             required = {"step", "epoch", "best_loss"}
             if self.ema is not None:
-                required.add("ema")
+                required.add("sharded_ema" if isinstance(self.ema, ShardedEMA) else "ema")
             missing = sorted(required.difference(client_state))
             if missing:
                 raise KeyError(f"DeepSpeed client_state is missing required keys: {missing}")
+            if isinstance(self.ema, ShardedEMA) and client_state["sharded_ema"] != ShardedEMA.SCHEMA:
+                raise ValueError("Invalid sharded EMA checkpoint marker")
 
             self.global_step = client_state["step"]
             self.epoch = client_state["epoch"]
             self.best_loss = client_state["best_loss"]
             self._restore_resume_state(client_state.get("resume_state"))
             self._restore_deepspeed_amp_scaler_state(client_state.get("torch_amp_scaler_by_rank"))
-            if self.ema is not None:
+            if self.ema is not None and not isinstance(self.ema, ShardedEMA):
                 self.ema.load_state_dict(client_state["ema"])
             return str(load_path)
 
@@ -1741,8 +1816,6 @@ class BaseDistillTrainer(ABC):
     def _load_checkpoint_fsdp(self, path: str):
         """Broadcast a rank-zero full checkpoint into FSDP model/optimizer shards."""
 
-        if self.ema is not None:
-            raise RuntimeError("Base EMA is not supported with FSDP checkpoints.")
         ckpt_path = os.path.join(path, "trainer_state.pt") if os.path.isdir(path) else path
         def _load_rank0_state() -> dict[str, Any]:
             if not os.path.exists(ckpt_path):
@@ -1832,12 +1905,14 @@ class BaseDistillTrainer(ABC):
 
     def _compute_grad_norm(self) -> torch.Tensor:
         """Compute the global L2 gradient norm for replicated or sharded params."""
+        if self._is_fsdp_wrapped(self.student_model):
+            # FSDP understands both shard and replica axes, unlike a WORLD sum
+            # which would count hybrid replicas more than once.
+            return self.student_model.clip_grad_norm_(float("inf"))
         total_squared = torch.tensor(0.0, device=self.device)
         for p in self._trainable_parameters():
             if p.grad is not None:
                 total_squared += p.grad.detach().float().norm(2) ** 2
-        if self._is_fsdp_wrapped(self.student_model) and self._checkpoint_distributed():
-            dist.all_reduce(total_squared, op=dist.ReduceOp.SUM)
         return total_squared.sqrt()
 
     def _log_metrics(self, metrics: Dict[str, float]):

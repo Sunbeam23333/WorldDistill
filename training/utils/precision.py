@@ -7,11 +7,8 @@ from loguru import logger
 
 
 def training_precisions(args):
-    """Hardware support cannot supply a missing optimizer/scaler algorithm."""
-    allowed = {"no", "fp16", "bf16"}
-    if args.parallel_mode == "fsdp" or args.distill_method in {"adversarial_distill", "dmd_distill"}:
-        allowed.discard("fp16")
-    return allowed
+    """Native, sharded, and auxiliary optimizers each own their scaler."""
+    return {"no", "fp16", "bf16"}
 
 
 def resolve_training_precision(args, device):

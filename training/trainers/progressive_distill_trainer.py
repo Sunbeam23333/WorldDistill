@@ -13,7 +13,7 @@ At each stage, the teacher is the student from the previous stage.
 Key improvements over naive implementation:
 - Supports loss in both v-space and x0-space (v-space is more stable per the paper)
 - Optimizer reset between stages for clean convergence
-- EMA-based teacher for smoother transitions
+- Full-state stage handoff preserving offloaded teacher parameter ownership
 
 References:
 - Progressive Distillation: https://arxiv.org/abs/2202.00512
@@ -40,16 +40,9 @@ class ProgressiveDistillTrainer(BaseDistillTrainer):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         self._require_velocity_prediction("Progressive distillation")
-        if self.parallel_mode != "ddp":
-            raise ValueError(
-                "Progressive stage transitions currently support serial/DDP training only; "
-                "FSDP/DeepSpeed require a full-state teacher handoff and engine rebuild."
-            )
-        if bool(getattr(self.args, "use_lora", False)):
-            raise ValueError(
-                "Progressive distillation with LoRA is not supported because stage-boundary "
-                "teacher handoff requires identical full-model state keys."
-            )
+        self._lora_teacher_handoff = bool(getattr(self.args, "use_lora", False))
+        if self._lora_teacher_handoff and not getattr(self._eager_student(), "peft_config", None):
+            raise ValueError("Progressive LoRA training requires a real PEFT student, not an unwrapped base model")
         self.stages = self.args.progressive_stages
         if len(self.stages) < 2 or any(step <= 0 for step in self.stages):
             raise ValueError("progressive_stages must contain at least two positive step counts")
@@ -75,6 +68,31 @@ class ProgressiveDistillTrainer(BaseDistillTrainer):
     def _reset_stage_optimizer(self) -> None:
         """Rebuild the optimizer and scheduler with the stage-local horizon."""
 
+        if self._deepspeed_engine is not None or self._is_fsdp_wrapped(self.student_model):
+            # Keep the optimizer's partition ownership and FP32 master weights.
+            # Reconstructing it from current model.parameters() would instead
+            # optimize transient low-precision/sharded model views. Reset only
+            # local moments, then bind a fresh stage-local scheduler to the
+            # underlying real optimizer used by the engine.
+            optimizer = self.optimizer
+            if self._deepspeed_engine is not None:
+                optimizer = getattr(optimizer, "optimizer", optimizer)
+            if not isinstance(optimizer, torch.optim.Optimizer):
+                raise TypeError("Progressive stage reset needs an accessible PyTorch base optimizer")
+            optimizer.state.clear()
+            optimizer.zero_grad(set_to_none=True)
+            for group in optimizer.param_groups:
+                group["lr"] = self.args.learning_rate
+                group["initial_lr"] = self.args.learning_rate
+            self.lr_scheduler = build_lr_scheduler(
+                optimizer, scheduler_type=self.args.lr_scheduler,
+                warmup_steps=self.args.warmup_steps, total_steps=self.stage_steps,
+                min_lr_ratio=self.args.lr_min_ratio,
+            )
+            if self._deepspeed_engine is not None:
+                self._deepspeed_engine.lr_scheduler = self.lr_scheduler
+            return
+
         raw_student = self._unwrap_model(self.student_model)
         self.optimizer = build_optimizer(
             raw_student,
@@ -95,6 +113,54 @@ class ProgressiveDistillTrainer(BaseDistillTrainer):
             total_steps=self.stage_steps,
             min_lr_ratio=self.args.lr_min_ratio,
         )
+
+    def _full_student_state_for_teacher(self):
+        """Collect full parameters on every rank before the frozen handoff."""
+        if self._is_fsdp_wrapped(self.student_model):
+            from torch.distributed.fsdp import (
+                FullyShardedDataParallel as FSDP, StateDictType, FullStateDictConfig,
+            )
+            with FSDP.state_dict_type(self.student_model, StateDictType.FULL_STATE_DICT,
+                                     FullStateDictConfig(offload_to_cpu=True, rank0_only=False)):
+                state = self.student_model.state_dict()
+            return self._canonical_state(state)
+        raw = self._unwrap_model(self.student_model)
+        if self._deepspeed_engine is not None and self.args.deepspeed_stage == 3:
+            import deepspeed
+            with deepspeed.zero.GatheredParameters(list(raw.parameters()), modifier_rank=None):
+                return self._canonical_state({key: value.detach().cpu().clone() for key, value in raw.state_dict().items()})
+        return self._canonical_state({key: value.detach().cpu().clone() for key, value in raw.state_dict().items()})
+
+    @staticmethod
+    def _canonical_state(state):
+        # torch.compile is an execution wrapper, not a different architecture.
+        result = {}
+        for name, value in state.items():
+            while name.startswith("_orig_mod."):
+                name = name[len("_orig_mod."):]
+            if name in result:
+                raise ValueError("Compiled progressive state has colliding canonical parameter keys")
+            result[name] = value
+        return result
+
+    def _teacher_state_model(self):
+        model = self._unwrap_model(self.teacher_model)
+        while getattr(model, "_orig_mod", None) is not None:
+            model = model._orig_mod
+        return model
+
+    def _eager_student(self):
+        model = self._unwrap_model(self.student_model)
+        while getattr(model, "_orig_mod", None) is not None:
+            model = model._orig_mod
+        return model
+
+    def _teacher_handoff_state(self):
+        state = self._full_student_state_for_teacher()
+        if self._lora_teacher_handoff:
+            from training.utils.peft_handoff import merge_lora_student_state
+            state = merge_lora_student_state(self._teacher_state_model(), self._eager_student(), state)
+        return state
 
     def _get_teacher_timesteps(self, num_steps: int) -> torch.Tensor:
         """Get evenly spaced timesteps for N-step denoising."""
@@ -234,8 +300,10 @@ class ProgressiveDistillTrainer(BaseDistillTrainer):
                     self.current_stage
                 )
                 # Swap: current student becomes new teacher
-                src_state = self._unwrap_model(self.student_model).state_dict()
-                self.teacher_model.load_state_dict(src_state)
+                src_state = self._teacher_handoff_state()
+                if self.runtime is not None:
+                    self.runtime.synchronize_teacher()
+                self._teacher_state_model().load_state_dict(src_state)
                 if self.runtime is not None:
                     self.runtime.advance_teacher_revision(f"progressive-stage-{self.current_stage}")
                 self.teacher_model.eval()
@@ -266,7 +334,7 @@ class ProgressiveDistillTrainer(BaseDistillTrainer):
         self._atomic_save_rank0(
             progressive_path,
             lambda: {
-                "teacher_model": self.teacher_model.state_dict(),
+                "teacher_model": self._teacher_state_model().state_dict(),
                 "current_stage": self.current_stage,
                 "current_teacher_steps": self.current_teacher_steps,
                 "current_student_steps": self.current_student_steps,
@@ -330,7 +398,9 @@ class ProgressiveDistillTrainer(BaseDistillTrainer):
         super().load_checkpoint(path)
 
         def _restore_progressive_teacher():
-            self.teacher_model.load_state_dict(state["teacher_model"], strict=True)
+            if self.runtime is not None:
+                self.runtime.synchronize_teacher()
+            self._teacher_state_model().load_state_dict(self._canonical_state(state["teacher_model"]), strict=True)
             if self.runtime is not None and self.current_stage > 0:
                 self.runtime.advance_teacher_revision(f"progressive-stage-{self.current_stage}")
 

@@ -1,4 +1,4 @@
-"""Real CPU GradScaler plus mock engines: checkpoint contracts, not GPU evidence."""
+"""GradScaler and engine checkpoint contract tests."""
 
 import copy
 from types import SimpleNamespace

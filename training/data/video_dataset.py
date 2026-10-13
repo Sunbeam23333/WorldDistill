@@ -21,6 +21,48 @@ from torch.utils.data import Dataset
 from loguru import logger
 
 
+def collation_signature(sample: Dict[str, Any]) -> Dict[str, Any]:
+    """JSON-safe structure used for exact-shape, field-preserving batching.
+
+    Text and sample identities may vary within a batch. Scalar conditioning
+    values (including fps) must agree: some native pipelines consume one scalar
+    for the whole batch rather than a per-example vector.
+    """
+    def describe(value, *, identity=False):
+        if torch.is_tensor(value):
+            spec = {"type": "tensor", "shape": list(value.shape), "dtype": str(value.dtype)}
+            if value.numel() == 1 and not value.is_meta:
+                scalar = value.item()
+                spec["scalar"] = str(scalar) if isinstance(scalar, complex) else scalar
+            return spec
+        if isinstance(value, dict):
+            return {key: describe(child) for key, child in sorted(value.items())}
+        if isinstance(value, (tuple, list)):
+            return {"type": type(value).__name__, "items": [describe(child) for child in value]}
+        if isinstance(value, str):
+            return {"type": "str"}
+        if isinstance(value, (bool, int, float)):
+            return {"type": type(value).__name__, **({} if identity else {"value": value})}
+        raise TypeError(f"Cannot determine collation structure for {type(value).__name__}")
+
+    return {key: describe(value, identity=key == "manifest_idx") for key, value in sorted(sample.items())}
+
+
+def _load_tensor_headers(path):
+    """Memory-map storage; inspect shapes and only touch scalar tensor values.
+
+    Pre-zip torch.save files cannot be memory-mapped. They are read one file at
+    a time and immediately released after producing the small JSON signature;
+    dataset metadata never retains tensor storage.
+    """
+    try:
+        return torch.load(path, map_location="cpu", weights_only=True, mmap=True)
+    except RuntimeError as error:
+        if "mmap can only be used" not in str(error):
+            raise
+        return torch.load(path, map_location="cpu", weights_only=True)
+
+
 class VideoDataset(Dataset):
     """Generic video dataset that loads raw video files.
 
@@ -49,6 +91,7 @@ class VideoDataset(Dataset):
         self.resolution = resolution
         self.num_frames = num_frames
         self.transform = transform
+        self._metadata_cache = {}
 
         # Parse target resolution
         res_map = {"360p": (360, 640), "480p": (480, 854), "720p": (720, 1280), "1080p": (1080, 1920)}
@@ -63,11 +106,40 @@ class VideoDataset(Dataset):
         return len(self.data)
 
     def get_metadata(self, idx: int) -> Dict[str, Any]:
+        if idx in self._metadata_cache:
+            return self._metadata_cache[idx]
+        if self.transform is not None:
+            raise ValueError("Shape-safe video bucketing requires fixed decoder output; "
+                             "cache transformed videos before using a custom transform with BucketSampler")
         item = self.data[idx]
-        return {
-            "resolution": item.get("resolution", [self.target_h, self.target_w]),
-            "num_frames": item.get("num_frames", self.num_frames),
-        }
+        frames = int(item.get("num_frames", self.num_frames))
+        sample = {"pixel_values": torch.empty((3, frames, self.target_h, self.target_w), device="meta"),
+                  "text": "", "resolution": [self.target_h, self.target_w], "num_frames": frames,
+                  "video_path": "", "sample_id": "", "manifest_idx": idx,
+                  "source_frame_indices": torch.empty(frames, dtype=torch.int64, device="meta")}
+        if "fps" in item:
+            sample["fps"] = float(item["fps"])
+        for path_key, key, prefix in (("audio_feature_path", "audio_pixel_values", None),
+                ("action_path", "actions", "action"), ("camera_path", "camera_poses", "camera")):
+            if not item.get(path_key):
+                continue
+            path = item[path_key]
+            path = os.path.join(self.video_dir, path) if self.video_dir and not os.path.isabs(path) else path
+            value = _load_tensor_headers(path)
+            if not torch.is_tensor(value):
+                raise TypeError(f"Declared {key} must be a tensor")
+            if prefix is not None:
+                axis = int(item.get(f"{prefix}_temporal_axis", 0))
+                if not value.ndim or not -value.ndim <= axis < value.ndim:
+                    raise ValueError(f"Invalid {key} temporal axis")
+                shape = list(value.movedim(axis, 0).shape)
+                shape[0] = frames
+                value = torch.empty(shape, dtype=value.dtype, device="meta")
+            sample[key] = value
+        metadata = {"resolution": [self.target_h, self.target_w], "num_frames": frames,
+                    "collation_signature": collation_signature(sample)}
+        self._metadata_cache[idx] = metadata
+        return metadata
 
     def __getitem__(self, idx) -> Dict[str, Any]:
         item = self.data[idx]
@@ -84,13 +156,28 @@ class VideoDataset(Dataset):
         result = {
             "pixel_values": frames,  # (C, T, H, W) float32 in [-1, 1]
             "text": item.get("text", ""),
-            "resolution": item.get("resolution", [self.target_h, self.target_w]),
+            "resolution": list(frames.shape[-2:]),
             "num_frames": frames.shape[1],
             "video_path": video_path,
             "sample_id": str(item.get("sample_id") or video_path),
             "manifest_idx": idx,
             "source_frame_indices": frame_indices,
         }
+        if "fps" in item:
+            fps = float(item["fps"])
+            if not 0 < fps < float("inf"):
+                raise ValueError("Raw video frame rate must be finite and positive")
+            result["fps"] = fps
+        if item.get("audio_feature_path"):
+            if item.get("audio_alignment") != "sampled_video":
+                raise ValueError("audio_feature_path must declare audio_alignment='sampled_video': features "
+                                 "must match the sampled frames and fps, not an unsampled source soundtrack")
+            if "fps" not in result:
+                raise ValueError("Audiovisual raw samples require an explicit sampled-video fps")
+            audio = self._load_optional_tensor(item["audio_feature_path"], "audio features")
+            if audio.ndim != 3 or not torch.isfinite(audio).all():
+                raise ValueError("Audio features must be finite C,L,M log-mel tensors from the checkpoint preprocessor")
+            result["audio_pixel_values"] = audio
 
         if "camera_path" in item and item.get("camera_path"):
             result["camera_poses"] = self._load_optional_tensor(item["camera_path"], "camera")
@@ -227,6 +314,7 @@ class CachedLatentDataset(Dataset):
         validate_paths: bool = True,
     ):
         self.cache_dir = cache_dir
+        self._metadata_cache = {}
 
         with open(data_json, "r") as f:
             self.data = json.load(f)
@@ -255,6 +343,7 @@ class CachedLatentDataset(Dataset):
             "camera_path",
             "action_path",
             "conditioning_path",
+            "audio_latent_path",
         )
         for idx, item in enumerate(self.data):
             if not isinstance(item, dict):
@@ -273,13 +362,15 @@ class CachedLatentDataset(Dataset):
                         f"Cached sample '{sample_id}' declares missing {path_key}: {resolved_path}"
                     )
 
-    def _load_cached_tensor(self, item: Dict[str, Any], idx: int, path_key: str):
+    def _load_cached_tensor(self, item: Dict[str, Any], idx: int, path_key: str, *, metadata_only=False):
         declared_path = item.get(path_key)
         if not declared_path:
             return None
         resolved_path = self._resolve_cache_path(str(declared_path))
         sample_id = self._sample_id(item, idx)
         try:
+            if metadata_only:
+                return _load_tensor_headers(resolved_path)
             return torch.load(resolved_path, map_location="cpu", weights_only=True)
         except Exception as exc:
             raise RuntimeError(
@@ -291,18 +382,28 @@ class CachedLatentDataset(Dataset):
         return len(self.data)
 
     def get_metadata(self, idx: int) -> Dict[str, Any]:
-        """Get metadata without loading heavy tensors (for bucket assignment)."""
-        item = self.data[idx]
-        return {
-            "resolution": item.get("resolution", [60, 107]),
-            "num_frames": item.get("num_frames", 49),
-        }
+        """Inspect actual tensor headers once; do not trust stale manifest sizes."""
+        if idx not in self._metadata_cache:
+            sample = self._read_sample(idx, metadata_only=True)
+            signature = collation_signature(sample)
+            declared = self.data[idx].get("collation_signature")
+            if declared is not None and declared != signature:
+                raise ValueError(f"Cached sample '{self._sample_id(self.data[idx], idx)}' "
+                                 "collation_signature does not match its tensor artifacts")
+            self._metadata_cache[idx] = {"resolution": list(sample["latents"].shape[-2:]),
+                                        "num_frames": sample["num_frames"], "collation_signature": signature}
+        return self._metadata_cache[idx]
 
     def __getitem__(self, idx) -> Dict[str, Any]:
+        return self._read_sample(idx)
+
+    def _read_sample(self, idx, *, metadata_only=False) -> Dict[str, Any]:
         item = self.data[idx]
+        def load(path_key):
+            return self._load_cached_tensor(item, idx, path_key, metadata_only=metadata_only)
 
         # Load pre-computed latent
-        latents = self._load_cached_tensor(item, idx, "latent_path")
+        latents = load("latent_path")
         if not isinstance(latents, torch.Tensor):
             raise TypeError(
                 f"Cached latent for sample '{self._sample_id(item, idx)}' must be a tensor, "
@@ -317,38 +418,50 @@ class CachedLatentDataset(Dataset):
         sample_id = self._sample_id(item, idx)
         result = {
             "latents": latents,  # (C, T, H, W)
-            "num_frames": item.get("num_frames", latents.shape[1] if latents.dim() == 4 else 1),
+            "num_frames": latents.shape[1] if latents.dim() == 4 else 1,
             "sample_id": sample_id,
             "manifest_idx": idx,
         }
+        if "fps" in item:
+            fps = float(item["fps"])
+            if not 0 < fps < float("inf"):
+                raise ValueError("Cached video frame rate must be finite and positive")
+            result["fps"] = fps
+        if item.get("audio_latent_path"):
+            audio = load("audio_latent_path")
+            if not torch.is_tensor(audio) or audio.ndim != 2 or (not metadata_only and not torch.isfinite(audio).all()):
+                raise ValueError("Cached audio latents must be normalized packed finite L,D tensors")
+            result["audio_latents"] = audio
 
         # Model-specific multi-encoder tensors (e.g. Hunyuan pooled/text2/masks)
         # travel together, rather than being silently reduced to one embedding.
         if item.get("conditioning_path"):
-            conditioning = self._load_cached_tensor(item, idx, "conditioning_path")
+            conditioning = load("conditioning_path")
             if not isinstance(conditioning, dict) or any(not isinstance(k, str) or not torch.is_tensor(v)
                                                          for k, v in conditioning.items()):
                 raise TypeError("conditioning_path must contain a dict of named tensors")
-            reserved = {"latents", "num_frames", "sample_id", "manifest_idx"}
+            reserved = {"latents", "num_frames", "sample_id", "manifest_idx", "fps"}
+            if "audio_latents" in result:
+                reserved.add("audio_latents")
             if reserved.intersection(conditioning):
                 raise ValueError("conditioning_path cannot override latent/sample metadata")
             result.update(conditioning)
 
         # Load text embeddings
         if "text_embed_path" in item:
-            text_embeds = self._load_cached_tensor(item, idx, "text_embed_path")
+            text_embeds = load("text_embed_path")
             if text_embeds is not None:
                 result["encoder_hidden_states"] = text_embeds
 
         # Load image conditioning (for i2v tasks)
         if "image_cond_path" in item and item.get("image_cond_path"):
-            result["image_cond"] = self._load_cached_tensor(item, idx, "image_cond_path")
+            result["image_cond"] = load("image_cond_path")
 
         # Load camera/action data (for world models)
         if "camera_path" in item and item.get("camera_path"):
-            result["camera_poses"] = self._load_cached_tensor(item, idx, "camera_path")
+            result["camera_poses"] = load("camera_path")
 
         if "action_path" in item and item.get("action_path"):
-            result["actions"] = self._load_cached_tensor(item, idx, "action_path")
+            result["actions"] = load("action_path")
 
         return result

@@ -172,6 +172,7 @@ models:
     architecture: dit
     tasks: [t2v, i2v, t2av, i2av]
     runner_cls: "ltx2"
+    distill_methods: [joint_av_distill]
     checkpoint_formats: [directory, diffusers, state_dict]
     status: supported
 

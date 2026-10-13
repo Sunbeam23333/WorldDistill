@@ -12,6 +12,9 @@ def extract_prediction_tensor(output: Any, *, tag: str = "model") -> torch.Tenso
 
     if torch.is_tensor(output):
         return output
+    audio = output.get("audio_sample") if isinstance(output, dict) else getattr(output, "audio_sample", None)
+    if audio is not None:
+        raise TypeError(f"{tag} returned audiovisual predictions; use joint_av_distill rather than discarding audio")
     if isinstance(output, (tuple, list)):
         if not output:
             raise TypeError(f"{tag} returned an empty tuple/list")

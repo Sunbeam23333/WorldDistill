@@ -72,7 +72,7 @@ class OptimizerContractTests(unittest.TestCase):
         self.assertEqual(optimized_ids, expected_ids)
         self.assertIs(trainer.lr_scheduler.optimizer, trainer.optimizer)
 
-    def test_muon_and_dual_model_reject_unsupported_sharded_modes(self) -> None:
+    def test_muon_rejects_sharding_but_dual_container_owns_both_experts(self) -> None:
         for parallel_mode in ("fsdp", "deepspeed"):
             with self.subTest(kind="muon", parallel_mode=parallel_mode):
                 args = TrainerArgs(
@@ -103,20 +103,24 @@ class OptimizerContractTests(unittest.TestCase):
                     mixed_precision="no",
                     report_to="none",
                 )
-                with self.assertRaisesRegex(ValueError, "Dual high/low-noise"):
-                    StepDistillTrainer(
-                        args=args,
-                        teacher_model=teacher,
-                        student_model=student,
-                        optimizer=optimizer,
-                        lr_scheduler=None,
-                        train_dataloader=[],
-                        device=torch.device("cpu"),
-                    )
+                trainer = StepDistillTrainer(
+                    args=args,
+                    teacher_model=teacher,
+                    student_model=student,
+                    optimizer=optimizer,
+                    lr_scheduler=None,
+                    train_dataloader=[],
+                    device=torch.device("cpu"),
+                )
+                self.assertIs(trainer.student_model.high, trainer.student_high)
+                self.assertIs(trainer.student_model.low, trainer.student_low)
+                self.assertEqual(args.dual_student_layout, "unified_v1")
+                self.assertEqual({id(p) for p in trainer.student_model.parameters()},
+                    {id(p) for group in trainer.optimizer.param_groups for p in group["params"]})
 
-    def test_fsdp_fp16_fails_before_unscaled_training(self) -> None:
+    def test_fsdp_fp16_requires_initialized_overflow_consensus_group(self) -> None:
         student = nn.Linear(2, 2)
-        with self.assertRaisesRegex(ValueError, "ShardedGradScaler"):
+        with self.assertRaisesRegex(RuntimeError, "initialized process group"):
             StepDistillTrainer(
                 args=TrainerArgs(
                     parallel_mode="fsdp",
@@ -148,7 +152,7 @@ class OptimizerContractTests(unittest.TestCase):
                 device=torch.device("cpu"),
             )
 
-    def test_auxiliary_optimizer_trainers_reject_unscaled_fp16(self) -> None:
+    def test_auxiliary_optimizer_trainers_own_independent_scalers(self) -> None:
         from training.trainers.adversarial_distill_trainer import AdversarialDistillTrainer
         from training.trainers.dmd_distill_trainer import DMDDistillTrainer
 
@@ -158,20 +162,15 @@ class OptimizerContractTests(unittest.TestCase):
         ):
             with self.subTest(trainer=trainer_cls.__name__):
                 student = nn.Linear(2, 2)
-                with self.assertRaisesRegex(ValueError, "GradScaler"):
-                    trainer_cls(
-                        args=TrainerArgs(
-                            distill_method=method,
-                            mixed_precision="fp16",
-                            report_to="none",
-                        ),
-                        teacher_model=nn.Linear(2, 2),
-                        student_model=student,
-                        optimizer=torch.optim.AdamW(student.parameters()),
-                        lr_scheduler=None,
-                        train_dataloader=[],
-                        device=torch.device("cpu"),
-                    )
+                trainer = trainer_cls(
+                    args=TrainerArgs(distill_method=method, mixed_precision="fp16", report_to="none"),
+                    teacher_model=nn.Linear(2, 2), student_model=student,
+                    optimizer=torch.optim.AdamW(student.parameters()), lr_scheduler=None,
+                    train_dataloader=[], device=torch.device("cpu"),
+                )
+                self.assertIsNot(trainer.disc_scaler, trainer.scaler)
+                if method == "dmd_distill":
+                    self.assertIsNot(trainer.fake_score_scaler, trainer.scaler)
 
     def test_deepspeed_accumulation_steps_once_per_microbatch(self) -> None:
         class FakeEngine:
@@ -244,16 +243,14 @@ class OptimizerContractTests(unittest.TestCase):
                 device=torch.device("cpu"),
             )
 
-    def test_auxiliary_trainers_reject_ambiguous_accumulation_cadence(self) -> None:
+    def test_auxiliary_trainers_install_accumulation_window_hook(self) -> None:
         for trainer_cls, method in (
             (AdversarialDistillTrainer, "adversarial_distill"),
             (DMDDistillTrainer, "dmd_distill"),
         ):
             student = nn.Linear(2, 2)
-            with self.subTest(method=method), self.assertRaisesRegex(
-                ValueError, "gradient_accumulation_steps=1"
-            ):
-                trainer_cls(
+            with self.subTest(method=method):
+                trainer = trainer_cls(
                     args=TrainerArgs(
                         distill_method=method,
                         gradient_accumulation_steps=2,
@@ -267,6 +264,8 @@ class OptimizerContractTests(unittest.TestCase):
                     train_dataloader=[],
                     device=torch.device("cpu"),
                 )
+                self.assertEqual(trainer.args.gradient_accumulation_steps, 2)
+                self.assertTrue(callable(trainer._run_auxiliary_updates))
 
     def test_dmd2_enables_gan_path_by_variant(self) -> None:
         student = nn.Linear(2, 2)

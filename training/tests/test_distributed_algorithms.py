@@ -32,6 +32,7 @@ def _gloo_worker(rank, rendezvous, output_root):
             ("step_distill", {}), ("progressive_distill", {}), ("consistency_distill", {}),
             ("stream_distill", {}), ("context_forcing", {}),
             ("adversarial_distill", {}), ("dmd_distill", {"dmd_variant": "dmd2"}),
+            ("mean_flow_distill", {}), ("joint_av_distill", {}),
         ]:
             def construct(name, max_steps, resume=""):
                 _seed(rank)

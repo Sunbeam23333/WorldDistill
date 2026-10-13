@@ -18,6 +18,8 @@ REGISTRY_BACKED_DISTILL_METHODS: tuple[str, ...] = (
     "context_forcing",
     "adversarial_distill",
     "dmd_distill",
+    "mean_flow_distill",
+    "joint_av_distill",
 )
 
 REGISTRY_BACKED_DISTILL_METHOD_SET = frozenset(REGISTRY_BACKED_DISTILL_METHODS)

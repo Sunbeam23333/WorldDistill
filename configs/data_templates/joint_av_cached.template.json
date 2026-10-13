@@ -1,0 +1,11 @@
+[
+  {
+    "sample_id": "clip-0001",
+    "latent_path": "clip-0001.video.pt",
+    "audio_latent_path": "clip-0001.audio.pt",
+    "text_embed_path": "clip-0001.video-text.pt",
+    "conditioning_path": "clip-0001.conditions.pt",
+    "num_frames": 25,
+    "resolution": [32, 48]
+  }
+]

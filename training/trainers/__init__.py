@@ -20,6 +20,8 @@ from training.trainers.consistency_distill_trainer import ConsistencyDistillTrai
 from training.trainers.context_forcing_trainer import ContextForcingTrainer
 from training.trainers.adversarial_distill_trainer import AdversarialDistillTrainer
 from training.trainers.dmd_distill_trainer import DMDDistillTrainer
+from training.trainers.mean_flow_distill_trainer import MeanFlowDistillTrainer
+from training.trainers.joint_av_distill_trainer import JointAVDistillTrainer
 
 TRAINER_REGISTRY = {
     "step_distill": StepDistillTrainer,
@@ -29,6 +31,8 @@ TRAINER_REGISTRY = {
     "context_forcing": ContextForcingTrainer,
     "adversarial_distill": AdversarialDistillTrainer,
     "dmd_distill": DMDDistillTrainer,
+    "mean_flow_distill": MeanFlowDistillTrainer,
+    "joint_av_distill": JointAVDistillTrainer,
 }
 
 _missing_registry_methods = [method for method in REGISTRY_BACKED_DISTILL_METHODS if method not in TRAINER_REGISTRY]
@@ -58,6 +62,8 @@ __all__ = [
     "ContextForcingTrainer",
     "AdversarialDistillTrainer",
     "DMDDistillTrainer",
+    "MeanFlowDistillTrainer",
+    "JointAVDistillTrainer",
     "build_trainer",
     "TRAINER_REGISTRY",
 ]

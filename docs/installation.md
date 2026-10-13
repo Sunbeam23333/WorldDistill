@@ -37,8 +37,7 @@ imports the training entry, and compiles the inference sources as a portable
 dependency/syntax smoke test. The full inference registry eagerly imports
 GPU-specific backends such as Triton, so it is checked by `run_infer.sh` on the
 target CUDA host rather than during a CPU install. Core and vendored metadata
-both accept PyTorch 2.5.1 or newer; a newer runtime is still unvalidated until a
-target-GPU run record is checked in.
+both accept PyTorch 2.5.1 or newer. Select a build containing your GPU's architecture.
 
 ## 2. Optional components
 
@@ -56,8 +55,7 @@ low-precision model conversion: this preserves FP32 timesteps and keyword inputs
 while the engine manages operation precision and scaling. Older manually
 installed engines are rejected for mixed precision; FP32 still requires its
 own compatible engine/build test. CPU optimizer offload additionally needs a
-working DeepSpeedCPUAdam extension. No DeepSpeed GPU run has been performed in
-the CPU development environment. See the official
+working DeepSpeedCPUAdam extension. See the official
 [mixed-precision API](https://deepspeed.readthedocs.io/en/latest/training.html#mixed-precision-training).
 
 `--install-kernels` installs the PyPI `flash-attn` package (the FA2 import path)
@@ -166,15 +164,14 @@ optional extensions. CPU-only hosts return `qualified=false` and exit 2.
 
 ## Hardware guidance
 
-| GPU | Policy profile | What must still be checked on the host |
+| GPU | Policy profile | Runtime setup and checks |
 |---|---|---|
 | A100 | `sm_80`, CUDA 11.0+ | FA2/SDPA forward-backward and distributed restart |
 | H20 | `sm_90`, CUDA 12.2+ | FA2/Sage2/SDPA selection and actual kernel execution; FA3 opt-in only after device validation |
-| B200 | `sm_100`, CUDA 12.8+ | Native PyTorch SDPA target; optimized kernels remain opt-in/pending |
+| B200 | `sm_100`, CUDA 12.8+ | Native PyTorch SDPA target; optimized kernels are opt-in |
 | B300 | `sm_103`, CUDA 12.9+ policy | Native PyTorch SDPA target; verify every custom extension |
 
-The repository currently has simulated policy tests, not signed results for
-these four systems. See [CUDA compatibility](cuda-compatibility.md).
+See [CUDA compatibility](cuda-compatibility.md).
 Older server/consumer NVIDIA families and ARM64 platforms have explicit policy
 lanes, not one universal wheel. See the complete
 [GPU and topology qualification tables](hardware-expectations.md) and

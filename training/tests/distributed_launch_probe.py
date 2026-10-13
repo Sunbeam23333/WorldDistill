@@ -1,12 +1,24 @@
 """Tiny CPU worker used only by launch-contract subprocess tests."""
 import json
 import os
+import sys
 
 import torch
 import torch.distributed as dist
 
 from training.distributed_config import rank_environment, topology_rank_groups
 from training.utils.distributed import cleanup_distributed, hybrid_process_groups, setup_distributed, wrap_model_ddp
+
+
+def emit_launch_probe(record):
+    """Keep the marker, JSON and newline in one atomic write to the agent pipe."""
+    payload = ("LAUNCH_PROBE=" + json.dumps(record, separators=(",", ":")) + "\n").encode("utf-8")
+    fd = sys.stdout.fileno()
+    if len(payload) > os.fpathconf(fd, "PC_PIPE_BUF"):
+        raise RuntimeError("Launch probe record exceeds the atomic pipe-write limit")
+    sys.stdout.flush()
+    if os.write(fd, payload) != len(payload):
+        raise RuntimeError("Incomplete launch probe record write")
 
 
 def main():
@@ -38,10 +50,10 @@ def main():
                 grouped = torch.tensor(float(rank + 1))
                 dist.all_reduce(grouped, group=group)
                 assert grouped.item() == sum(member + 1 for member in ranks)
-        print("LAUNCH_PROBE=" + json.dumps({"rank": rank, "world_size": world,
-                                             "local_world_size": info.local_world_size,
-                                             "backend": dist.get_backend(), "shards": shards,
-                                             "replicas": replicas}), flush=True)
+        emit_launch_probe({"rank": rank, "world_size": world,
+                           "local_world_size": info.local_world_size,
+                           "backend": dist.get_backend(), "shards": shards,
+                           "replicas": replicas})
     finally:
         cleanup_distributed()
 

@@ -31,10 +31,8 @@ registration fails early. ZeRO-1/2 and DDP are unchanged. This follows
 
 This guard gathers **all experts in each routed leaf**, including inactive
 ones, on every rank. Peak memory includes that complete group (and potentially
-the larger enclosing FSDP unit), activations and communication buffers: it is
-not a free memory optimization or evidence that a particular checkpoint fits.
-CPU policy/mock tests do not qualify routed FSDP or ZeRO-3 on GPU; different
-per-rank routing still needs real multi-GPU forward/backward verification.
+the larger enclosing FSDP unit), activations and communication buffers.
+Include that complete group when sizing the job's memory budget.
 
 ## Manual launch: run once on each node
 

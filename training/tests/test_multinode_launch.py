@@ -19,6 +19,96 @@ ROOT = Path(__file__).resolve().parents[2]
 SCRIPT = ROOT / "scripts/run_train.sh"
 
 
+def parse_launch_probe_records(outputs, world_size, local_workers):
+    """Decode every marked record, including records coalesced onto one line."""
+    marker = "LAUNCH_PROBE="
+    decoder = json.JSONDecoder()
+    records = []
+    for output in outputs:
+        cursor = 0
+        while (start := output.find(marker, cursor)) != -1:
+            payload_start = start + len(marker)
+            while payload_start < len(output) and output[payload_start].isspace():
+                payload_start += 1
+            try:
+                record, cursor = decoder.raw_decode(output, payload_start)
+            except json.JSONDecodeError as exc:
+                raise AssertionError(f"Malformed launch probe record at offset {start}: {output[start:start + 240]!r}") from exc
+            assert isinstance(record, dict), f"Launch probe record must be an object: {record!r}"
+            for field in ("rank", "world_size", "local_world_size"):
+                assert type(record.get(field)) is int, f"Invalid launch probe {field}: {record!r}"
+            assert record["world_size"] == world_size, f"Wrong launch probe world size: {record!r}"
+            assert record["local_world_size"] == local_workers, f"Wrong launch probe local world size: {record!r}"
+            assert record.get("backend") == "gloo", f"Wrong launch probe backend: {record!r}"
+            records.append(record)
+    ranks = [record["rank"] for record in records]
+    assert len(ranks) == len(set(ranks)), f"Duplicate launch probe ranks: {ranks!r}"
+    assert set(ranks) == set(range(world_size)), f"Missing or unexpected launch probe ranks: {ranks!r}"
+    return records
+
+
+def probe_record(rank):
+    return {"rank": rank, "world_size": 2, "local_world_size": 1, "backend": "gloo"}
+
+
+@pytest.mark.parametrize("separator", ["", "\n", "\n[worker1] ", " [worker1] "])
+def test_launch_probe_parser_accepts_coalesced_records(separator):
+    # Reproduces concurrent print() calls whose newlines arrive after both JSONs.
+    output = "launcher log\n[worker0] LAUNCH_PROBE=" + json.dumps(probe_record(0))
+    output += separator + "LAUNCH_PROBE=" + json.dumps(probe_record(1)) + "\n\ncleanup log\n"
+    assert parse_launch_probe_records([output], 2, 1) == [probe_record(0), probe_record(1)]
+
+
+@pytest.mark.parametrize("suffix", ['{"rank":', '{"rank":oops}', '[]', '{}'])
+def test_launch_probe_parser_rejects_malformed_records(suffix):
+    output = "LAUNCH_PROBE=" + json.dumps(probe_record(0)) + "LAUNCH_PROBE=" + suffix
+    with pytest.raises(AssertionError):
+        parse_launch_probe_records([output], 2, 1)
+
+
+@pytest.mark.parametrize("ranks,reason", [([], "Missing"), ([0], "Missing"), ([0, 0, 1], "Duplicate"), ([0, 2], "unexpected")])
+def test_launch_probe_parser_requires_exact_rank_coverage(ranks, reason):
+    output = "".join("LAUNCH_PROBE=" + json.dumps(probe_record(rank)) for rank in ranks)
+    with pytest.raises(AssertionError, match=reason):
+        parse_launch_probe_records([output], 2, 1)
+
+
+@pytest.mark.parametrize("mutation", [{"rank": False}, {"world_size": 4}, {"local_world_size": 2}, {"backend": "nccl"}])
+def test_launch_probe_parser_rejects_invalid_metadata(mutation):
+    outputs = ["LAUNCH_PROBE=" + json.dumps({**probe_record(0), **mutation}),
+               "LAUNCH_PROBE=" + json.dumps(probe_record(1))]
+    with pytest.raises(AssertionError):
+        parse_launch_probe_records(outputs, 2, 1)
+
+
+def test_launch_probe_emits_marker_json_and_newline_in_one_write(monkeypatch, capfd):
+    from training.tests import distributed_launch_probe
+    writes = []
+    original_write = os.write
+
+    def record_write(fd, payload):
+        writes.append(payload)
+        return original_write(fd, payload)
+
+    monkeypatch.setattr(distributed_launch_probe.os, "write", record_write)
+    distributed_launch_probe.emit_launch_probe(probe_record(0))
+    output = capfd.readouterr().out
+    assert len(writes) == 1
+    assert writes[0].decode("utf-8") == output
+    assert output.startswith("LAUNCH_PROBE=") and output.endswith("\n")
+    assert json.loads(output.removeprefix("LAUNCH_PROBE=")) == probe_record(0)
+
+
+def test_launch_probe_rejects_short_or_nonatomic_writes(monkeypatch, capfd):
+    from training.tests import distributed_launch_probe
+    monkeypatch.setattr(distributed_launch_probe.os, "write", lambda fd, payload: len(payload) - 1)
+    with pytest.raises(RuntimeError, match="Incomplete"):
+        distributed_launch_probe.emit_launch_probe(probe_record(0))
+    monkeypatch.setattr(distributed_launch_probe.os, "fpathconf", lambda fd, name: 1)
+    with pytest.raises(RuntimeError, match="atomic pipe-write limit"):
+        distributed_launch_probe.emit_launch_probe(probe_record(0))
+
+
 def worker_env(**overrides):
     return {"RANK": "0", "WORLD_SIZE": "2", "LOCAL_RANK": "0", "LOCAL_WORLD_SIZE": "2",
             "MASTER_ADDR": "127.0.0.1", "MASTER_PORT": "29500", **overrides}
@@ -239,10 +329,7 @@ def test_real_two_agent_cpu_launch_and_training(backend, local_workers):
                                               cwd=ROOT, env=env, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT))
         outputs = [process.communicate(timeout=90)[0] for process in processes]
         assert [process.returncode for process in processes] == [0, 0], "\n".join(outputs)
-        records = [json.loads(line.split("LAUNCH_PROBE=", 1)[1]) for output in outputs for line in output.splitlines()
-                   if "LAUNCH_PROBE=" in line]
-        assert {record["rank"] for record in records} == set(range(2 * local_workers))
-        assert all(record["backend"] == "gloo" and record["local_world_size"] == local_workers for record in records)
+        parse_launch_probe_records(outputs, 2 * local_workers, local_workers)
     finally:
         for process in processes:
             if process.poll() is None:

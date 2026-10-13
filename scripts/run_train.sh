@@ -94,7 +94,7 @@ resolve_default_config() {
                 return 0
             fi
             ;;
-        stream_distill|consistency_distill)
+        stream_distill|consistency_distill|progressive_distill|adversarial_distill|dmd_distill|mean_flow_distill|joint_av_distill)
             local candidate="${PROJECT_ROOT}/configs/distill_presets/${METHOD}.json"
             if [ -f "${candidate}" ]; then
                 echo "${candidate}"
@@ -127,6 +127,8 @@ while [[ $# -gt 0 ]]; do
         --model_cls) MODEL_CLS="$2"; shift 2 ;;
         --teacher_model) TEACHER_MODEL="$2"; shift 2 ;;
         --student_model) STUDENT_MODEL="$2"; shift 2 ;;
+        --use_dual_model) DUAL_MODEL_ARG="--use_dual_model"; shift ;;
+        --no-use_dual_model) DUAL_MODEL_ARG="--no-use_dual_model"; shift ;;
         --data_json) DATA_JSON="$2"; shift 2 ;;
         --val_data_json) VAL_DATA_JSON="$2"; shift 2 ;;
         --eval_every) EVAL_EVERY="$2"; shift 2 ;;
@@ -192,6 +194,8 @@ while [[ $# -gt 0 ]]; do
             echo "  context_forcing       Memory-aware context forcing distillation"
             echo "  adversarial_distill   Adversarial Diffusion Distillation (ADD/LADD)"
             echo "  dmd_distill           Distribution Matching Distillation (DMD/DMD2)"
+            echo "  mean_flow_distill     Teacher-guided two-time MeanFlow"
+            echo "  joint_av_distill      Joint video/audio flow distillation"
             echo ""
             echo "Parallel Modes:"
             echo "  ddp                   DistributedDataParallel (default, <14B params)"
@@ -203,6 +207,7 @@ while [[ $# -gt 0 ]]; do
             echo "  --model_cls           Model class / alias (default: wan2.1)"
             echo "  --teacher_model       Path to teacher model weights"
             echo "  --student_model       Path to student model (optional, init from teacher)"
+            echo "  --use_dual_model/--no-use_dual_model Explicit high/low student override"
             echo "  --data_json           Training data json"
             echo "  --val_data_json       Validation data json (optional)"
             echo "  --eval_every          Evaluate every N steps (optional)"
@@ -338,14 +343,6 @@ if [ -z "${NUM_FRAMES}" ]; then
     else
         NUM_FRAMES=49
     fi
-fi
-
-if [ "${METHOD}" = "step_distill" ] && [ "${PARALLEL_MODE}" != "ddp" ]; then
-    # The stock 4-step preset enables two independently routed students. Only
-    # the primary student is sharded today, so select the supported single-
-    # student path for FSDP/DeepSpeed instead of failing after model loading.
-    DUAL_MODEL_ARG="--no-use_dual_model"
-    echo ">>> Disabling dual-student routing for ${PARALLEL_MODE}; serial/DDP is required for dual mode."
 fi
 
 # CUDA_VISIBLE_DEVICES (including UUID/MIG masks and an intentionally empty

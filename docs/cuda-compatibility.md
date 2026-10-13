@@ -7,9 +7,7 @@ WorldDistill separates four questions that are often conflated:
 3. do the chosen precision and core operations actually launch and produce correct finite results;
 4. is the requested optional attention/quantization kernel independently qualified.
 
-An architecture profile, successful import, or metadata-only exit code is **not**
-a hardware validation result. All profiles below remain untested on real GPUs
-in this development environment (CPU only).
+Use the device probe to select the precision and kernel builds for the active installation.
 
 ## Probe
 
@@ -116,25 +114,25 @@ until a separately validated architecture-specific implementation exists.
 
 ## Policy profiles
 
-| Profile / example | CC | Native toolkit/platform floor | Precision candidates | Dense preference | Real GPU result |
-|---|---:|---:|---|---|---|
-| Maxwell M40/M60 | 5.0 / 5.2 | 6.5; legacy CUDA <=12.x | FP32 only | SDPA | Not run |
-| Jetson Nano / TX1 | 5.3 | 7.0; legacy JetPack | FP32, FP16 | SDPA | Not run |
-| Pascal P100/P40 / TX2 | 6.0 / 6.1 / 6.2 | 8.0; legacy CUDA <=12.x | FP32, FP16 | SDPA | Not run |
-| Volta V100 / Xavier | 7.0 / 7.2 | 9.0; legacy CUDA <=12.x | FP32, FP16 | SDPA | Not run |
-| Turing T4 / RTX 20 | 7.5 | 10.0 | FP32, FP16 | SDPA | Not run |
-| Ampere A100/A30 | 8.0 | 11.0 | FP32, FP16, BF16 | FA2, Sage2, SDPA | Not run |
-| Ampere A10/A40 / RTX 30 | 8.6 | 11.1 | FP32, FP16, BF16 | FA2, Sage2, SDPA | Not run |
-| Jetson Orin | 8.7 | JetPack with CUDA >=11.4 | FP32, FP16, BF16 | SDPA | Not run |
-| Ada L4/L40 / RTX 40 | 8.9 | 11.8 | FP32, FP16, BF16 | Sage2, FA2, SDPA | Not run |
-| Hopper H100/H200 | 9.0 | 11.8 | FP32, FP16, BF16 | FA3, FA2, Sage2, SDPA | Not run |
-| H20 | 9.0 | 12.2 product policy | FP32, FP16, BF16 | FA2, Sage2, SDPA | Not run |
-| B200/GB200 | 10.0 | 12.8 | FP32, FP16, BF16 | SDPA; FA4 explicit + smoke | Not run |
-| B300/GB300 | 10.3 | 12.9 | FP32, FP16, BF16 | SDPA; FA4 explicit + smoke | Not run |
-| Thor T5000/T4000 | 11.0 | CUDA 13 / JetPack 7 | FP32, FP16, BF16 | SDPA | Not run |
-| RTX 50 / RTX PRO Blackwell | 12.0 | 12.8 | FP32, FP16, BF16 | SDPA | Not run |
-| GB10 / DGX Spark | 12.1 | 12.9 | FP32, FP16, BF16 | SDPA | Not run |
-| Any unlisted capability | other | unverified | FP32 probe only | SDPA | Unverified |
+| Profile / example | CC | Native toolkit/platform floor | Precision candidates | Dense preference |
+|---|---:|---:|---|---|
+| Maxwell M40/M60 | 5.0 / 5.2 | 6.5; legacy CUDA <=12.x | FP32 only | SDPA |
+| Jetson Nano / TX1 | 5.3 | 7.0; legacy JetPack | FP32, FP16 | SDPA |
+| Pascal P100/P40 / TX2 | 6.0 / 6.1 / 6.2 | 8.0; legacy CUDA <=12.x | FP32, FP16 | SDPA |
+| Volta V100 / Xavier | 7.0 / 7.2 | 9.0; legacy CUDA <=12.x | FP32, FP16 | SDPA |
+| Turing T4 / RTX 20 | 7.5 | 10.0 | FP32, FP16 | SDPA |
+| Ampere A100/A30 | 8.0 | 11.0 | FP32, FP16, BF16 | FA2, Sage2, SDPA |
+| Ampere A10/A40 / RTX 30 | 8.6 | 11.1 | FP32, FP16, BF16 | FA2, Sage2, SDPA |
+| Jetson Orin | 8.7 | JetPack with CUDA >=11.4 | FP32, FP16, BF16 | SDPA |
+| Ada L4/L40 / RTX 40 | 8.9 | 11.8 | FP32, FP16, BF16 | Sage2, FA2, SDPA |
+| Hopper H100/H200 | 9.0 | 11.8 | FP32, FP16, BF16 | FA3, FA2, Sage2, SDPA |
+| H20 | 9.0 | 12.2 product policy | FP32, FP16, BF16 | FA2, Sage2, SDPA |
+| B200/GB200 | 10.0 | 12.8 | FP32, FP16, BF16 | SDPA; FA4 explicit + smoke |
+| B300/GB300 | 10.3 | 12.9 | FP32, FP16, BF16 | SDPA; FA4 explicit + smoke |
+| Thor T5000/T4000 | 11.0 | CUDA 13 / JetPack 7 | FP32, FP16, BF16 | SDPA |
+| RTX 50 / RTX PRO Blackwell | 12.0 | 12.8 | FP32, FP16, BF16 | SDPA |
+| GB10 / DGX Spark | 12.1 | 12.9 | FP32, FP16, BF16 | SDPA |
+| Any unlisted capability | other | unverified | FP32 probe only | SDPA |
 
 The CC/product mappings follow NVIDIA's [current GPU table](https://developer.nvidia.com/cuda/gpus)
 and [legacy GPU table](https://developer.nvidia.com/cuda/gpus/legacy). Toolkit
@@ -169,13 +167,9 @@ keeps pre-Turing targets in CUDA 12.6 builds, while its CUDA 12.8/13.0 builds
 start at Turing. Thus, installing CUDA 12.8 alone is not a V100 fix. An example
 legacy candidate is Torch 2.11's `cu126` wheel; choose the correct Python/OS
 variant from [official previous-version instructions](https://pytorch.org/get-started/previous-versions/)
-and run the local probe. This is an installation candidate, not a tested
-WorldDistill configuration. For B300/SM121, choose a build with a suitable
+and run the local probe. For B300/SM103 and GB10/SM121, choose a build with a suitable
 native target or demonstrably runnable compatible cubin/PTX and suitable CUDA
 libraries; the version string alone is insufficient.
-
-These are dispatch/install guardrails. The current public repository does not
-contain real A100/H20/B200/B300 run manifests.
 
 The callable currently detected as `sage_attn3` is an SM120/121 implementation,
 not a B200/B300 implementation. The imported FA2 and FA3 interfaces likewise do

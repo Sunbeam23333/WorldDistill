@@ -157,7 +157,6 @@ _FALLBACK_MODEL_ZOO: dict[str, dict[str, Any]] = {
         teacher_model_cls="wan2.1",
         distill_stage="student",
         distill_methods=["mean_flow_distill"],
-        catalog_only_distill_methods=["mean_flow_distill"],
         default_configs={"t2v": "meanflow/wan_t2v_meanflow_distill_2step.json"},
     ),
     "wan2.1_vace": _spec(
@@ -447,6 +446,7 @@ _FALLBACK_MODEL_ZOO: dict[str, dict[str, Any]] = {
         "dit",
         ["t2v", "i2v", "t2av", "i2av"],
         "ltx2",
+        distill_methods=["joint_av_distill"],
         model_family="video",
         checkpoint_formats=["directory", "diffusers", "state_dict"],
         features=["audio_video_generation"],

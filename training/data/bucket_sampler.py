@@ -12,18 +12,21 @@ References:
 """
 
 import math
-import random
+import hashlib
+import json
 from typing import Dict, Iterator, List, Optional, Tuple
 
 import torch
 from torch.utils.data import Sampler
 from loguru import logger
 
+from .video_dataset import collation_signature
+
 
 class BucketSampler(Sampler):
     """Sampler that groups samples by resolution/frame-count buckets.
 
-    Each bucket contains samples with similar resolution and frame count.
+    Each bucket contains samples with identical tensor structure and frame count.
     Batches are drawn from within a single bucket to ensure uniform dimensions.
 
     Args:
@@ -57,6 +60,8 @@ class BucketSampler(Sampler):
         self.epoch = 0
         self.rank = rank
         self.world_size = world_size
+        if batch_size < 1 or world_size < 1 or not 0 <= rank < world_size:
+            raise ValueError("BucketSampler requires positive batch_size/world_size and a valid rank")
 
         # Build buckets
         if bucket_config is not None:
@@ -74,16 +79,31 @@ class BucketSampler(Sampler):
         # Fallback: read from .data list (JSON manifest) directly
         if hasattr(self.data_source, "data") and isinstance(self.data_source.data, list):
             item = self.data_source.data[idx]
-            return {
-                "resolution": item.get("resolution", [480, 854]),
-                "num_frames": item.get("num_frames", 49),
-            }
+            return item
         # Last resort: call __getitem__ (may be slow for CachedLatentDataset)
         item = self.data_source[idx]
-        return {
+        metadata = {
             "resolution": item.get("resolution", [480, 854]),
             "num_frames": item.get("num_frames", 49),
         }
+        if isinstance(item, dict):
+            metadata["collation_signature"] = collation_signature(item)
+        return metadata
+
+    @staticmethod
+    def _shape_key(meta):
+        # A configured bucket does not resize or pad data. Exact shapes, key
+        # presence, dtypes, and batch-global scalar conditions still must match.
+        shape = {"resolution": list(meta.get("resolution", [480, 854])),
+                 "num_frames": meta.get("num_frames", 49),
+                 "signature": meta.get("collation_signature")}
+        for key in ("fps", "audio_shape", "audio_latent_shape", "tensor_shapes"):
+            if key in meta:
+                shape[key] = meta[key]
+        digest = hashlib.sha256(json.dumps(shape, sort_keys=True, separators=(",", ":"),
+                                          allow_nan=False).encode()).hexdigest()
+        res = shape["resolution"]
+        return f"{res[0]}x{res[1]}_f{shape['num_frames']}_{digest}"
 
     def _auto_bucket(self) -> Dict[str, List[int]]:
         """Automatically group samples into buckets by resolution and frames."""
@@ -91,12 +111,7 @@ class BucketSampler(Sampler):
 
         for idx in range(len(self.data_source)):
             meta = self._get_item_metadata(idx)
-            res = tuple(meta.get("resolution", [480, 854]))
-            nf = meta.get("num_frames", 49)
-
-            # Quantize frames to nearest 16
-            nf_bucket = max(1, (nf // 16) * 16)
-            key = f"{res[0]}x{res[1]}_f{nf_bucket}"
+            key = self._shape_key(meta)
 
             if key not in buckets:
                 buckets[key] = []
@@ -107,8 +122,8 @@ class BucketSampler(Sampler):
     def _build_from_config(self, config: Dict) -> Dict[str, List[int]]:
         """Build buckets from explicit configuration."""
         buckets: Dict[str, List[int]] = {}
-        for bucket_name in config:
-            buckets[bucket_name] = []
+        if not config:
+            raise ValueError("bucket_config must contain at least one bucket")
 
         # Assign samples to nearest bucket
         for idx in range(len(self.data_source)):
@@ -126,8 +141,9 @@ class BucketSampler(Sampler):
                     best_dist = dist
                     best_bucket = bname
 
-            if best_bucket:
-                buckets[best_bucket].append(idx)
+            if best_bucket is not None:
+                key = f"{best_bucket}/{self._shape_key(meta)}"
+                buckets.setdefault(key, []).append(idx)
 
         return buckets
 

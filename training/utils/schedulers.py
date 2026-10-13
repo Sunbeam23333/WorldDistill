@@ -20,6 +20,8 @@ def _linear_schedule(step, warmup, total):
 
 
 def _constant_schedule(step, warmup):
+    if warmup <= 0:
+        return 1.0
     return min(1.0, float(step) / float(max(1, warmup)))
 
 

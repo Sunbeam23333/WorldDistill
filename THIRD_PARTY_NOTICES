@@ -1,6 +1,17 @@
 WorldDistill third-party notices
 ================================
 
+Diffusers Wan context-parallel adapter
+-------------------------------------
+
+The Wan self-attention operations in training/utils/context_parallel.py are
+adapted from Hugging Face Diffusers' transformer_wan.py:
+Copyright 2025 The Wan Team and The HuggingFace Team. All rights reserved.
+Source: https://github.com/huggingface/diffusers
+License: Apache License, Version 2.0 (reproduced in the root LICENSE).
+WorldDistill adds local Ulysses backward compatibility and training-specific
+mesh, input-gradient, batch and RNG handling.
+
 Optional Tencent HY-WorldPlay integration
 -----------------------------------------
 

@@ -41,6 +41,7 @@ class StreamDistillTrainer(BaseDistillTrainer):
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
+        self._require_velocity_prediction("Stream distillation")
         self.window_size = self.args.window_size
         self.overlap_frames = self.args.overlap_frames
         self.noise_schedule = self.args.noise_schedule

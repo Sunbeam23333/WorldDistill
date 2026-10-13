@@ -214,6 +214,37 @@ def _build_dataset(
     raise ValueError(f"Unsupported data_mode: {data_mode}")
 
 
+def _data_parallel_coordinates(rank: int, world_size: int, sp_size: int) -> tuple[int, int]:
+    """Contiguous context ranks consume the same samples, not disjoint data."""
+    if sp_size < 1 or world_size < 1 or world_size % sp_size or not 0 <= rank < world_size:
+        raise ValueError("sp_size must divide world_size and rank must identify an allocated worker")
+    return rank // sp_size, world_size // sp_size
+
+
+def _build_training_optimizer(model, args):
+    return build_optimizer(
+        model, optimizer_type=args.optimizer, lr=args.learning_rate,
+        weight_decay=args.weight_decay, adam_beta1=args.adam_beta1, adam_beta2=args.adam_beta2,
+        adam_epsilon=args.adam_epsilon, muon_momentum=args.muon_momentum,
+        muon_nesterov=args.muon_nesterov, muon_ns_steps=args.muon_ns_steps,
+    )
+
+
+def _build_validation_dataloader(dataset, args, data_rank, data_world_size):
+    from training.data.validation_sampler import DistributedValidationBatchSampler
+
+    if args.use_bucket_sampler:
+        base_sampler = BucketSampler(dataset, batch_size=args.batch_size, shuffle=False,
+            drop_last=False, seed=args.seed, rank=0, world_size=1)
+    else:
+        base_sampler = torch.utils.data.BatchSampler(
+            torch.utils.data.SequentialSampler(dataset), args.batch_size, drop_last=False)
+    sampler = DistributedValidationBatchSampler(
+        base_sampler, rank=data_rank, world_size=data_world_size)
+    return torch.utils.data.DataLoader(dataset, batch_sampler=sampler,
+        num_workers=args.num_workers, pin_memory=True)
+
+
 def _bucket_sampler_drop_last(world_size: int) -> bool:
     """Distributed collectives require equal local batch shapes."""
 
@@ -267,6 +298,7 @@ def main():
         Path(args.output_dir, "precision_preflight.json").write_text(json.dumps(precision_report, indent=2) + "\n")
 
     # --- Build Dataset & DataLoader ---
+    data_rank, data_world_size = _data_parallel_coordinates(rank, world_size, args.sp_size)
     train_data_mode = _resolve_data_mode(args.data_json, args.data_mode)
     dataset = _build_dataset(
         data_json=args.data_json,
@@ -280,14 +312,16 @@ def main():
     if args.use_bucket_sampler:
         sampler = BucketSampler(
             dataset, batch_size=args.batch_size, shuffle=True,
-            drop_last=_bucket_sampler_drop_last(world_size),
-            seed=args.seed, rank=rank, world_size=world_size,
+            drop_last=_bucket_sampler_drop_last(data_world_size),
+            seed=args.seed, rank=data_rank, world_size=data_world_size,
         )
         dataloader = torch.utils.data.DataLoader(
             dataset, batch_sampler=sampler, num_workers=args.num_workers, pin_memory=True,
         )
     else:
-        sampler = torch.utils.data.distributed.DistributedSampler(dataset) if world_size > 1 else None
+        sampler = (torch.utils.data.distributed.DistributedSampler(
+            dataset, num_replicas=data_world_size, rank=data_rank, seed=args.seed
+        ) if data_world_size > 1 else None)
         dataloader = torch.utils.data.DataLoader(
             dataset, batch_size=args.batch_size, sampler=sampler,
             num_workers=args.num_workers, pin_memory=True, drop_last=True,
@@ -306,19 +340,7 @@ def main():
             resolution=args.resolution,
             num_frames=args.num_frames,
         )
-        val_sampler = (
-            torch.utils.data.distributed.DistributedSampler(val_dataset, shuffle=False)
-            if world_size > 1
-            else None
-        )
-        val_dataloader = torch.utils.data.DataLoader(
-            val_dataset,
-            batch_size=args.batch_size,
-            sampler=val_sampler,
-            num_workers=args.num_workers,
-            pin_memory=True,
-            drop_last=False,
-        )
+        val_dataloader = _build_validation_dataloader(val_dataset, args, data_rank, data_world_size)
 
     batch_encoder = None
     if train_data_mode == "raw" or val_data_mode == "raw":
@@ -347,8 +369,16 @@ def main():
         device,
         teacher_dtype,
         student_device=torch.device("cpu") if world_size > 1 and args.parallel_mode in {"fsdp", "deepspeed"} else device,
+        teacher_device=torch.device("cpu") if args.runtime_teacher_offload != "none" else device,
+        allow_native_code=args.allow_native_model_code,
     )
     _resolve_native_dual_args(args, student_model)
+
+    if args.distill_method == "mean_flow_distill" and not getattr(student_model, "supports_meanflow", False):
+        from training.utils.meanflow import MeanFlowTimeAdapter
+        student_model = MeanFlowTimeAdapter(student_model,
+            latent_channels=args.meanflow_latent_channels or None,
+            hidden_dim=args.meanflow_hidden_dim)
 
     # Apply LoRA if requested
     if args.use_lora:
@@ -367,10 +397,7 @@ def main():
     # --- Build Optimizer & Scheduler ---
     # Note: For FSDP, optimizer will be re-created after wrapping in base_distill_trainer.
     # For DeepSpeed, optimizer will be wrapped by DS engine.
-    optimizer = build_optimizer(
-        student_model, optimizer_type=args.optimizer, lr=args.learning_rate,
-        weight_decay=args.weight_decay, adam_beta1=args.adam_beta1, adam_beta2=args.adam_beta2,
-    )
+    optimizer = _build_training_optimizer(student_model, args)
     lr_scheduler = build_lr_scheduler(
         optimizer, scheduler_type=args.lr_scheduler,
         warmup_steps=args.warmup_steps, total_steps=args.max_train_steps,
@@ -503,6 +530,8 @@ def _load_models(
     device: torch.device,
     teacher_dtype: torch.dtype,
     student_device: torch.device | None = None,
+    teacher_device: torch.device | None = None,
+    allow_native_code: bool = False,
 ):
     """Load teacher and student models.
 
@@ -552,12 +581,13 @@ def _load_models(
     from training.model_adapter import load_diffusers_training_model
     for candidate_dir in candidate_dirs:
         has_diffusers = any(os.path.exists(os.path.join(candidate_dir, name))
-                            for name in ("model_index.json", "worlddistill_export.json"))
+                            for name in ("model_index.json", "worlddistill_export.json", "worlddistill_model.json"))
         if not has_diffusers:
             continue
         # A declared dual pipeline failing to load must not fall through to a
         # single-expert subdirectory and silently lose its low-noise teacher.
-        teacher_model = load_diffusers_training_model(candidate_dir, dtype=teacher_dtype)
+        teacher_model = load_diffusers_training_model(candidate_dir, dtype=teacher_dtype,
+                                                     allow_native_code=allow_native_code)
         break
 
     # --- Strategy 2: Direct state_dict loading ---
@@ -603,8 +633,12 @@ def _load_models(
 
         logger.info(f"Loading separate student model from {student_path}")
         if os.path.isdir(student_path):
-            student_model = load_diffusers_training_model(student_path, dtype=torch.float32)
-            if type(student_model) is not type(teacher_model):
+            student_model = load_diffusers_training_model(student_path, dtype=torch.float32,
+                                                         allow_native_code=allow_native_code)
+            from training.utils.meanflow import MeanFlowTimeAdapter
+            comparison_model = student_model.base_model if isinstance(student_model, MeanFlowTimeAdapter) else student_model
+            teacher_topology = teacher_model.base_model if isinstance(teacher_model, MeanFlowTimeAdapter) else teacher_model
+            if type(comparison_model) is not type(teacher_topology):
                 raise ValueError("Teacher/student expert topology differs; supply a matching student architecture")
         else:
             student_model = copy.deepcopy(teacher_model)
@@ -621,7 +655,7 @@ def _load_models(
     # FSDP/ZeRO consume CPU-staged parameters, avoiding a full FP32 student on
     # each GPU before wrapping/sharding. Teacher weights remain replicated.
     student_model = student_model.to(device=student_device or device, dtype=torch.float32)
-    teacher_model = teacher_model.to(device)
+    teacher_model = teacher_model.to(teacher_device or device)
 
     # Ensure student requires grad, teacher does not
     for p in teacher_model.parameters():
@@ -726,6 +760,7 @@ def _apply_lora(model, args):
             target_modules=args.lora_target_modules,
             lora_dropout=0.0,
             bias="none",
+            modules_to_save=["time_conditioner"] if hasattr(model, "time_conditioner") else None,
         )
         model = get_peft_model(model, lora_config)
         trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)

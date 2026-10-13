@@ -31,17 +31,23 @@ def _distill_method_choices() -> tuple[str, ...]:
 
 
 class CapabilityConsistencyTests(unittest.TestCase):
+    def test_ltx2_registers_joint_audio_video_objective(self) -> None:
+        for resolver in (resolve_training_metadata, resolve_inference_metadata):
+            metadata = resolver("ltx2", task="t2av")
+            self.assertEqual(metadata["registry_backed_distill_methods"], ["joint_av_distill"])
+            self.assertTrue(metadata["supports_registry_training_entry"])
+
     def test_cli_choices_match_registry_backed_method_contract(self) -> None:
         self.assertEqual(_distill_method_choices(), REGISTRY_BACKED_DISTILL_METHODS)
 
-    def test_mean_flow_student_is_cataloged_but_not_registry_backed(self) -> None:
+    def test_mean_flow_student_has_a_dedicated_registered_objective(self) -> None:
         for resolver in (resolve_training_metadata, resolve_inference_metadata):
             metadata = resolver("wan2.1_mean_flow_distill", task="t2v")
             self.assertEqual(metadata["distill_methods"], ["mean_flow_distill"])
-            self.assertEqual(metadata["registry_backed_distill_methods"], [])
-            self.assertEqual(metadata["non_registry_distill_methods"], ["mean_flow_distill"])
-            self.assertEqual(metadata["catalog_only_distill_methods"], ["mean_flow_distill"])
-            self.assertFalse(metadata["supports_registry_training_entry"])
+            self.assertEqual(metadata["registry_backed_distill_methods"], ["mean_flow_distill"])
+            self.assertEqual(metadata["non_registry_distill_methods"], [])
+            self.assertEqual(metadata["catalog_only_distill_methods"], [])
+            self.assertTrue(metadata["supports_registry_training_entry"])
             self.assertFalse(metadata["supports_opd_like_runtime"])
 
     def test_training_and_inference_catalogs_agree_on_capability_fields(self) -> None:
@@ -70,8 +76,8 @@ class CapabilityConsistencyTests(unittest.TestCase):
 
     def test_teacher_catalog_splits_registry_backed_and_non_registry_method_tags(self) -> None:
         metadata = resolve_training_metadata("wan2.1", task="t2v")
-        self.assertEqual(metadata["registry_backed_distill_methods"], ["step_distill"])
-        self.assertEqual(metadata["non_registry_distill_methods"], ["lora_distill", "mean_flow_distill"])
+        self.assertEqual(metadata["registry_backed_distill_methods"], ["step_distill", "mean_flow_distill"])
+        self.assertEqual(metadata["non_registry_distill_methods"], ["lora_distill"])
         self.assertEqual(metadata["catalog_only_distill_methods"], [])
         self.assertTrue(metadata["supports_registry_training_entry"])
 
