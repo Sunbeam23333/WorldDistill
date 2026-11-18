@@ -20,7 +20,7 @@ auxiliary supervision, is maintained in
 | Wan 2.1 | T2V, I2V, FLF2V | Integrated where a default config is listed | Diffusers adapter |
 | Wan 2.1 distilled | T2V, I2V as catalogued | Integrated inference variants | Compatible Diffusers checkpoints use the matching training objective |
 | Wan 2.1 MeanFlow | T2V as catalogued | Integrated inference variant | Teacher-guided `mean_flow_distill`; explicit dual-time conditioning |
-| Wan Self-Forcing | T2V as catalogued | Integrated inference variant | No dedicated native Self-Forcing training integration; Stream requires a causal/per-frame adapter |
+| Wan Self-Forcing | T2V as catalogued | Integrated inference variant | Generic `self_forcing` and `causal_forcing` trainers; a native author-specific adapter remains model-owned |
 | Wan 2.1 VACE | VACE | Integrated | Exact Diffusers VACE control adapter |
 | Wan 2.2 MoE / distilled | T2V, I2V, selected FLF2V configs | Integrated | Diffusers adapter |
 | Wan 2.2 VACE / Animate | VACE, Animate | Integrated | VACE context/scales and Animate reference/pose/face adapters |

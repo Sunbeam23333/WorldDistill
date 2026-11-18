@@ -14,20 +14,28 @@ supervision and checkpoint contracts.
 | Consistency / TCD-LCD style | Implemented | `ConsistencyDistillTrainer` | EMA adjacent-point flow-space consistency. |
 | PCM | Implemented core phase contract | `PCMTrainer`, `pcm_distill.json` | Phase-aware sub-trajectory sampling is exposed. The original repository's full guided/adversarial recipe is not implied by the name. |
 | TCM | Implemented core two-stage contract | `TCMTrainer`, `tcm_distill.json` | Stage 1 full-range training, stage 2 truncation, and frozen stage-1 boundary loss. |
-| Stream / Diffusion Forcing | Implemented generic path | `StreamDistillTrainer` | Requires a causal/per-frame model adapter. It is not a dedicated Self-Forcing implementation. |
+| Stream / Diffusion Forcing | Implemented generic path | `StreamDistillTrainer` | Requires a causal/per-frame model adapter. Self-Forcing and Causal-Forcing are separate registered trainers. |
+| Self-Forcing | Implemented core rollout contract | `SelfForcingTrainer`, `self_forcing.json` | Generated overlap is fed into later windows with configurable rollout repeats and teacher/ground-truth context mixing. |
+| Causal-Forcing | Implemented core causal rollout contract | `CausalForcingTrainer`, `causal_forcing.json` | Enforces causal temporal masks and configurable generated context frames. |
+| rCM / sCM | Implemented core continuous consistency contracts | `RCMTrainer`, `SCMTrainer` | Continuous pair sampling, endpoint anchoring, and score-consistency weighting are exposed. |
+| Diagonal distillation | Implemented | `DiagonalDistillTrainer`, `diagonal_distill.json` | Monotone diagonal frame/noise schedule with jitter control. |
+| Reflow | Implemented | `ReflowTrainer`, `reflow.json` | Straight-line flow target with optional teacher endpoint mixing. |
+| TMD | Implemented core transition contract | `TMDTrainer`, `tmd_distill.json` | Adjacent-state teacher transition matching with configurable gap and target weighting. |
+| SiD-DiT | Implemented core score-identity contract | `SiDDiTTrainer`, `sid_dit_distill.json` | Pointwise score matching plus finite-difference identity supervision. |
+| VSD / RL | Implemented core reward-aware contract | `VSDRLTrainer`, `vsd_rl_distill.json` | Teacher KL surrogate plus reward or preference advantage policy term. |
+| Data-free DMD | Implemented synthetic-source contract | `DataFreeDMDTrainer`, `data_free_dmd_distill.json` | Synthesizes latent sources when batches omit latents and reuses DMD/DMD2 objectives. |
 | Context Forcing | Implemented runtime path | `ContextForcingTrainer`, `WorldModelRuntime` | Hybrid-sparse memory and teacher context are available. The paper's slow/fast key-similarity KV algorithm is model-owned. |
 | ADD/LADD | Implemented | `AdversarialDistillTrainer` | Latent projection discriminator and auxiliary optimizer state. |
 | DMD/DMD2 | Implemented | `DMDDistillTrainer` | Fake-score DSM, DMD regression, and DMD2 GAN paths. |
 | MeanFlow | Implemented | `MeanFlowDistillTrainer` | Teacher-guided dual-time JVP path with explicit higher-order derivative constraints. |
 | Joint audio/video | Implemented for LTX2 | `JointAVDistillTrainer` | Separate video/audio heads and packed audio latent contract. |
-| Generic sparse MoE | Partial adapter support | `training/utils/moe.py` | Optional router auxiliary loss for models returning `router_logits` or `aux_loss`. Dispatch, capacity, and expert-parallel collectives remain native-model responsibilities. |
+| Generic sparse MoE | Implemented routing adapter | `training/utils/moe.py` | Top-k token routing, capacity-limited local dispatch/combine, and expert-parallel `all_to_all_single` helpers. Model adapters own expert module forward and checkpoint layout. |
 
-The following entries remain catalog or research-extension work rather than
-unified objective implementations: dedicated Self-Forcing/Causal-Forcing,
-rCM/sCM, TMD, diagonal distillation, reflow, SiD-DiT, VSD or preference/RL
-optimization, data-free DMD, and model-native SkyReels or the catalogued stub
-world models. Their names must not be used as evidence that the corresponding
-author training recipe is available.
+The remaining boundary is model-native coverage for SkyReels and other
+catalogued stub world models, plus paper-specific extras that require their
+original model architecture, data engine, or reward service. The unified
+trainers expose executable core objectives and keep those external contracts
+explicit.
 
 ## What is novel in WorldDistill
 

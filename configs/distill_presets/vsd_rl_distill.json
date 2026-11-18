@@ -1,0 +1,7 @@
+{
+  "distill_method": "vsd_rl_distill",
+  "vsd_kl_weight": 1.0,
+  "vsd_rl_weight": 0.1,
+  "vsd_reward_baseline_momentum": 0.9,
+  "description": "Variational score distillation with an optional reward or preference surrogate."
+}

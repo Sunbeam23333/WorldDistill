@@ -13,6 +13,14 @@ states the executable contracts.
 | Consistency | EMA target and Huber/MSE options | Real tiny Wan update and CPU restart tests |
 | PCM | Phase-aware consistency pairs over declared native-noise sub-trajectories | Phase interval and boundary sampler contracts |
 | TCM | Stage-selectable full-range or truncated consistency interval | Stage and truncation interval contracts; stage-2 runs should resume a stage-1 checkpoint |
+| Self-Forcing / Causal-Forcing | Generated-history rollout with causal masks and context mixing | Core rollout, context-ratio, and causal-mask contracts |
+| rCM / sCM | Continuous consistency pairs, endpoint anchoring, and score-consistency weighting | Pair-order and parameter validation contracts |
+| Diagonal | Monotone diagonal frame/noise schedule | Bounded monotonic schedule contract |
+| Reflow | Straight-line rectified-flow target with optional teacher mixing | Endpoint target contract |
+| TMD | Adjacent-state transition matching target | Transition-gap and target contract |
+| SiD-DiT | Pointwise and finite-difference score identity terms | Weight and pair contracts |
+| VSD / RL | Teacher KL surrogate plus reward or preference advantage term | Reward-shape and baseline contracts |
+| Data-free DMD | Synthetic latent source path over DMD/DMD2 | Latent-shape and inherited DMD contracts |
 | Context Forcing | Teacher context, hybrid memory, action/camera passthrough, target mask | CPU selector/chunk tests |
 | Adversarial | Latent projection discriminator plus distillation term; independent AMP and accumulated auxiliary updates | Serial/DDP and sharded-student/full-replica-critic contracts, checkpoint and resume |
 | DMD-style | Fake-distribution DSM; teacher-minus-fake distribution gradient; DMD online teacher regression, DMD2 GAN without regression | Numerical target tests, tiny real Wan DMD/DMD2 updates and CPU/Gloo restart |
@@ -42,9 +50,15 @@ MoE support has two layers. Wan2.2 native checkpoints use the tested timestep
 boundary router that keeps high- and low-noise experts together through training,
 checkpointing, and export. Custom models may additionally return `router_logits`
 or `aux_loss` and enable `--moe_load_balance_weight`, `--moe_top_k`, and
-`--moe_num_experts` for a differentiable router penalty. Token dispatch,
-capacity management, and expert-parallel all-to-all remain model-owned APIs and
-are not inferred from a catalog name.
+`--moe_num_experts` for a differentiable router penalty. Generic token-level
+dispatch is available in `training.utils.moe` through
+`build_token_route` or `build_expert_parallel_route`, followed by
+`dispatch_tokens` and `combine_tokens`, with configurable capacity limits.
+`dispatch_expert_parallel` and `combine_expert_parallel` use
+`torch.distributed.all_to_all_single` for expert-parallel groups and fall back
+to a single-rank local path. `--moe_capacity_factor`, `--moe_min_capacity`,
+and `--moe_expert_parallel_size` control the shared route contract. Model
+adapters still own the expert module forward and checkpoint layout.
 
 ## Executable CPU smoke test
 

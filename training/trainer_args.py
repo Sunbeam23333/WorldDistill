@@ -66,7 +66,7 @@ class TrainerArgs:
     output_dir: str = "./results/distill"
 
     # --- Distillation Method ---
-    distill_method: str = "step_distill"  # step_distill | cfg_distill | stream_distill | progressive_distill | consistency_distill | pcm_distill | tcm_distill | context_forcing | adversarial_distill | dmd_distill
+    distill_method: str = "step_distill"  # step_distill | cfg_distill | self_forcing | causal_forcing | stream_distill | progressive_distill | consistency_distill | pcm_distill | tcm_distill | rcm_distill | scm_distill | diagonal_distill | reflow | tmd_distill | sid_dit_distill | vsd_rl_distill | data_free_dmd_distill | context_forcing | adversarial_distill | dmd_distill
     distill_preset: str = ""  # Path to distill preset JSON (e.g., configs/distill_presets/step_distill_4step.json)
 
     # --- Flow Matching / Noise ---
@@ -96,6 +96,34 @@ class TrainerArgs:
     # --- Classifier-free guidance distillation ---
     cfg_scale: float = 4.0
     cfg_unconditional_prefix: str = "uncond_"
+
+    # --- Self/Causal Forcing ---
+    self_forcing_rollout_steps: int = 1
+    self_forcing_context_ratio: float = 1.0
+    causal_forcing_context_frames: int = 0
+
+    # --- Continuous consistency, diagonal distillation, and reflow ---
+    rcm_min_sigma: float = 0.001
+    rcm_max_sigma: float = 0.999
+    rcm_endpoint_weight: float = 0.1
+    scm_score_weight: float = 1.0
+    diagonal_slope: float = 1.0
+    diagonal_jitter: float = 0.05
+    reflow_endpoint_mix: float = 1.0
+
+    # --- Transition, score-identity, VSD/RL, and data-free DMD ---
+    tmd_transition_gap: float = 0.05
+    tmd_transition_weight: float = 1.0
+    sid_identity_weight: float = 1.0
+    sid_pointwise_weight: float = 1.0
+    vsd_kl_weight: float = 1.0
+    vsd_rl_weight: float = 0.1
+    vsd_reward_baseline_momentum: float = 0.9
+    data_free_latent_shape: Optional[List[int]] = None
+    data_free_latent_channels: int = 16
+    data_free_num_frames: int = 1
+    data_free_height: int = 32
+    data_free_width: int = 32
 
     # --- Stream Distillation ---
     window_size: int = 16
@@ -196,6 +224,9 @@ class TrainerArgs:
     moe_top_k: int = 2
     moe_load_balance_weight: float = 0.0
     moe_z_loss_weight: float = 0.0
+    moe_capacity_factor: float = 1.25
+    moe_min_capacity: int = 4
+    moe_expert_parallel_size: int = 1
 
     # --- LR Scheduler ---
     lr_scheduler: str = "cosine"  # cosine | linear | constant | constant_with_warmup | cosine_with_min_lr
@@ -335,6 +366,32 @@ class TrainerArgs:
             raise ValueError("cfg_scale must be finite and at least 1.0")
         if not isinstance(self.cfg_unconditional_prefix, str) or not self.cfg_unconditional_prefix:
             raise ValueError("cfg_unconditional_prefix must be a non-empty string")
+        if type(self.self_forcing_rollout_steps) is not int or self.self_forcing_rollout_steps < 1:
+            raise ValueError("self_forcing_rollout_steps must be a positive integer")
+        if not 0.0 <= self.self_forcing_context_ratio <= 1.0:
+            raise ValueError("self_forcing_context_ratio must lie in [0, 1]")
+        if type(self.causal_forcing_context_frames) is not int or self.causal_forcing_context_frames < 0:
+            raise ValueError("causal_forcing_context_frames must be non-negative")
+        if not 0.0 <= self.rcm_min_sigma < self.rcm_max_sigma <= 1.0:
+            raise ValueError("rcm interval must satisfy 0 <= min < max <= 1")
+        if self.rcm_endpoint_weight < 0 or self.scm_score_weight < 0:
+            raise ValueError("rcm_endpoint_weight and scm_score_weight must be non-negative")
+        if self.diagonal_slope <= 0 or self.diagonal_jitter < 0:
+            raise ValueError("diagonal_slope must be positive and diagonal_jitter non-negative")
+        if not 0.0 <= self.reflow_endpoint_mix <= 1.0:
+            raise ValueError("reflow_endpoint_mix must lie in [0, 1]")
+        if not 0.0 < self.tmd_transition_gap <= 1.0 or self.tmd_transition_weight <= 0:
+            raise ValueError("tmd_transition_gap must lie in (0, 1] and tmd_transition_weight must be positive")
+        if min(self.sid_identity_weight, self.sid_pointwise_weight) < 0 or (self.sid_identity_weight + self.sid_pointwise_weight) == 0:
+            raise ValueError("SiD-DiT weights must be non-negative and not both zero")
+        if self.vsd_kl_weight < 0 or self.vsd_rl_weight < 0 or not 0 <= self.vsd_reward_baseline_momentum < 1:
+            raise ValueError("Invalid VSD/RL weights or reward baseline momentum")
+        if self.data_free_latent_shape is not None:
+            if len(self.data_free_latent_shape) not in (4, 5) or any(int(v) < 1 for v in self.data_free_latent_shape):
+                raise ValueError("data_free_latent_shape must have four or five positive dimensions")
+        for name in ("data_free_latent_channels", "data_free_num_frames", "data_free_height", "data_free_width"):
+            if type(getattr(self, name)) is not int or getattr(self, name) < 1:
+                raise ValueError(f"{name} must be a positive integer")
         if type(self.pcm_num_phases) is not int or self.pcm_num_phases < 1:
             raise ValueError("pcm_num_phases must be a positive integer")
         if self.pcm_phase_sampling not in {"uniform", "boundary"}:
@@ -352,6 +409,12 @@ class TrainerArgs:
         for name in ("moe_load_balance_weight", "moe_z_loss_weight"):
             if not math.isfinite(getattr(self, name)) or getattr(self, name) < 0:
                 raise ValueError(f"{name} must be finite and non-negative")
+        if not math.isfinite(self.moe_capacity_factor) or self.moe_capacity_factor <= 0:
+            raise ValueError("moe_capacity_factor must be finite and positive")
+        if type(self.moe_min_capacity) is not int or self.moe_min_capacity < 1:
+            raise ValueError("moe_min_capacity must be a positive integer")
+        if type(self.moe_expert_parallel_size) is not int or self.moe_expert_parallel_size < 1:
+            raise ValueError("moe_expert_parallel_size must be a positive integer")
         # Legacy compat: if use_fsdp is True, set parallel_mode to fsdp
         if self.use_fsdp and self.parallel_mode == "ddp":
             self.parallel_mode = "fsdp"
@@ -479,11 +542,21 @@ def build_training_arg_parser() -> argparse.ArgumentParser:
         choices=[
             "step_distill",
             "cfg_distill",
+            "self_forcing",
+            "causal_forcing",
             "stream_distill",
             "progressive_distill",
             "consistency_distill",
             "pcm_distill",
             "tcm_distill",
+            "rcm_distill",
+            "scm_distill",
+            "diagonal_distill",
+            "reflow",
+            "tmd_distill",
+            "sid_dit_distill",
+            "vsd_rl_distill",
+            "data_free_dmd_distill",
             "context_forcing",
             "adversarial_distill",
             "dmd_distill",
@@ -506,6 +579,28 @@ def build_training_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--student_low_model", type=str, default=None)
     parser.add_argument("--cfg_scale", type=float, default=4.0)
     parser.add_argument("--cfg_unconditional_prefix", type=str, default="uncond_")
+    parser.add_argument("--self_forcing_rollout_steps", type=int, default=1)
+    parser.add_argument("--self_forcing_context_ratio", type=float, default=1.0)
+    parser.add_argument("--causal_forcing_context_frames", type=int, default=0)
+    parser.add_argument("--rcm_min_sigma", type=float, default=0.001)
+    parser.add_argument("--rcm_max_sigma", type=float, default=0.999)
+    parser.add_argument("--rcm_endpoint_weight", type=float, default=0.1)
+    parser.add_argument("--scm_score_weight", type=float, default=1.0)
+    parser.add_argument("--diagonal_slope", type=float, default=1.0)
+    parser.add_argument("--diagonal_jitter", type=float, default=0.05)
+    parser.add_argument("--reflow_endpoint_mix", type=float, default=1.0)
+    parser.add_argument("--tmd_transition_gap", type=float, default=0.05)
+    parser.add_argument("--tmd_transition_weight", type=float, default=1.0)
+    parser.add_argument("--sid_identity_weight", type=float, default=1.0)
+    parser.add_argument("--sid_pointwise_weight", type=float, default=1.0)
+    parser.add_argument("--vsd_kl_weight", type=float, default=1.0)
+    parser.add_argument("--vsd_rl_weight", type=float, default=0.1)
+    parser.add_argument("--vsd_reward_baseline_momentum", type=float, default=0.9)
+    parser.add_argument("--data_free_latent_shape", type=int, nargs="+", default=None)
+    parser.add_argument("--data_free_latent_channels", type=int, default=16)
+    parser.add_argument("--data_free_num_frames", type=int, default=1)
+    parser.add_argument("--data_free_height", type=int, default=32)
+    parser.add_argument("--data_free_width", type=int, default=32)
 
     # Training
     parser.add_argument("--learning_rate", type=float, default=1e-5)
@@ -556,6 +651,9 @@ def build_training_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--moe_top_k", type=int, default=2)
     parser.add_argument("--moe_load_balance_weight", type=float, default=0.0)
     parser.add_argument("--moe_z_loss_weight", type=float, default=0.0)
+    parser.add_argument("--moe_capacity_factor", type=float, default=1.25)
+    parser.add_argument("--moe_min_capacity", type=int, default=4)
+    parser.add_argument("--moe_expert_parallel_size", type=int, default=1)
 
     # EMA
     parser.add_argument("--use_ema", action="store_true")

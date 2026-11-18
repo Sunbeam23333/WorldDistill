@@ -1,0 +1,8 @@
+{
+  "distill_method": "rcm_distill",
+  "rcm_min_sigma": 0.001,
+  "rcm_max_sigma": 0.999,
+  "rcm_endpoint_weight": 0.1,
+  "consistency_loss_type": "huber",
+  "description": "Continuous-time regularized consistency distillation."
+}

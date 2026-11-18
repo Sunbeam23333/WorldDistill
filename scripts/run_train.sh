@@ -98,7 +98,7 @@ resolve_default_config() {
                 return 0
             fi
             ;;
-        cfg_distill|stream_distill|consistency_distill|pcm_distill|tcm_distill|progressive_distill|adversarial_distill|dmd_distill|mean_flow_distill|joint_av_distill)
+        cfg_distill|self_forcing|causal_forcing|stream_distill|consistency_distill|pcm_distill|tcm_distill|rcm_distill|scm_distill|diagonal_distill|reflow|tmd_distill|sid_dit_distill|vsd_rl_distill|data_free_dmd_distill|progressive_distill|adversarial_distill|dmd_distill|mean_flow_distill|joint_av_distill)
             local candidate="${PROJECT_ROOT}/configs/distill_presets/${METHOD}.json"
             if [ -f "${candidate}" ]; then
                 echo "${candidate}"
@@ -197,11 +197,21 @@ while [[ $# -gt 0 ]]; do
             echo "Distillation Methods:"
             echo "  step_distill          Fixed N-step distillation (default)"
             echo "  cfg_distill           Classifier-free guidance distillation"
+            echo "  self_forcing          Self-forcing rollout distillation"
+            echo "  causal_forcing        Causal-forcing rollout distillation"
             echo "  stream_distill        Diffusion Forcing stream distillation"
             echo "  progressive_distill   Progressive halving distillation"
             echo "  consistency_distill   Trajectory Consistency Distillation"
             echo "  pcm_distill           Phased consistency distillation"
             echo "  tcm_distill           Two-stage truncated consistency distillation"
+            echo "  rcm_distill           Continuous consistency distillation"
+            echo "  scm_distill           Score consistency distillation"
+            echo "  diagonal_distill      Diagonal streaming distillation"
+            echo "  reflow                Rectified-flow reflow training"
+            echo "  tmd_distill           Transition matching distillation"
+            echo "  sid_dit_distill      Score-identity DiT distillation"
+            echo "  vsd_rl_distill       Variational score distillation with reward surrogate"
+            echo "  data_free_dmd_distill Data-free DMD with synthetic latent sources"
             echo "  context_forcing       Memory-aware context forcing distillation"
             echo "  adversarial_distill   Adversarial Diffusion Distillation (ADD/LADD)"
             echo "  dmd_distill           Distribution Matching Distillation (DMD/DMD2)"

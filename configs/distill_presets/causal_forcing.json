@@ -1,0 +1,7 @@
+{
+  "distill_method": "causal_forcing",
+  "self_forcing_rollout_steps": 2,
+  "causal_forcing_context_frames": 8,
+  "causal_attention": true,
+  "description": "Causal-forcing video rollout distillation."
+}

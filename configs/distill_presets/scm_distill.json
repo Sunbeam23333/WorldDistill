@@ -1,0 +1,7 @@
+{
+  "distill_method": "scm_distill",
+  "rcm_min_sigma": 0.001,
+  "rcm_max_sigma": 0.999,
+  "scm_score_weight": 1.0,
+  "description": "Score-consistency distillation over continuous noise pairs."
+}

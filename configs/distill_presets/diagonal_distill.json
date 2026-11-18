@@ -1,0 +1,8 @@
+{
+  "distill_method": "diagonal_distill",
+  "window_size": 16,
+  "overlap_frames": 4,
+  "diagonal_slope": 1.0,
+  "diagonal_jitter": 0.05,
+  "description": "Diagonal streaming distillation with monotone frame-noise schedules."
+}

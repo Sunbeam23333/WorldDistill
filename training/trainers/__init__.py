@@ -19,6 +19,11 @@ from training.trainers.stream_distill_trainer import StreamDistillTrainer
 from training.trainers.progressive_distill_trainer import ProgressiveDistillTrainer
 from training.trainers.consistency_distill_trainer import ConsistencyDistillTrainer
 from training.trainers.consistency_variants import PCMTrainer, TCMTrainer
+from training.trainers.advanced_distill_trainers import (
+    SelfForcingTrainer, CausalForcingTrainer, RCMTrainer, SCMTrainer,
+    DiagonalDistillTrainer, ReflowTrainer, TMDTrainer, SiDDiTTrainer,
+    VSDRLTrainer, DataFreeDMDTrainer,
+)
 from training.trainers.context_forcing_trainer import ContextForcingTrainer
 from training.trainers.adversarial_distill_trainer import AdversarialDistillTrainer
 from training.trainers.dmd_distill_trainer import DMDDistillTrainer
@@ -28,11 +33,21 @@ from training.trainers.joint_av_distill_trainer import JointAVDistillTrainer
 TRAINER_REGISTRY = {
     "step_distill": StepDistillTrainer,
     "cfg_distill": CFGDistillTrainer,
+    "self_forcing": SelfForcingTrainer,
+    "causal_forcing": CausalForcingTrainer,
     "stream_distill": StreamDistillTrainer,
     "progressive_distill": ProgressiveDistillTrainer,
     "consistency_distill": ConsistencyDistillTrainer,
     "pcm_distill": PCMTrainer,
     "tcm_distill": TCMTrainer,
+    "rcm_distill": RCMTrainer,
+    "scm_distill": SCMTrainer,
+    "diagonal_distill": DiagonalDistillTrainer,
+    "reflow": ReflowTrainer,
+    "tmd_distill": TMDTrainer,
+    "sid_dit_distill": SiDDiTTrainer,
+    "vsd_rl_distill": VSDRLTrainer,
+    "data_free_dmd_distill": DataFreeDMDTrainer,
     "context_forcing": ContextForcingTrainer,
     "adversarial_distill": AdversarialDistillTrainer,
     "dmd_distill": DMDDistillTrainer,
@@ -62,11 +77,21 @@ __all__ = [
     "BaseDistillTrainer",
     "StepDistillTrainer",
     "CFGDistillTrainer",
+    "SelfForcingTrainer",
+    "CausalForcingTrainer",
     "StreamDistillTrainer",
     "ProgressiveDistillTrainer",
     "ConsistencyDistillTrainer",
     "PCMTrainer",
     "TCMTrainer",
+    "RCMTrainer",
+    "SCMTrainer",
+    "DiagonalDistillTrainer",
+    "ReflowTrainer",
+    "TMDTrainer",
+    "SiDDiTTrainer",
+    "VSDRLTrainer",
+    "DataFreeDMDTrainer",
     "ContextForcingTrainer",
     "AdversarialDistillTrainer",
     "DMDDistillTrainer",

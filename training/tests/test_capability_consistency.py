@@ -77,7 +77,10 @@ class CapabilityConsistencyTests(unittest.TestCase):
     def test_teacher_catalog_splits_registry_backed_and_non_registry_method_tags(self) -> None:
         metadata = resolve_training_metadata("wan2.1", task="t2v")
         self.assertEqual(metadata["registry_backed_distill_methods"], [
-            "step_distill", "cfg_distill", "pcm_distill", "tcm_distill", "mean_flow_distill",
+            "step_distill", "cfg_distill", "self_forcing", "causal_forcing",
+            "pcm_distill", "tcm_distill", "rcm_distill", "scm_distill",
+            "diagonal_distill", "reflow", "tmd_distill", "sid_dit_distill",
+            "vsd_rl_distill", "data_free_dmd_distill", "mean_flow_distill",
         ])
         self.assertEqual(metadata["non_registry_distill_methods"], ["lora_distill"])
         self.assertEqual(metadata["catalog_only_distill_methods"], [])

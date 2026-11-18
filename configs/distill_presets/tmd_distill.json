@@ -1,0 +1,6 @@
+{
+  "distill_method": "tmd_distill",
+  "tmd_transition_gap": 0.05,
+  "tmd_transition_weight": 1.0,
+  "description": "Transition matching distillation over adjacent native-noise states."
+}

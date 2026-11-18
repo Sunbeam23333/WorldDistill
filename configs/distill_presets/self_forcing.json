@@ -1,0 +1,7 @@
+{
+  "distill_method": "self_forcing",
+  "self_forcing_rollout_steps": 2,
+  "self_forcing_context_ratio": 1.0,
+  "causal_attention": true,
+  "description": "Self-forcing video rollout distillation with generated history."
+}

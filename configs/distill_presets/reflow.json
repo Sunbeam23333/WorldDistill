@@ -1,0 +1,5 @@
+{
+  "distill_method": "reflow",
+  "reflow_endpoint_mix": 1.0,
+  "description": "Rectified-flow reflow training from clean/noise endpoint couplings."
+}

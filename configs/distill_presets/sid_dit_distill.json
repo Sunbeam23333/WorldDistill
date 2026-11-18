@@ -1,0 +1,6 @@
+{
+  "distill_method": "sid_dit_distill",
+  "sid_identity_weight": 1.0,
+  "sid_pointwise_weight": 1.0,
+  "description": "Score-identity DiT distillation with pointwise and finite-difference targets."
+}

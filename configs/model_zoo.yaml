@@ -20,7 +20,7 @@ models:
     architecture: wan
     tasks: [t2v, i2v, flf2v]
     runner_cls: "wan2.1"
-    distill_methods: [step_distill, cfg_distill, pcm_distill, tcm_distill, lora_distill, mean_flow_distill]
+    distill_methods: [step_distill, cfg_distill, self_forcing, causal_forcing, pcm_distill, tcm_distill, rcm_distill, scm_distill, diagonal_distill, reflow, tmd_distill, sid_dit_distill, vsd_rl_distill, data_free_dmd_distill, lora_distill, mean_flow_distill]
     status: supported
 
   wan2.1_distill:
@@ -28,7 +28,7 @@ models:
     architecture: wan
     tasks: [t2v, i2v]
     runner_cls: "wan2.1_distill"
-    distill_methods: [step_distill, cfg_distill, pcm_distill, tcm_distill]
+    distill_methods: [step_distill, cfg_distill, self_forcing, causal_forcing, pcm_distill, tcm_distill, rcm_distill, scm_distill, diagonal_distill, reflow, tmd_distill, sid_dit_distill, vsd_rl_distill, data_free_dmd_distill]
     teacher_model_cls: "wan2.1"
     distill_stage: student
     default_steps: 4
@@ -65,7 +65,7 @@ models:
     architecture: wan_moe
     tasks: [t2v, i2v, flf2v, t2av, i2av]
     runner_cls: "wan2.2_moe"
-    distill_methods: [step_distill, cfg_distill, pcm_distill, tcm_distill, lora_distill, full_model_distill, fp8_distill]
+    distill_methods: [step_distill, cfg_distill, self_forcing, causal_forcing, pcm_distill, tcm_distill, rcm_distill, scm_distill, diagonal_distill, reflow, tmd_distill, sid_dit_distill, vsd_rl_distill, data_free_dmd_distill, lora_distill, full_model_distill, fp8_distill]
     status: supported
 
   wan2.2_moe_distill:
@@ -73,7 +73,7 @@ models:
     architecture: wan_moe
     tasks: [t2v, i2v, flf2v]
     runner_cls: "wan2.2_moe_distill"
-    distill_methods: [step_distill, cfg_distill, pcm_distill, tcm_distill]
+    distill_methods: [step_distill, cfg_distill, self_forcing, causal_forcing, pcm_distill, tcm_distill, rcm_distill, scm_distill, diagonal_distill, reflow, tmd_distill, sid_dit_distill, vsd_rl_distill, data_free_dmd_distill]
     teacher_model_cls: "wan2.2_moe"
     distill_stage: student
     default_steps: 4
@@ -117,7 +117,7 @@ models:
     architecture: hunyuan_video
     tasks: [t2v, i2v]
     runner_cls: "hunyuan_video_1.5"
-    distill_methods: [step_distill, cfg_distill, pcm_distill, tcm_distill]
+    distill_methods: [step_distill, cfg_distill, self_forcing, causal_forcing, pcm_distill, tcm_distill, rcm_distill, scm_distill, diagonal_distill, reflow, tmd_distill, sid_dit_distill, vsd_rl_distill, data_free_dmd_distill]
     status: supported
 
   hunyuan_video_1.5_distill:
@@ -125,7 +125,7 @@ models:
     architecture: hunyuan_video
     tasks: [t2v]
     runner_cls: "hunyuan_video_1.5_distill"
-    distill_methods: [step_distill, cfg_distill, pcm_distill, tcm_distill]
+    distill_methods: [step_distill, cfg_distill, self_forcing, causal_forcing, pcm_distill, tcm_distill, rcm_distill, scm_distill, diagonal_distill, reflow, tmd_distill, sid_dit_distill, vsd_rl_distill, data_free_dmd_distill]
     teacher_model_cls: "hunyuan_video_1.5"
     distill_stage: student
     default_steps: 4

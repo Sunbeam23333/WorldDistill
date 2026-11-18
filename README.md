@@ -28,9 +28,10 @@ runners. Joint audio-video distillation uses a dedicated two-stream trainer; mod
 
 The bow-tie view separates task inputs, teacher/student execution, runtime
 mechanisms, and deployment outputs. The trainer registry includes Step,
-CFG-aware, Step, Progressive, Consistency, PCM, TCM, Stream, Context Forcing,
-adversarial, and DMD-style paths, together with teacher-guided MeanFlow and
-joint audio-video distillation. [Figure provenance](assets/readme/PROVENANCE.md).
+CFG-aware, Self-Forcing, Causal-Forcing, Progressive, Consistency, PCM, TCM,
+rCM/sCM, Diagonal, Reflow, TMD, SiD-DiT, VSD/RL, data-free DMD, Stream,
+Context Forcing, adversarial, and DMD-style paths, together with teacher-guided
+MeanFlow and joint audio-video distillation. [Figure provenance](assets/readme/PROVENANCE.md).
 
 ## What is implemented
 
@@ -46,6 +47,9 @@ joint audio-video distillation. [Figure provenance](assets/readme/PROVENANCE.md)
 | Raw-video cache builder | Checkpoint VAE/text/image/AV encoders, all tensor conditions and source-frame alignment | Raw→cache→dataset round-trip and fail-safe publication |
 | Stream / Progressive / Consistency | Generated-overlap multi-step unroll, complete progressive intervals, EMA consistency | CPU optimizer/restart tests; real tiny Wan tests where its forward contract supports the method |
 | PCM / TCM | Phase-aware and truncated native-noise consistency variants | CPU phase/stage contract tests |
+| Self/Causal Forcing | Generated-history rollout, context mixing, and causal masks | CPU rollout and context contracts |
+| rCM / sCM / Diagonal / Reflow | Continuous consistency, diagonal schedules, and rectified-flow targets | CPU objective contracts |
+| TMD / SiD-DiT / VSD-RL / data-free DMD | Transition, score-identity, reward-aware, and synthetic-source objectives | CPU objective and shape contracts |
 | Context Forcing | Teacher context, target mask, frame-aligned action/camera packing, tail-safe chunking | CPU memory, temporal-index, and non-divisible-tail tests |
 | Hybrid-Sparse Memory | Full-history sparse anchors plus contiguous recent tail | Deterministic selector tests |
 | DistillCache | Memory/disk/hybrid stores; original-age-preserving promotion; bounded background CPU prefetch | CPU freshness, worker and runtime regressions |
@@ -230,7 +234,7 @@ Training entries refer to the exact architecture and conditioning contract.
 | Wan 2.1 / 2.2 and compatible distilled checkpoints | Runner + config | Exact Diffusers adapter, native dual experts | Wan Ulysses context parallelism; method-specific objective contracts |
 | Wan MeanFlow | Runner + config | Teacher-guided `mean_flow_distill` | Explicit two-time student and exact JVP target |
 | Wan VACE / Animate | Runner + config | Dedicated Diffusers control adapters | Encoded VACE context; Animate reference/pose/face protocol |
-| Wan Self-Forcing variants | Runner + config | No dedicated Self-Forcing architecture adapter | Generic Stream is not a substitute for the author's causal model |
+| Wan Self-Forcing variants | Runner + config | Generic Self/Causal-Forcing trainers | A native author-specific causal architecture adapter remains model-owned |
 | HunyuanVideo 1.5 | Runner + config | Diffusers T2V/I2V adapter | VAE, reference-frame and image-encoder conditioning |
 | HY-WorldPlay | Runner + config; external licensed pose adapter required | Explicit official training-class bridge | Separately installed licensed source and native distributed/shape requirements |
 | Matrix-Game 2.0 | Runner + config; game CLI contract | Native causal/foundation architecture, PP | CLIP/image latents and pixel-rate keyboard/mouse controls |
@@ -281,8 +285,9 @@ native validation. The vendored low-bit CUTLASS extension is explicitly
   independent optimizers, accumulation and AMP scalers.
 - Wan2.2 MoE training preserves its native high/low-noise dual experts. Custom
   sparse-MoE models can expose router logits for an optional load-balancing
-  penalty, while token dispatch and expert-parallel collectives remain part of
-  the model adapter contract.
+  penalty. `training.utils.moe` also provides capacity-limited token routing,
+  local dispatch/combine, and expert-parallel `all_to_all_single` helpers. The
+  model adapter still owns expert forward logic and checkpoint layout.
 - Wan uses real Ulysses context parallelism with `sp_size>1`. Other architectures
   require a matching model-layer adapter. MeanFlow keeps `sp_size=1` because its
   JVP needs higher-order derivatives beyond the Ulysses backward contract.

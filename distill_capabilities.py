@@ -13,11 +13,21 @@ same method contract without importing heavyweight model code.
 REGISTRY_BACKED_DISTILL_METHODS: tuple[str, ...] = (
     "step_distill",
     "cfg_distill",
+    "self_forcing",
+    "causal_forcing",
     "stream_distill",
     "progressive_distill",
     "consistency_distill",
     "pcm_distill",
     "tcm_distill",
+    "rcm_distill",
+    "scm_distill",
+    "diagonal_distill",
+    "reflow",
+    "tmd_distill",
+    "sid_dit_distill",
+    "vsd_rl_distill",
+    "data_free_dmd_distill",
     "context_forcing",
     "adversarial_distill",
     "dmd_distill",
@@ -26,7 +36,10 @@ REGISTRY_BACKED_DISTILL_METHODS: tuple[str, ...] = (
 )
 
 REGISTRY_BACKED_DISTILL_METHOD_SET = frozenset(REGISTRY_BACKED_DISTILL_METHODS)
-ONLINE_RUNTIME_DISTILL_METHODS = frozenset({"progressive_distill", "stream_distill", "context_forcing"})
+ONLINE_RUNTIME_DISTILL_METHODS = frozenset({
+    "progressive_distill", "stream_distill", "self_forcing", "causal_forcing",
+    "diagonal_distill", "context_forcing",
+})
 
 
 def _normalize_method_list(methods: Iterable[str] | None) -> list[str]:
