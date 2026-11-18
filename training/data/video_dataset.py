@@ -341,6 +341,7 @@ class CachedLatentDataset(Dataset):
     {
         "latent_path": "latents/video_001.pt",
         "text_embed_path": "text_embeds/video_001.pt",
+        "uncond_text_embed_path": "text_embeds/video_001_uncond.pt",  (optional for CFG)
         "image_cond_path": "image_conds/video_001.pt",  (optional)
         "num_frames": 49,
         "resolution": [60, 107],  (latent resolution)
@@ -380,6 +381,7 @@ class CachedLatentDataset(Dataset):
         path_keys = (
             "latent_path",
             "text_embed_path",
+            "uncond_text_embed_path",
             "image_cond_path",
             "camera_path",
             "action_path",
@@ -493,6 +495,10 @@ class CachedLatentDataset(Dataset):
             text_embeds = load("text_embed_path")
             if text_embeds is not None:
                 result["encoder_hidden_states"] = text_embeds
+        if "uncond_text_embed_path" in item and item.get("uncond_text_embed_path"):
+            unconditional = load("uncond_text_embed_path")
+            if unconditional is not None:
+                result["uncond_encoder_hidden_states"] = unconditional
 
         # Load image conditioning (for i2v tasks)
         if "image_cond_path" in item and item.get("image_cond_path"):

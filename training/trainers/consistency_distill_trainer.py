@@ -133,6 +133,14 @@ class ConsistencyDistillTrainer(BaseDistillTrainer):
             return max(self.delta_min, delta)
         return base_delta
 
+    def _sample_consistency_pair(self, batch_size: int) -> tuple[torch.Tensor, torch.Tensor]:
+        """Sample the default adjacent pair used by TCD/LCD-style training."""
+        t_n = torch.rand(batch_size, device=self.device) * 0.98 + 0.02
+        t_n = t_n * self.num_train_timesteps
+        delta = self._get_delta()
+        t_n1 = (t_n - delta).clamp(min=1.0)
+        return t_n, t_n1
+
     def _consistency_function(
         self,
         model_output: torch.Tensor,
@@ -158,12 +166,7 @@ class ConsistencyDistillTrainer(BaseDistillTrainer):
         bs = latents.shape[0]
 
         # Sample timestep pair: (t_n, t_{n-1}) where t_n > t_{n-1}
-        t_n = torch.rand(bs, device=self.device) * 0.98 + 0.02  # [0.02, 1.0]
-        t_n = t_n * self.num_train_timesteps
-
-        # Adjacent timestep (slightly less noisy)
-        delta = self._get_delta()
-        t_n1 = (t_n - delta).clamp(min=1.0)  # Avoid sigma=0 exactly
+        t_n, t_n1 = self._sample_consistency_pair(bs)
 
         sigma_n = t_n / self.num_train_timesteps
         sigma_n1 = t_n1 / self.num_train_timesteps
