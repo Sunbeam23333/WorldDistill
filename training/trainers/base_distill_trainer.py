@@ -206,6 +206,7 @@ class BaseDistillTrainer(ABC):
         self.best_loss = float("inf")
         self._batches_in_epoch = 0
         self._pending_rng_state: Optional[Dict[str, Any]] = None
+        self._moe_aux_losses: list[torch.Tensor] = []
 
         # Parallel strategy
         self.parallel_mode = getattr(args, "parallel_mode", "ddp")  # ddp | fsdp | deepspeed
@@ -1053,6 +1054,7 @@ class BaseDistillTrainer(ABC):
     def _train_step_native(self, batch: Dict[str, Any]) -> Dict[str, float]:
         """Native PyTorch training step (DDP / FSDP)."""
         self.optimizer.zero_grad()
+        self._moe_aux_losses = []
         total_loss = 0.0
 
         for accum_idx, batch in enumerate(self._training_microbatches(batch)):
@@ -1067,6 +1069,9 @@ class BaseDistillTrainer(ABC):
             with ctx:
                 with torch.amp.autocast("cuda", dtype=self.amp_dtype, enabled=self.use_amp):
                     loss = self._forward_and_loss(batch)
+                    moe_aux = getattr(self, "_take_moe_auxiliary_loss", lambda: None)()
+                    if moe_aux is not None:
+                        loss = loss + moe_aux
                     loss = loss / self.args.gradient_accumulation_steps
                 self.scaler.scale(self._context_parallel_backward_loss(loss)).backward()
             total_loss += loss.item()
@@ -1146,6 +1151,7 @@ class BaseDistillTrainer(ABC):
         engine = self._deepspeed_engine
         assert engine is not None, "DeepSpeed engine should be initialized before calling _train_step_deepspeed"
         total_loss = 0.0
+        self._moe_aux_losses = []
 
         accumulation_steps = self.args.gradient_accumulation_steps
         skipped_before = getattr(engine, "skipped_steps", 0)
@@ -1155,6 +1161,9 @@ class BaseDistillTrainer(ABC):
             # context when their stored dtype differs from the input latents.
             with torch.amp.autocast("cuda", dtype=self.amp_dtype, enabled=self.use_amp):
                 loss = self._forward_and_loss(batch)
+                moe_aux = getattr(self, "_take_moe_auxiliary_loss", lambda: None)()
+                if moe_aux is not None:
+                    loss = loss + moe_aux
 
             # DeepSpeed owns loss scaling and the accumulation boundary. Its
             # step() is called for every microbatch and updates parameters only
@@ -1402,7 +1411,25 @@ class BaseDistillTrainer(ABC):
                 tag=tag,
             )
         output = student_model(**input_kwargs)
+        if torch.is_grad_enabled():
+            from training.utils.moe import model_moe_auxiliary_loss
+            moe_aux = model_moe_auxiliary_loss(
+                output,
+                top_k=int(getattr(self.args, "moe_top_k", 2)),
+                num_experts=(int(getattr(self.args, "moe_num_experts", 0)) or None),
+                load_balance_weight=float(getattr(self.args, "moe_load_balance_weight", 0.0)),
+                z_loss_weight=float(getattr(self.args, "moe_z_loss_weight", 0.0)),
+            )
+            if moe_aux is not None:
+                self._moe_aux_losses.append(moe_aux)
         return extract_prediction_tensor(output, tag=tag)
+
+    def _take_moe_auxiliary_loss(self) -> Optional[torch.Tensor]:
+        if not self._moe_aux_losses:
+            return None
+        value = torch.stack([loss if loss.ndim == 0 else loss.mean() for loss in self._moe_aux_losses]).mean()
+        self._moe_aux_losses = []
+        return value
 
     def select_runtime_memory_frames(
         self,

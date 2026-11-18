@@ -28,8 +28,9 @@ runners. Joint audio-video distillation uses a dedicated two-stream trainer; mod
 
 The bow-tie view separates task inputs, teacher/student execution, runtime
 mechanisms, and deployment outputs. The trainer registry includes Step,
-Progressive, Consistency, Stream, Context Forcing, adversarial, and DMD-style
-paths, together with teacher-guided MeanFlow and joint audio-video distillation. [Figure provenance](assets/readme/PROVENANCE.md).
+CFG-aware, Step, Progressive, Consistency, PCM, TCM, Stream, Context Forcing,
+adversarial, and DMD-style paths, together with teacher-guided MeanFlow and
+joint audio-video distillation. [Figure provenance](assets/readme/PROVENANCE.md).
 
 ## What is implemented
 
@@ -37,12 +38,14 @@ paths, together with teacher-guided MeanFlow and joint audio-video distillation.
 |---|---|---|
 | Shared model metadata | YAML registry plus train/infer resolvers and aliases | CPU catalog/config consistency tests |
 | Step distillation | Fixed-timestep trainer, target-only supervision, checkpoint-native dual teacher/student experts | Real tiny Wan forward/backward and exact export/reload |
+| CFG distillation | Conditional/unconditional teacher pair and configurable guided target | CPU guidance algebra and input-contract tests |
 | MeanFlow | Explicit two-time student, exact directional JVP and teacher-guided target | Analytic derivatives, gradient isolation and exact restart |
 | VP diffusion | Checkpoint-native alpha schedule and epsilon/v/sample conversion | CogVideoX DDIM/DPM references and Step gradients |
 | Joint audio-video | LTX2 video/audio branches and modality-balanced losses | Two-head gradients, runtime payloads and export/reload |
 | Teacher offload | CPU or file-backed frozen weights with stream-safe device leases | Tied weights, buffers, cache hits and revision handoff |
 | Raw-video cache builder | Checkpoint VAE/text/image/AV encoders, all tensor conditions and source-frame alignment | Raw→cache→dataset round-trip and fail-safe publication |
 | Stream / Progressive / Consistency | Generated-overlap multi-step unroll, complete progressive intervals, EMA consistency | CPU optimizer/restart tests; real tiny Wan tests where its forward contract supports the method |
+| PCM / TCM | Phase-aware and truncated native-noise consistency variants | CPU phase/stage contract tests |
 | Context Forcing | Teacher context, target mask, frame-aligned action/camera packing, tail-safe chunking | CPU memory, temporal-index, and non-divisible-tail tests |
 | Hybrid-Sparse Memory | Full-history sparse anchors plus contiguous recent tail | Deterministic selector tests |
 | DistillCache | Memory/disk/hybrid stores; original-age-preserving promotion; bounded background CPU prefetch | CPU freshness, worker and runtime regressions |
@@ -276,6 +279,10 @@ native validation. The vendored low-bit CUTLASS extension is explicitly
   trained fake-score DSM and their separately selected regression/GAN terms.
   FSDP/ZeRO partition the student; auxiliary models remain full replicas with
   independent optimizers, accumulation and AMP scalers.
+- Wan2.2 MoE training preserves its native high/low-noise dual experts. Custom
+  sparse-MoE models can expose router logits for an optional load-balancing
+  penalty, while token dispatch and expert-parallel collectives remain part of
+  the model adapter contract.
 - Wan uses real Ulysses context parallelism with `sp_size>1`. Other architectures
   require a matching model-layer adapter. MeanFlow keeps `sp_size=1` because its
   JVP needs higher-order derivatives beyond the Ulysses backward contract.

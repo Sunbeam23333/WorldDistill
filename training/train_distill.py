@@ -397,6 +397,8 @@ def main():
             model_path=args.teacher_model_path,
             device=device,
             dtype=encoder_dtype,
+            enable_cfg=args.distill_method == "cfg_distill",
+            cfg_unconditional_prefix=args.cfg_unconditional_prefix,
         )
 
     # --- Build Models ---

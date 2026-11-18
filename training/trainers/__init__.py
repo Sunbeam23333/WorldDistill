@@ -14,9 +14,11 @@ from distill_capabilities import REGISTRY_BACKED_DISTILL_METHODS
 
 from training.trainers.base_distill_trainer import BaseDistillTrainer
 from training.trainers.step_distill_trainer import StepDistillTrainer
+from training.trainers.cfg_distill_trainer import CFGDistillTrainer
 from training.trainers.stream_distill_trainer import StreamDistillTrainer
 from training.trainers.progressive_distill_trainer import ProgressiveDistillTrainer
 from training.trainers.consistency_distill_trainer import ConsistencyDistillTrainer
+from training.trainers.consistency_variants import PCMTrainer, TCMTrainer
 from training.trainers.context_forcing_trainer import ContextForcingTrainer
 from training.trainers.adversarial_distill_trainer import AdversarialDistillTrainer
 from training.trainers.dmd_distill_trainer import DMDDistillTrainer
@@ -25,9 +27,12 @@ from training.trainers.joint_av_distill_trainer import JointAVDistillTrainer
 
 TRAINER_REGISTRY = {
     "step_distill": StepDistillTrainer,
+    "cfg_distill": CFGDistillTrainer,
     "stream_distill": StreamDistillTrainer,
     "progressive_distill": ProgressiveDistillTrainer,
     "consistency_distill": ConsistencyDistillTrainer,
+    "pcm_distill": PCMTrainer,
+    "tcm_distill": TCMTrainer,
     "context_forcing": ContextForcingTrainer,
     "adversarial_distill": AdversarialDistillTrainer,
     "dmd_distill": DMDDistillTrainer,
@@ -56,9 +61,12 @@ def build_trainer(method: str, **kwargs) -> BaseDistillTrainer:
 __all__ = [
     "BaseDistillTrainer",
     "StepDistillTrainer",
+    "CFGDistillTrainer",
     "StreamDistillTrainer",
     "ProgressiveDistillTrainer",
     "ConsistencyDistillTrainer",
+    "PCMTrainer",
+    "TCMTrainer",
     "ContextForcingTrainer",
     "AdversarialDistillTrainer",
     "DMDDistillTrainer",

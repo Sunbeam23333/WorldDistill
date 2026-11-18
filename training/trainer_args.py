@@ -66,7 +66,7 @@ class TrainerArgs:
     output_dir: str = "./results/distill"
 
     # --- Distillation Method ---
-    distill_method: str = "step_distill"  # step_distill | stream_distill | progressive_distill | consistency_distill | context_forcing | adversarial_distill | dmd_distill
+    distill_method: str = "step_distill"  # step_distill | cfg_distill | stream_distill | progressive_distill | consistency_distill | pcm_distill | tcm_distill | context_forcing | adversarial_distill | dmd_distill
     distill_preset: str = ""  # Path to distill preset JSON (e.g., configs/distill_presets/step_distill_4step.json)
 
     # --- Flow Matching / Noise ---
@@ -93,6 +93,10 @@ class TrainerArgs:
     dual_student_layout: str = ""  # Written by the unified dual-student trainer.
     student_low_model: Optional[str] = None  # Path to low-noise student model (for dual-model)
 
+    # --- Classifier-free guidance distillation ---
+    cfg_scale: float = 4.0
+    cfg_unconditional_prefix: str = "uncond_"
+
     # --- Stream Distillation ---
     window_size: int = 16
     overlap_frames: int = 4
@@ -113,6 +117,14 @@ class TrainerArgs:
     huber_c: float = 0.00054
     consistency_delta_schedule: str = "fixed"  # fixed | linear_decay
     consistency_delta_min: int = 5  # Minimum delta (for linear_decay schedule)
+
+    # --- Phased / truncated consistency variants ---
+    pcm_num_phases: int = 4
+    pcm_phase_sampling: str = "uniform"  # uniform | boundary
+    tcm_truncation_start: float = 0.02
+    tcm_truncation_end: float = 1.0
+    tcm_stage: int = 1
+    tcm_boundary_weight: float = 1.0
 
     # --- Context Forcing ---
     memory_frames: int = 20
@@ -177,6 +189,13 @@ class TrainerArgs:
     muon_momentum: float = 0.95
     muon_nesterov: bool = True
     muon_ns_steps: int = 5
+
+    # --- Generic sparse-MoE auxiliary supervision ---
+    # Models must expose router_logits or aux_loss in their forward output.
+    moe_num_experts: int = 0
+    moe_top_k: int = 2
+    moe_load_balance_weight: float = 0.0
+    moe_z_loss_weight: float = 0.0
 
     # --- LR Scheduler ---
     lr_scheduler: str = "cosine"  # cosine | linear | constant | constant_with_warmup | cosine_with_min_lr
@@ -312,6 +331,27 @@ class TrainerArgs:
             )
         if self.huber_c <= 0:
             raise ValueError(f"huber_c must be positive, got {self.huber_c}")
+        if not math.isfinite(self.cfg_scale) or self.cfg_scale < 1.0:
+            raise ValueError("cfg_scale must be finite and at least 1.0")
+        if not isinstance(self.cfg_unconditional_prefix, str) or not self.cfg_unconditional_prefix:
+            raise ValueError("cfg_unconditional_prefix must be a non-empty string")
+        if type(self.pcm_num_phases) is not int or self.pcm_num_phases < 1:
+            raise ValueError("pcm_num_phases must be a positive integer")
+        if self.pcm_phase_sampling not in {"uniform", "boundary"}:
+            raise ValueError("pcm_phase_sampling must be 'uniform' or 'boundary'")
+        if not (0.0 <= self.tcm_truncation_start < self.tcm_truncation_end <= 1.0):
+            raise ValueError("TCM truncation interval must satisfy 0 <= start < end <= 1")
+        if self.tcm_stage not in {1, 2}:
+            raise ValueError("tcm_stage must be 1 or 2")
+        if not math.isfinite(self.tcm_boundary_weight) or self.tcm_boundary_weight < 0:
+            raise ValueError("tcm_boundary_weight must be finite and non-negative")
+        if type(self.moe_num_experts) is not int or self.moe_num_experts < 0:
+            raise ValueError("moe_num_experts must be a non-negative integer")
+        if type(self.moe_top_k) is not int or self.moe_top_k < 1:
+            raise ValueError("moe_top_k must be a positive integer")
+        for name in ("moe_load_balance_weight", "moe_z_loss_weight"):
+            if not math.isfinite(getattr(self, name)) or getattr(self, name) < 0:
+                raise ValueError(f"{name} must be finite and non-negative")
         # Legacy compat: if use_fsdp is True, set parallel_mode to fsdp
         if self.use_fsdp and self.parallel_mode == "ddp":
             self.parallel_mode = "fsdp"
@@ -438,9 +478,12 @@ def build_training_arg_parser() -> argparse.ArgumentParser:
         default="step_distill",
         choices=[
             "step_distill",
+            "cfg_distill",
             "stream_distill",
             "progressive_distill",
             "consistency_distill",
+            "pcm_distill",
+            "tcm_distill",
             "context_forcing",
             "adversarial_distill",
             "dmd_distill",
@@ -461,6 +504,8 @@ def build_training_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--runtime_teacher_offload_dir", type=str, default="")
     parser.add_argument("--use_dual_model", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--student_low_model", type=str, default=None)
+    parser.add_argument("--cfg_scale", type=float, default=4.0)
+    parser.add_argument("--cfg_unconditional_prefix", type=str, default="uncond_")
 
     # Training
     parser.add_argument("--learning_rate", type=float, default=1e-5)
@@ -489,6 +534,12 @@ def build_training_arg_parser() -> argparse.ArgumentParser:
         default=0.00054,
         help="Positive Huber delta (and pseudo-Huber constant for consistency distillation)",
     )
+    parser.add_argument("--pcm_num_phases", type=int, default=4)
+    parser.add_argument("--pcm_phase_sampling", type=str, default="uniform", choices=["uniform", "boundary"])
+    parser.add_argument("--tcm_truncation_start", type=float, default=0.02)
+    parser.add_argument("--tcm_truncation_end", type=float, default=1.0)
+    parser.add_argument("--tcm_stage", type=int, default=1, choices=[1, 2])
+    parser.add_argument("--tcm_boundary_weight", type=float, default=1.0)
 
     # Optimizer
     parser.add_argument("--optimizer", type=str, default="adamw", choices=["adamw", "muon"])
@@ -501,6 +552,10 @@ def build_training_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--muon_nesterov", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--muon_ns_steps", type=int, default=5)
     parser.add_argument("--lr_min_ratio", type=float, default=0.1)
+    parser.add_argument("--moe_num_experts", type=int, default=0)
+    parser.add_argument("--moe_top_k", type=int, default=2)
+    parser.add_argument("--moe_load_balance_weight", type=float, default=0.0)
+    parser.add_argument("--moe_z_loss_weight", type=float, default=0.0)
 
     # EMA
     parser.add_argument("--use_ema", action="store_true")

@@ -9,6 +9,10 @@ Status vocabulary:
 
 Use the training guide for objective-specific input contracts.
 
+The executable method matrix, including CFG, PCM, TCM, and generic router
+auxiliary supervision, is maintained in
+[method-support-matrix.md](method-support-matrix.md).
+
 ## Video and audio-video inference
 
 | Catalog family | Tasks | Runner/config | Unified training |

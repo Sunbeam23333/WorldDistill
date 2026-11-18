@@ -7,9 +7,12 @@ states the executable contracts.
 | Method | Implemented surface | Regression coverage |
 |---|---|---|
 | Step | Fixed timetable, native high/low-noise teacher AND student routing | Tiny real Wan optimizer, export/reload and CPU restart tests |
+| CFG | Explicit conditional/unconditional teacher forwards and `u + s(c-u)` guided target | CPU guidance algebra, missing-branch validation and CLI contracts |
 | Stream | Differentiable per-frame Euler unroll; generated overlap passed to the next window | CPU multi-window/solver and restart tests; requires a causal/per-frame model adapter |
 | Progressive | All schedule intervals including the final interval to zero | Sampling regression, real tiny Wan update and restart tests |
 | Consistency | EMA target and Huber/MSE options | Real tiny Wan update and CPU restart tests |
+| PCM | Phase-aware consistency pairs over declared native-noise sub-trajectories | Phase interval and boundary sampler contracts |
+| TCM | Stage-selectable full-range or truncated consistency interval | Stage and truncation interval contracts; stage-2 runs should resume a stage-1 checkpoint |
 | Context Forcing | Teacher context, hybrid memory, action/camera passthrough, target mask | CPU selector/chunk tests |
 | Adversarial | Latent projection discriminator plus distillation term; independent AMP and accumulated auxiliary updates | Serial/DDP and sharded-student/full-replica-critic contracts, checkpoint and resume |
 | DMD-style | Fake-distribution DSM; teacher-minus-fake distribution gradient; DMD online teacher regression, DMD2 GAN without regression | Numerical target tests, tiny real Wan DMD/DMD2 updates and CPU/Gloo restart |
@@ -20,6 +23,28 @@ The shared target-supervision path supports MSE and Huber loss. The optional
 Triton fusion applies only to masked MSE; Huber always uses the PyTorch path.
 LPIPS is intentionally not exposed because latent-space trainers do not decode
 predictions to a calibrated perceptual image space.
+
+CFG distillation requires `uncond_*` text-condition tensors in cached batches.
+Raw mode creates them by encoding an empty prompt with the same pipeline. The
+student receives only the conditional branch. Set `--cfg_scale` to the guidance
+scale used for the teacher target. This keeps classifier-free guidance in the
+training contract instead of confusing it with Hunyuan's `guidance` embedding.
+For a single encoder, `uncond_text_embed_path` is a convenient cached-manifest
+field. Multi-encoder checkpoints can place all `uncond_*` tensors in
+`conditioning_path`.
+
+PCM uses explicit phase boundaries and trains the consistency mapping within a
+phase. TCM exposes a stage-1 full-range sampler and a stage-2 truncated sampler
+through `--tcm_stage`, `--tcm_truncation_start`, and `--tcm_truncation_end`.
+Use the matching presets under `configs/distill_presets/`.
+
+MoE support has two layers. Wan2.2 native checkpoints use the tested timestep
+boundary router that keeps high- and low-noise experts together through training,
+checkpointing, and export. Custom models may additionally return `router_logits`
+or `aux_loss` and enable `--moe_load_balance_weight`, `--moe_top_k`, and
+`--moe_num_experts` for a differentiable router penalty. Token dispatch,
+capacity management, and expert-parallel all-to-all remain model-owned APIs and
+are not inferred from a catalog name.
 
 ## Executable CPU smoke test
 

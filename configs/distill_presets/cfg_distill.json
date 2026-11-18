@@ -1,0 +1,7 @@
+{
+  "distill_method": "cfg_distill",
+  "cfg_scale": 4.0,
+  "cfg_unconditional_prefix": "uncond_",
+  "description": "Classifier-free guidance distillation with explicit conditional and unconditional teacher branches.",
+  "notes": "Cached batches must include uncond_* embeddings. Raw mode generates them from the empty prompt."
+}

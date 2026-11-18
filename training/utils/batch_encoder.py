@@ -19,10 +19,15 @@ class DiffusersRawBatchEncoder:
     are errors; raw examples never silently become unconditional examples.
     """
 
-    def __init__(self, model_path: str, device: torch.device, dtype: torch.dtype = torch.bfloat16):
+    def __init__(self, model_path: str, device: torch.device, dtype: torch.dtype = torch.bfloat16,
+                 enable_cfg: bool = False, cfg_unconditional_prefix: str = "uncond_"):
         self.model_path = model_path
         self.device = device
         self.dtype = dtype
+        self.enable_cfg = bool(enable_cfg)
+        self.cfg_unconditional_prefix = str(cfg_unconditional_prefix)
+        if not self.cfg_unconditional_prefix:
+            raise ValueError("cfg_unconditional_prefix must be a non-empty string")
 
         try:
             from diffusers import DiffusionPipeline
@@ -129,6 +134,24 @@ class DiffusersRawBatchEncoder:
                 batch["encoder_hidden_states"] = prompt_embeds
             else:
                 raise RuntimeError("Prompt encoding produced no conditioning; refusing unconditional fallback")
+
+        if getattr(self, "enable_cfg", False) and "encoder_hidden_states" in batch:
+            # Keep the unconditional branch explicit in the batch. The CFG
+            # trainer can therefore use cached and raw examples through the
+            # same contract without guessing an embedding or silently zeroing
+            # a model-specific text encoder output.
+            prefix = getattr(self, "cfg_unconditional_prefix", "uncond_")
+            if not any(key.startswith(prefix) for key in batch):
+                prompts = batch.get("text")
+                if prompts is None:
+                    raise ValueError("CFG raw training requires text prompts or explicit uncond_* embeddings")
+                empty = [""] * len(self._normalize_prompts(prompts))
+                unconditional = self._encode_text(empty)
+                if not isinstance(unconditional, dict):
+                    unconditional = {"encoder_hidden_states": unconditional}
+                for key, value in unconditional.items():
+                    if value is not None:
+                        batch[f"{prefix}{key}"] = value
 
         if "HunyuanVideo15" in type(getattr(self, "pipe", None)).__name__:
             self._encode_hunyuan15_conditions(batch)

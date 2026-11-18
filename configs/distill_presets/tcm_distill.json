@@ -1,0 +1,10 @@
+{
+  "distill_method": "tcm_distill",
+  "tcm_stage": 2,
+  "tcm_truncation_start": 0.02,
+  "tcm_truncation_end": 1.0,
+  "tcm_boundary_weight": 1.0,
+  "consistency_loss_type": "huber",
+  "description": "Truncated consistency distillation on a declared native-noise interval.",
+  "notes": "Run stage 1 with tcm_stage=1, save a complete checkpoint, then resume stage 2 with tcm_stage=2 and the same truncation boundary."
+}

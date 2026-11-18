@@ -1,0 +1,8 @@
+{
+  "distill_method": "pcm_distill",
+  "pcm_num_phases": 4,
+  "pcm_phase_sampling": "uniform",
+  "consistency_loss_type": "huber",
+  "description": "Phased consistency distillation over explicit native-noise sub-trajectories.",
+  "notes": "The phase sampler is exposed as a native video-latent contract. PCM guidance and adversarial options remain configurable through the shared trainer."
+}

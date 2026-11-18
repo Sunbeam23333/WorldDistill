@@ -12,9 +12,12 @@ same method contract without importing heavyweight model code.
 
 REGISTRY_BACKED_DISTILL_METHODS: tuple[str, ...] = (
     "step_distill",
+    "cfg_distill",
     "stream_distill",
     "progressive_distill",
     "consistency_distill",
+    "pcm_distill",
+    "tcm_distill",
     "context_forcing",
     "adversarial_distill",
     "dmd_distill",

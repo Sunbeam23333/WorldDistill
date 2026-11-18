@@ -98,7 +98,7 @@ resolve_default_config() {
                 return 0
             fi
             ;;
-        stream_distill|consistency_distill|progressive_distill|adversarial_distill|dmd_distill|mean_flow_distill|joint_av_distill)
+        cfg_distill|stream_distill|consistency_distill|pcm_distill|tcm_distill|progressive_distill|adversarial_distill|dmd_distill|mean_flow_distill|joint_av_distill)
             local candidate="${PROJECT_ROOT}/configs/distill_presets/${METHOD}.json"
             if [ -f "${candidate}" ]; then
                 echo "${candidate}"
@@ -196,9 +196,12 @@ while [[ $# -gt 0 ]]; do
             echo ""
             echo "Distillation Methods:"
             echo "  step_distill          Fixed N-step distillation (default)"
+            echo "  cfg_distill           Classifier-free guidance distillation"
             echo "  stream_distill        Diffusion Forcing stream distillation"
             echo "  progressive_distill   Progressive halving distillation"
             echo "  consistency_distill   Trajectory Consistency Distillation"
+            echo "  pcm_distill           Phased consistency distillation"
+            echo "  tcm_distill           Two-stage truncated consistency distillation"
             echo "  context_forcing       Memory-aware context forcing distillation"
             echo "  adversarial_distill   Adversarial Diffusion Distillation (ADD/LADD)"
             echo "  dmd_distill           Distribution Matching Distillation (DMD/DMD2)"
